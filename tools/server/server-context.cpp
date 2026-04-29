@@ -681,6 +681,10 @@ private:
     // slots / clients
     std::vector<server_slot> slots;
 
+    // cached slot init parameters (used for dynamic slot creation)
+    int32_t n_ctx_slot_ = 0;
+    common_context_seq_rm_type ctx_seq_rm_type_ = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+
     int slots_debug = 0;
     int n_empty_consecutive = 0;
 
@@ -730,6 +734,40 @@ private:
         if (prefix_cache_) {
             prefix_cache_->invalidate(id_slot);
         }
+    }
+
+    // Initialize (or re-initialize) a slot's fields and callback.
+    // Called both from the initial slot setup loop and from dynamic slot creation.
+    void init_slot(server_slot & slot, int id, int n_ctx_slot, common_context_seq_rm_type ctx_seq_rm_type) {
+        slot.id    = id;
+        slot.ctx   = ctx;
+        slot.n_ctx = n_ctx_slot;
+
+        slot.ctx_seq_rm_type = ctx_seq_rm_type;
+
+        slot.mctx                   = mctx;
+        slot.prompt.tokens.has_mtmd = mctx != nullptr;
+
+        if (ctx_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+            slot.spec.reset(common_speculative_init(params_base.speculative, slot.ctx));
+            if (slot.spec) {
+                SLT_INF(slot, "%s", "speculative decoding context initialized\n");
+            }
+        }
+
+        SLT_INF(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
+
+        slot.callback_on_release = [this](int id_slot) {
+            queue_tasks.pop_deferred_task(id_slot);
+            if (prefix_cache_) {
+                const server_slot * sl = get_slot_by_id(id_slot);
+                if (sl && !sl->prompt.tokens.has_mtmd && !sl->prompt.tokens.empty()) {
+                    prefix_cache_->register_slot(id_slot, sl->prompt.tokens.get_tokens());
+                }
+            }
+        };
+
+        slot.reset();
     }
 
     void slot_save_and_clear(server_slot & slot) {
@@ -900,46 +938,22 @@ private:
             SRV_WRN("%s", "speculative decoding will use checkpoints\n");
         }
 
+        // cache for dynamic slot creation
+        n_ctx_slot_       = n_ctx_slot;
+        ctx_seq_rm_type_  = ctx_seq_rm_type;
+
+        // Validate --dynamic-slots prerequisites
+        if (params_base.dynamic_slots) {
+            if (!params_base.kv_unified) {
+                SRV_WRN("%s", "[dynamic-slots] requires --kv-unified — disabling\n");
+                params_base.dynamic_slots = false;
+            }
+        }
+
         // initialize slots
         for (int i = 0; i < params_base.n_parallel; i++) {
             slots.emplace_back();
-        }
-
-        for (int i = 0; i < params_base.n_parallel; i++) {
-            server_slot & slot = slots[i];
-
-            slot.id    = i;
-            slot.ctx   = ctx;
-            slot.n_ctx = n_ctx_slot;
-
-            slot.ctx_seq_rm_type = ctx_seq_rm_type;
-
-            slot.mctx                   = mctx;
-            slot.prompt.tokens.has_mtmd = mctx != nullptr;
-
-            // try speculative decoding
-            if (ctx_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
-                slot.spec.reset(common_speculative_init(params_base.speculative, slot.ctx));
-
-                if (slot.spec) {
-                    SLT_INF(slot, "%s", "speculative decoding context initialized\n");
-                }
-            }
-
-            SLT_INF(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
-
-            slot.callback_on_release = [this](int id_slot) {
-                queue_tasks.pop_deferred_task(id_slot);
-                // register released slot's KV prefix so other requests can reuse it
-                if (prefix_cache_) {
-                    const server_slot * sl = get_slot_by_id(id_slot);
-                    if (sl && !sl->prompt.tokens.has_mtmd && !sl->prompt.tokens.empty()) {
-                        prefix_cache_->register_slot(id_slot, sl->prompt.tokens.get_tokens());
-                    }
-                }
-            };
-
-            slot.reset();
+            init_slot(slots.back(), i, n_ctx_slot, ctx_seq_rm_type);
         }
 
         {
@@ -1181,6 +1195,34 @@ private:
                 SLT_INF(*ret, "selected slot by LRU, t_last = %" PRId64 "\n", t_last);
 
                 update_cache = true;
+            }
+        }
+
+        // Dynamic slot allocation (--dynamic-slots)
+        // All existing slots are busy. Grow the pool if the KV block allocator
+        // has enough free blocks to service at least one more request and we
+        // haven't hit the hard n_seq_max cap of the llama context.
+        if (ret == nullptr && params_base.dynamic_slots) {
+            const int32_t seq_max   = (int32_t) llama_n_seq_max(ctx);
+            const int32_t n_cur     = (int32_t) slots.size();
+            const int32_t n_free_blk = llama_kv_cache_n_free_blocks(llama_get_memory(ctx));
+            // require at least n_ctx_slot / block_size blocks free for new slot
+            const int32_t bs        = (int32_t) LLAMA_KV_BLOCK_SIZE_DEFAULT;
+            const int32_t blks_needed = (n_ctx_slot_ + bs - 1) / bs;
+
+            if (n_cur < seq_max && n_free_blk >= blks_needed) {
+                slots.emplace_back();
+                init_slot(slots.back(), n_cur, n_ctx_slot_, ctx_seq_rm_type_);
+                ret = &slots.back();
+
+                SRV_INF("[dynamic-slots] created slot %d (free_blocks=%d, seq_max=%d)\n",
+                        n_cur, n_free_blk, seq_max);
+
+                update_cache = false; // fresh slot — nothing to cache
+            } else if (n_cur >= seq_max) {
+                SRV_WRN("[dynamic-slots] cannot grow: n_slots=%d >= n_seq_max=%d\n", n_cur, seq_max);
+            } else {
+                SRV_WRN("[dynamic-slots] cannot grow: free_blocks=%d < needed=%d\n", n_free_blk, blks_needed);
             }
         }
 

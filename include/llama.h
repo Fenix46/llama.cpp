@@ -760,6 +760,9 @@ extern "C" {
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
+    // Number of free KV blocks in stream 0 (paged allocator). Returns 0 if not using paged allocator.
+    LLAMA_API int32_t llama_kv_cache_n_free_blocks(llama_memory_t mem);
+
     //
     // State / sessions
     //

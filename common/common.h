@@ -541,6 +541,7 @@ struct common_params {
     bool kv_unified        = false; // enable unified KV cache
     bool kv_block_scheduler = false; // enable experimental paged-KV block scheduler (logs metrics, no inference change)
     bool kv_prefix_cache    = false; // enable experimental cross-slot prefix caching (reuses KV blocks across requests)
+    bool dynamic_slots      = false; // allow more concurrent slots than n_parallel if KV pool has space
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool use_mmap          = true;  // enable mmap to use filesystem cache

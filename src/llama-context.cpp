@@ -3317,6 +3317,13 @@ bool llama_memory_can_shift(llama_memory_t mem) {
     return mem->get_can_shift();
 }
 
+int32_t llama_kv_cache_n_free_blocks(llama_memory_t mem) {
+    if (!mem) {
+        return 0;
+    }
+    return mem->get_n_free_blocks();
+}
+
 // llama state API
 
 // deprecated

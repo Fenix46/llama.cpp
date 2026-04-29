@@ -1346,6 +1346,13 @@ bool llama_kv_cache::get_can_shift() const {
     return true;
 }
 
+int32_t llama_kv_cache::get_n_free_blocks() const {
+    if (v_block_alloc.empty()) {
+        return 0;
+    }
+    return (int32_t) v_block_alloc[0].n_free();
+}
+
 uint32_t llama_kv_cache::get_size() const {
     const auto & cells = v_cells[seq_to_stream[0]];
 

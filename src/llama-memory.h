@@ -93,6 +93,9 @@ struct llama_memory_i {
     // getters
     virtual bool get_can_shift() const = 0;
 
+    // number of free KV blocks in stream 0 (0 if not using paged allocator)
+    virtual int32_t get_n_free_blocks() const { return 0; }
+
     //
     // ops
     //
