@@ -83,6 +83,7 @@ llama_kv_cache::llama_kv_cache(
                      bool   v_trans,
                      bool   offload,
                      bool   unified,
+                     bool   paged,
                  uint32_t   kv_size,
                  uint32_t   n_seq_max,
                  uint32_t   n_pad,
@@ -90,7 +91,7 @@ llama_kv_cache::llama_kv_cache(
            llama_swa_type   swa_type,
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse) :
-    model(model), hparams(model.hparams), v_trans(v_trans),
+    model(model), hparams(model.hparams), v_trans(v_trans), paged(paged),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type) {
 
     GGML_ASSERT(kv_size % n_pad == 0);
@@ -903,6 +904,9 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         std::vector<uint32_t> v_heads_old; // old positions of the heads, before placing the ubatch
 
         std::vector<llama_kv_cells> v_cells; // copy of the old cells, before placing the ubatch
+
+        std::vector<llama_kv_block_allocator> v_block_alloc;
+        llama_kv_block_table block_table;
     };
 
     // remember the old state of the cells so we can restore it in the end
@@ -923,7 +927,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
         // store the old state of the cells in the recovery stack
         {
-            state_t state = { sinfo_new, v_heads, {} };
+            state_t state = { sinfo_new, v_heads, {}, v_block_alloc, block_table };
 
             for (uint32_t s = 0; s < sinfo_new.n_stream(); ++s) {
                 auto & cells = v_cells[sinfo_new.strm[s]];
@@ -951,6 +955,9 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
             cells.set(sinfo.idxs[s], it->v_cells[s]);
             head = it->v_heads_old[s];
         }
+
+        v_block_alloc = it->v_block_alloc;
+        block_table   = it->block_table;
     }
 
     if (!success) {
@@ -1154,7 +1161,58 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
         const uint32_t strm      = seq_to_stream[seq_id];
         bool           use_paged = false;
 
-        if (strm < v_block_alloc.size() && v_block_alloc[strm].n_blocks() > 0) {
+        if (paged && strm < v_block_alloc.size() && v_block_alloc[strm].n_blocks() > 0) {
+            const auto & alloc = v_block_alloc[strm];
+            const uint32_t bs  = alloc.block_size();
+
+            std::unordered_map<uint32_t, uint32_t> planned_pages;
+            uint32_t n_planned = 0;
+
+            res.idxs[s].clear();
+            res.idxs[s].reserve(n_tokens);
+
+            for (uint32_t ii = 0; ii < n_tokens; ++ii) {
+                const uint32_t i    = s * n_tokens + ii;
+                const llama_pos pos = ubatch.pos[i];
+
+                const uint32_t page  = llama_kv_block_table::logical_page(pos, bs);
+                const uint32_t intra = llama_kv_block_table::intra_offset(pos, bs);
+
+                uint32_t blk_id = block_table.lookup(seq_id, page);
+                if (blk_id == LLAMA_KV_BLOCK_ID_NONE) {
+                    auto it = planned_pages.find(page);
+                    if (it != planned_pages.end()) {
+                        blk_id = it->second;
+                    } else {
+                        blk_id = alloc.peek_free(n_planned);
+                        if (blk_id == LLAMA_KV_BLOCK_ID_NONE) {
+                            return { };
+                        }
+                        planned_pages[page] = blk_id;
+                        ++n_planned;
+                    }
+                }
+
+                const uint32_t cell_idx = alloc.get(blk_id).first_cell + intra;
+                if (cell_idx >= cells.size()) {
+                    return { };
+                }
+
+                if (!cells.is_empty(cell_idx) && !cells.seq_has(cell_idx, seq_id)) {
+                    // Copy-on-write for shared blocks is not implemented yet.
+                    return { };
+                }
+
+                res.idxs[s].push_back(cell_idx);
+            }
+
+            use_paged = true;
+
+            if (debug > 1) {
+                LLAMA_LOG_DEBUG("%s: [paged] seq %d: planned %u tokens, new_pages=%zu\n",
+                        __func__, seq_id, n_tokens, planned_pages.size());
+            }
+        } else if (strm < v_block_alloc.size() && v_block_alloc[strm].n_blocks() > 0) {
             const auto & alloc = v_block_alloc[strm];
             const uint32_t bs  = alloc.block_size();
 

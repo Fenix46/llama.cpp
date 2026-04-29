@@ -421,6 +421,7 @@ struct ggml_opt_optimizer_params common_opt_lr_pars(void * userdata);
 struct common_params {
     int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
+    int32_t max_model_len         =     0; // vLLM-style per-request max context alias for server paged scheduler
     int32_t n_batch               =  2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_ubatch              =   512; // physical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
@@ -543,6 +544,10 @@ struct common_params {
     bool kv_block_scheduler = false; // enable experimental paged-KV block scheduler (logs metrics, no inference change)
     bool kv_prefix_cache    = false; // enable experimental cross-slot prefix caching (reuses KV blocks across requests)
     bool dynamic_slots      = false; // allow more concurrent slots than n_parallel if KV pool has space
+    bool paged_kv           = false; // make paged KV block allocator authoritative for new pages
+    std::string scheduler   = "slots"; // server scheduler mode: slots, paged
+    std::string paged_admission = "full-ctx"; // paged scheduler admission policy
+    int32_t kv_block_size   = 16; // paged KV block size, currently fixed to 16
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool use_mmap          = true;  // enable mmap to use filesystem cache

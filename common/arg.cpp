@@ -1330,6 +1330,76 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL}));
     add_opt(common_arg(
+        {"--scheduler"}, "slots|paged",
+        "server scheduler mode: slots (default) or paged (vLLM-like paged KV admission)",
+        [](common_params & params, const std::string & value) {
+            if (value != "slots" && value != "paged") {
+                throw std::invalid_argument("error: --scheduler must be 'slots' or 'paged'\n");
+            }
+            params.scheduler = value;
+        }
+    ).set_env("LLAMA_ARG_SCHEDULER").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--paged-admission"}, "full-ctx|actual-len",
+        "paged scheduler admission policy (default: full-ctx; actual-len reserved for future work)",
+        [](common_params & params, const std::string & value) {
+            if (value != "full-ctx" && value != "actual-len") {
+                throw std::invalid_argument("error: --paged-admission must be 'full-ctx' or 'actual-len'\n");
+            }
+            params.paged_admission = value;
+        }
+    ).set_env("LLAMA_ARG_PAGED_ADMISSION").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--kv-block-size"}, "N",
+        "paged KV block size in tokens (currently only 16 is supported)",
+        [](common_params & params, int value) {
+            if (value != 16) {
+                throw std::invalid_argument("error: --kv-block-size currently supports only 16\n");
+            }
+            params.kv_block_size = value;
+        }
+    ).set_env("LLAMA_ARG_KV_BLOCK_SIZE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--max-model-len"}, "N",
+        "vLLM-style maximum model length per request; server alias for --ctx-size in paged scheduler mode",
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("error: --max-model-len must be > 0\n");
+            }
+            params.max_model_len = value;
+            params.n_ctx = value;
+        }
+    ).set_env("LLAMA_ARG_MAX_MODEL_LEN").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--max-num-batched-tokens"}, "auto|N",
+        "vLLM-style maximum batched tokens; alias for --batch-size",
+        [](common_params & params, const std::string & value) {
+            if (is_autoy(value)) {
+                return;
+            }
+            const int n = std::stoi(value);
+            if (n <= 0) {
+                throw std::invalid_argument("error: --max-num-batched-tokens must be > 0\n");
+            }
+            params.n_batch = n;
+        }
+    ).set_env("LLAMA_ARG_MAX_NUM_BATCHED_TOKENS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--max-num-seqs"}, "auto|N",
+        "vLLM-style maximum concurrent sequences; alias for --max-parallel",
+        [](common_params & params, const std::string & value) {
+            if (is_autoy(value)) {
+                params.n_parallel_max = 0;
+                return;
+            }
+            const int n = std::stoi(value);
+            if (n <= 0) {
+                throw std::invalid_argument("error: --max-num-seqs must be > 0\n");
+            }
+            params.n_parallel_max = n;
+        }
+    ).set_env("LLAMA_ARG_MAX_NUM_SEQS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--cache-idle-slots"},
         {"--no-cache-idle-slots"},
         "save and clear idle slots on new task (default: enabled, requires unified KV and cache-ram)",

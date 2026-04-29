@@ -993,9 +993,19 @@ private:
         // Dynamic slot scheduler
         if (params_base.dynamic_slots) {
             const int32_t seq_max = (int32_t) llama_n_seq_max(ctx);
+            const int32_t bs      = (int32_t) LLAMA_KV_BLOCK_SIZE_DEFAULT;
+            const int32_t blks_per_full_ctx = (n_ctx_slot + bs - 1) / bs;
+            const int32_t free_blocks = llama_kv_cache_n_free_blocks(llama_get_memory(ctx));
+            const int32_t max_full_ctx = blks_per_full_ctx > 0 ? free_blocks / blks_per_full_ctx : 0;
+
+            if (params_base.scheduler == "paged") {
+                SRV_INF("[paged-scheduler] enabled: block_size=%d, max_model_len=%d, total_blocks=%d, blocks_per_full_ctx=%d, max_full_ctx_concurrency=%d, n_seq_max=%d\n",
+                        bs, n_ctx_slot, free_blocks, blks_per_full_ctx, max_full_ctx, seq_max);
+            }
+
             SRV_INF("[dynamic-slots] enabled: initial=%d, max=%d (n_seq_max), free_blocks=%d\n",
                     params_base.n_parallel, seq_max,
-                    llama_kv_cache_n_free_blocks(llama_get_memory(ctx)));
+                    free_blocks);
         }
 
         // the update_slots() logic will always submit a maximum of n_batch or n_parallel tokens

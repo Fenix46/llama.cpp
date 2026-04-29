@@ -116,6 +116,15 @@ public:
     // Block size.
     uint32_t block_size() const { return bs; }
 
+    // Return the block id that would be allocated after `offset` allocations.
+    // Used by non-mutating slot planning; alloc() pops from the back.
+    uint32_t peek_free(uint32_t offset = 0) const {
+        if (offset >= free_ids.size()) {
+            return LLAMA_KV_BLOCK_ID_NONE;
+        }
+        return free_ids[free_ids.size() - 1 - offset];
+    }
+
     // Access block by id.
     const llama_kv_block & get(uint32_t id) const {
         assert(id < blocks.size());
@@ -153,6 +162,11 @@ public:
     // the cell metadata in llama_kv_cells before or after this call.
     void free(uint32_t id) {
         assert(id < blocks.size());
+        for (uint32_t cur : free_ids) {
+            if (cur == id) {
+                return;
+            }
+        }
         free_ids.push_back(id);
     }
 

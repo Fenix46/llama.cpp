@@ -21,6 +21,7 @@ public:
                          bool   offload,
                          bool   swa_full,
                          bool   unified,
+                         bool   paged,
                      uint32_t   kv_size,
                      uint32_t   n_seq_max,
                      uint32_t   n_ubatch,
@@ -43,7 +44,8 @@ public:
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
-    bool get_can_shift() const override;
+    bool    get_can_shift()     const override;
+    int32_t get_n_free_blocks() const override;
 
     void clear(bool data) override;
 

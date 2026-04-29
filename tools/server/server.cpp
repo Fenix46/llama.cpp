@@ -99,6 +99,23 @@ int main(int argc, char ** argv) {
         params.kv_unified = true;
     }
 
+    if (params.scheduler == "paged") {
+        LOG_INF("%s: enabling paged scheduler mode (paged KV + unified KV + dynamic slots)\n", __func__);
+        params.paged_kv           = true;
+        params.kv_unified         = true;
+        params.dynamic_slots      = true;
+        params.kv_block_scheduler = true;
+
+        if (params.paged_admission != "full-ctx") {
+            LOG_WRN("%s: --paged-admission=%s parsed, but only full-ctx admission is implemented in this milestone\n",
+                    __func__, params.paged_admission.c_str());
+        }
+
+        if (params.n_parallel_max == 0) {
+            params.n_parallel_max = 256;
+        }
+    }
+
     // for consistency between server router mode and single-model mode, we set the same model name as alias
     if (params.model_alias.empty() && !params.model.name.empty()) {
         params.model_alias.insert(params.model.name);

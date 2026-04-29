@@ -38,6 +38,7 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
         offload,
         swa_full,
         unified,
+        false,
         kv_size,
         n_seq_max,
         n_ubatch,

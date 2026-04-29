@@ -19,6 +19,7 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                      bool   offload,
                      bool   swa_full,
                      bool   unified,
+                     bool   paged,
                  uint32_t   kv_size,
                  uint32_t   n_seq_max,
                  uint32_t   n_ubatch,
@@ -61,14 +62,14 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
 
     kv_base = std::make_unique<llama_kv_cache>(
             model, type_k, type_v,
-            v_trans, offload, unified, size_base, n_seq_max, n_pad,
+            v_trans, offload, unified, paged, size_base, n_seq_max, n_pad,
             0, LLAMA_SWA_TYPE_NONE, filter_base, reuse);
 
     LLAMA_LOG_INFO("%s: creating     SWA KV cache, size = %u cells\n", __func__, size_swa);
 
     kv_swa = std::make_unique<llama_kv_cache>(
             model, type_k, type_v,
-            v_trans, offload, unified, size_swa, n_seq_max, n_pad,
+            v_trans, offload, unified, paged, size_swa, n_seq_max, n_pad,
             hparams.n_swa, hparams.swa_type, filter_swa, reuse);
 }
 
@@ -221,6 +222,10 @@ bool llama_kv_cache_iswa::get_can_shift() const {
     return kv_base->get_can_shift() &&
            kv_swa->get_can_shift() &&
            kv_base->get_size() == kv_swa->get_size();
+}
+
+int32_t llama_kv_cache_iswa::get_n_free_blocks() const {
+    return std::min(kv_base->get_n_free_blocks(), kv_swa->get_n_free_blocks());
 }
 
 void llama_kv_cache_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
