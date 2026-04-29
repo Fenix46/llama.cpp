@@ -959,9 +959,14 @@ private:
 
         // Experimental cross-slot KV prefix cache
         if (params_base.kv_prefix_cache) {
-            prefix_cache_ = std::make_unique<kv_prefix_cache>(LLAMA_KV_BLOCK_SIZE_DEFAULT);
-            SRV_INF("%s", "[kv-prefix-cache] enabled (experimental): cross-slot prefix reuse, block_size=%d\n",
-                    (int)LLAMA_KV_BLOCK_SIZE_DEFAULT);
+            if (!params_base.kv_unified) {
+                SRV_WRN("%s", "[kv-prefix-cache] requires --kv-unified for cross-slot seq_cp — disabling\n");
+                params_base.kv_prefix_cache = false;
+            } else {
+                prefix_cache_ = std::make_unique<kv_prefix_cache>(LLAMA_KV_BLOCK_SIZE_DEFAULT);
+                SRV_INF("[kv-prefix-cache] enabled (experimental): cross-slot prefix reuse, block_size=%d\n",
+                        (int)LLAMA_KV_BLOCK_SIZE_DEFAULT);
+            }
         }
 
         // the update_slots() logic will always submit a maximum of n_batch or n_parallel tokens
