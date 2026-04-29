@@ -763,6 +763,10 @@ extern "C" {
     // Number of free KV blocks in stream 0 (paged allocator). Returns 0 if not using paged allocator.
     LLAMA_API int32_t llama_kv_cache_n_free_blocks(llama_memory_t mem);
 
+    // Rebuild the paged block table for seq_id after llama_state_seq_set_data_ext().
+    // No-op if the memory does not use the paged allocator.
+    LLAMA_API void llama_kv_cache_rebuild_block_table(llama_memory_t mem, llama_seq_id seq_id);
+
     //
     // State / sessions
     //

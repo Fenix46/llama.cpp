@@ -2659,6 +2659,9 @@ private:
                                             do_reset = true;
                                             //printf("[DEBUG] `do_reset` was set to `true` after failing to restore a checkpoint");
                                         } else {
+                                            // rebuild paged block table — llama_state_seq_set_data_ext writes
+                                            // directly to KV cells, bypassing paged_record_cell()
+                                            llama_kv_cache_rebuild_block_table(llama_get_memory(ctx), slot.id);
                                             pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                             n_past = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
                                             SLT_WRN(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) checkpoint_size / 1024 / 1024);
@@ -3170,6 +3173,7 @@ private:
                                         __func__, ckpt.pos_min, ckpt.pos_max, ckpt.size(), ckpt.size(), n);
                             }
 
+                            llama_kv_cache_rebuild_block_table(llama_get_memory(slot.ctx), slot.id);
                             llama_memory_seq_rm(llama_get_memory(slot.ctx), slot.id, ckpt.pos_max + 1, -1);
 
                             slot.prompt.tokens.keep_first(ckpt.n_tokens);

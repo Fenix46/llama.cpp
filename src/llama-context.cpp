@@ -5,6 +5,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -3322,6 +3323,16 @@ int32_t llama_kv_cache_n_free_blocks(llama_memory_t mem) {
         return 0;
     }
     return mem->get_n_free_blocks();
+}
+
+void llama_kv_cache_rebuild_block_table(llama_memory_t mem, llama_seq_id seq_id) {
+    if (!mem) {
+        return;
+    }
+    auto * kvc = dynamic_cast<llama_kv_cache *>(mem);
+    if (kvc) {
+        kvc->rebuild_block_table_for_seq(seq_id);
+    }
 }
 
 // llama state API

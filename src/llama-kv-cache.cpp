@@ -479,6 +479,34 @@ void llama_kv_cache::paged_record_cell(uint32_t strm, uint32_t cell_idx,
     }
 }
 
+void llama_kv_cache::rebuild_block_table_for_seq(llama_seq_id seq_id) {
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return;
+    }
+
+    const uint32_t strm = seq_to_stream[seq_id];
+    if (strm >= v_block_alloc.size()) {
+        return;
+    }
+
+    auto & alloc = v_block_alloc[strm];
+    if (alloc.n_blocks() == 0) {
+        return;
+    }
+
+    // remove stale block table entries for this seq, return blocks to free list
+    block_table.erase_seq(seq_id);
+
+    // rescan all cells — any cell belonging to seq_id rebuilds the mapping
+    const auto & c = v_cells[strm];
+    for (uint32_t i = 0; i < c.size(); ++i) {
+        if (c.is_empty(i) || !c.seq_has(i, seq_id)) {
+            continue;
+        }
+        paged_record_cell(strm, i, seq_id, c.pos_get(i));
+    }
+}
+
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
 

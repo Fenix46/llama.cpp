@@ -127,6 +127,11 @@ public:
     bool    get_can_shift()      const override;
     int32_t get_n_free_blocks()  const override;
 
+    // Rebuild the paged block table for seq_id by scanning physical cells.
+    // Must be called after llama_state_seq_set_data_ext() to keep the
+    // block table consistent with the KV data written directly to cells.
+    void rebuild_block_table_for_seq(llama_seq_id seq_id);
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;

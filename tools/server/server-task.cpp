@@ -2073,6 +2073,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             return false;
         }
 
+        // Rebuild the paged block table for this slot — llama_state_seq_set_data_ext
+        // writes directly to KV cells, bypassing paged_record_cell().
+        llama_kv_cache_rebuild_block_table(llama_get_memory(ctx), id_slot);
+
         it_best->data.clear();
         it_best->data.shrink_to_fit();
 
