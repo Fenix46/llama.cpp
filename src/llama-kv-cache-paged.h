@@ -133,6 +133,22 @@ public:
         return id;
     }
 
+    // Allocate a specific block by id — removes it from the free list if
+    // present. No-op (idempotent) if the block is already allocated.
+    // Used by paged_record_cell() to mark blocks as owned without changing
+    // which physical cells apply_ubatch() has already written to.
+    void alloc_specific(uint32_t id) {
+        assert(id < blocks.size());
+        for (uint32_t i = 0; i < (uint32_t) free_ids.size(); ++i) {
+            if (free_ids[i] == id) {
+                free_ids[i] = free_ids.back();
+                free_ids.pop_back();
+                return;
+            }
+        }
+        // not in free list → already allocated, nothing to do
+    }
+
     // Return a block to the free list. The caller is responsible for clearing
     // the cell metadata in llama_kv_cells before or after this call.
     void free(uint32_t id) {
@@ -190,6 +206,11 @@ public:
     uint32_t lookup(llama_seq_id seq_id, uint32_t logical_page) const {
         auto it = table.find(make_key(seq_id, logical_page));
         return (it != table.end()) ? it->second : LLAMA_KV_BLOCK_ID_NONE;
+    }
+
+    // Remove the mapping for a single (seq_id, page) pair.
+    void erase_page(llama_seq_id seq_id, uint32_t logical_page) {
+        table.erase(make_key(seq_id, logical_page));
     }
 
     // Remove all mappings for seq_id (called by seq_rm / seq_keep).
