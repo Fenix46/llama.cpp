@@ -950,6 +950,13 @@ private:
             }
         }
 
+        // pre-reserve to n_seq_max so emplace_back never reallocates
+        // (dynamic-slots takes &slots.back() — realloc would dangle)
+        {
+            const int32_t seq_max = (int32_t) llama_n_seq_max(ctx);
+            slots.reserve(seq_max > params_base.n_parallel ? seq_max : params_base.n_parallel);
+        }
+
         // initialize slots
         for (int i = 0; i < params_base.n_parallel; i++) {
             slots.emplace_back();
