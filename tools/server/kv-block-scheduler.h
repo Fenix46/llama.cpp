@@ -25,6 +25,9 @@
 
 #include "llama.h"
 #include "llama-kv-cache.h"   // llama_kv_cache, llama_kv_block_allocator
+#include "llama-kv-cache-iswa.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-iswa.h"
 #include "common/log.h"
 
 #include <cstdint>
@@ -137,10 +140,7 @@ private:
         s.n_total_slots  = n_total_slots_;
         s.n_active_slots = bucket_.n_active_slots;
 
-        // block pool stats — read from llama_kv_cache via dynamic_cast
-        auto * mem = llama_get_memory(ctx);
-        auto * kvc = dynamic_cast<llama_kv_cache *>(mem);
-        if (kvc) {
+        auto read_kv = [&](const llama_kv_cache * kvc) {
             const auto & alloc = kvc->get_block_alloc(0);
             s.n_blocks_total = alloc.n_blocks();
             s.n_blocks_free  = alloc.n_free();
@@ -150,6 +150,19 @@ private:
             if (s.n_blocks_total > 0) {
                 s.fragmentation = (float) s.n_blocks_free / (float) s.n_blocks_total;
             }
+        };
+
+        // block pool stats — read from direct, ISWA, or hybrid attention KV.
+        auto * mem = llama_get_memory(ctx);
+        auto * kvc = dynamic_cast<llama_kv_cache *>(mem);
+        if (kvc) {
+            read_kv(kvc);
+        } else if (auto * kvc_iswa = dynamic_cast<llama_kv_cache_iswa *>(mem)) {
+            read_kv(kvc_iswa->get_base());
+        } else if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
+            read_kv(hybrid->get_mem_attn());
+        } else if (auto * hybrid_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(mem)) {
+            read_kv(hybrid_iswa->get_mem_attn()->get_base());
         }
 
         // throughput

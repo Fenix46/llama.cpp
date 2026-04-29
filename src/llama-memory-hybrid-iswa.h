@@ -36,6 +36,7 @@ public:
                  uint32_t   n_seq_max,
                      bool   offload,
                      bool   unified,
+                     bool   paged,
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,
     const layer_filter_cb & filter_recr = nullptr);
@@ -56,6 +57,7 @@ public:
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
+    int32_t get_n_free_blocks() const override;
 
     void clear(bool data) override;
 
@@ -81,6 +83,8 @@ public:
 
     llama_kv_cache_iswa * get_mem_attn() const;
     llama_memory_recurrent * get_mem_recr() const;
+
+    void rebuild_block_table_for_seq(llama_seq_id seq_id);
 
 private:
     const llama_hparams & hparams;

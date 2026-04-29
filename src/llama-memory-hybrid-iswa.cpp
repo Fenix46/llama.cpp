@@ -26,6 +26,7 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
                  uint32_t   n_seq_max,
                      bool   offload,
                      bool   unified,
+                     bool   paged,
                             /* layer filters */
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr) :
@@ -38,7 +39,7 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
         offload,
         swa_full,
         unified,
-        false,
+        paged,
         kv_size,
         n_seq_max,
         n_ubatch,
@@ -131,6 +132,10 @@ bool llama_memory_hybrid_iswa::get_can_shift() const {
     return mem_attn->get_can_shift();
 }
 
+int32_t llama_memory_hybrid_iswa::get_n_free_blocks() const {
+    return mem_attn->get_n_free_blocks();
+}
+
 void llama_memory_hybrid_iswa::clear(bool data) {
     mem_attn->clear(data);
     mem_recr->clear(data);
@@ -199,6 +204,11 @@ llama_kv_cache_iswa * llama_memory_hybrid_iswa::get_mem_attn() const {
 
 llama_memory_recurrent * llama_memory_hybrid_iswa::get_mem_recr() const {
     return mem_recr.get();
+}
+
+void llama_memory_hybrid_iswa::rebuild_block_table_for_seq(llama_seq_id seq_id) {
+    mem_attn->get_base()->rebuild_block_table_for_seq(seq_id);
+    mem_attn->get_swa()->rebuild_block_table_for_seq(seq_id);
 }
 
 //

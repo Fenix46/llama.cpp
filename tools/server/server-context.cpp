@@ -1993,6 +1993,34 @@ private:
         return free_slots;
     }
 
+    int32_t count_processing_slots() const {
+        int32_t n_processing = 0;
+        for (const auto & slot : slots) {
+            if (slot.is_processing()) {
+                ++n_processing;
+            }
+        }
+        return n_processing;
+    }
+
+    bool paged_admission_available(size_t n_slots_needed) const {
+        if (params_base.scheduler != "paged" || paged_max_full_ctx_concurrency_ <= 0) {
+            return true;
+        }
+
+        const int32_t seq_max = ctx ? (int32_t) llama_n_seq_max(ctx) : paged_max_full_ctx_concurrency_;
+        const int32_t cap     = std::min(seq_max, paged_max_full_ctx_concurrency_);
+        const int32_t running = count_processing_slots();
+
+        if (running + (int32_t) n_slots_needed <= cap) {
+            return true;
+        }
+
+        SRV_DBG("[paged-scheduler] admission deferred: running=%d, requested=%zu, cap=%d, blocks_per_seq=%d\n",
+                running, n_slots_needed, cap, paged_blocks_per_seq_);
+        return false;
+    }
+
     // launch multiple slots for parent + child tasks
     bool launch_slots_with_parent_task(server_slot & parent_slot, std::vector<server_slot *> & child_slots, server_task && parent_task) {
         GGML_ASSERT(!parent_slot.is_processing());
@@ -2075,6 +2103,12 @@ private:
 
                     const int id_slot = task.id_slot;
                     const int id_task = task.id;
+
+                    const size_t n_slots_needed = task.is_parent() ? 1 + task.child_tasks.size() : 1;
+                    if (!paged_admission_available(n_slots_needed)) {
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
 
                     server_slot * slot = id_slot != -1 ? get_slot_by_id(id_slot) : get_available_slot(task);
 

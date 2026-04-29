@@ -6,6 +6,9 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-kv-cache.h"
+#include "llama-kv-cache-iswa.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-iswa.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -3334,6 +3337,22 @@ void llama_kv_cache_rebuild_block_table(llama_memory_t mem, llama_seq_id seq_id)
     auto * kvc = dynamic_cast<llama_kv_cache *>(mem);
     if (kvc) {
         kvc->rebuild_block_table_for_seq(seq_id);
+        return;
+    }
+    auto * kvc_iswa = dynamic_cast<llama_kv_cache_iswa *>(mem);
+    if (kvc_iswa) {
+        kvc_iswa->get_base()->rebuild_block_table_for_seq(seq_id);
+        kvc_iswa->get_swa()->rebuild_block_table_for_seq(seq_id);
+        return;
+    }
+    auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem);
+    if (hybrid) {
+        hybrid->rebuild_block_table_for_seq(seq_id);
+        return;
+    }
+    auto * hybrid_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(mem);
+    if (hybrid_iswa) {
+        hybrid_iswa->rebuild_block_table_for_seq(seq_id);
     }
 }
 
