@@ -448,24 +448,34 @@ void llama_kv_cache::paged_record_cell(uint32_t strm, uint32_t cell_idx,
 
     auto & alloc = v_block_alloc[strm];
     if (alloc.n_blocks() == 0) {
-        return; // allocator not initialised yet (can happen during construction)
+        return;
     }
 
     const uint32_t bs   = alloc.block_size();
     const uint32_t page = llama_kv_block_table::logical_page(pos, bs);
 
-    // Only insert if not already mapped (a block covers multiple cells).
-    if (block_table.lookup(seq_id, page) == LLAMA_KV_BLOCK_ID_NONE) {
-        // The physical block id is the flat block that contains cell_idx.
-        const uint32_t blk_id = cell_idx / bs;
-        if (blk_id < alloc.n_blocks()) {
-            block_table.insert(seq_id, page, blk_id);
+    if (block_table.lookup(seq_id, page) != LLAMA_KV_BLOCK_ID_NONE) {
+        return; // page already mapped
+    }
 
-            if (debug > 2) {
-                LLAMA_LOG_DEBUG("%s: [paged] seq %d pos %d → page %u → block %u (cell %u)\n",
-                        __func__, seq_id, pos, page, blk_id, cell_idx);
-            }
-        }
+    // Phase 2: derive block_id from the physical cell index that apply_ubatch
+    // chose (still contiguous slab in Phase 1/2 — block_id = cell_idx / bs).
+    // When find_slot() is block-table-driven the cell_idx passed here already
+    // comes from a block we own, so the division is exact.
+    const uint32_t blk_id = cell_idx / bs;
+    if (blk_id >= alloc.n_blocks()) {
+        return;
+    }
+
+    // Mark the block as allocated in the pool if it wasn't already.
+    // alloc.alloc_specific() removes blk_id from the free list if present.
+    alloc.alloc_specific(blk_id);
+
+    block_table.insert(seq_id, page, blk_id);
+
+    if (debug > 1) {
+        LLAMA_LOG_DEBUG("%s: [paged] seq %d pos %d → page %u → block %u (cell %u)\n",
+                __func__, seq_id, pos, page, blk_id, cell_idx);
     }
 }
 
@@ -503,12 +513,49 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
             head = new_head;
         }
 
-        // [paged] full-range remove: erase all block table entries for this seq.
-        // Partial-range removes leave pages intact; full rebuild from cells would
-        // be needed for sub-range accuracy, but Phase 1 only tracks full sequences.
-        const bool full_range = (p0 == 0 && p1 == std::numeric_limits<llama_pos>::max());
-        if (full_range) {
-            paged_seq_rm(seq_id);
+        // [paged] free any block whose entire cell range is now empty.
+        // Works for both full-range and partial-range removes: after cells are
+        // cleared above, we scan each page mapping for seq_id and check whether
+        // every cell in the corresponding block is vacant.
+        {
+            const uint32_t strm_id = seq_to_stream[seq_id];
+            if (strm_id < v_block_alloc.size()) {
+                auto & alloc       = v_block_alloc[strm_id];
+                const uint32_t bs  = alloc.block_size();
+
+                for (uint32_t page = 0; ; ++page) {
+                    const uint32_t blk_id = block_table.lookup(seq_id, page);
+                    if (blk_id == LLAMA_KV_BLOCK_ID_NONE) {
+                        break;
+                    }
+
+                    const auto & blk = alloc.get(blk_id);
+                    bool block_empty = true;
+
+                    for (uint32_t k = 0; k < bs && blk.first_cell + k < cells.size(); ++k) {
+                        if (!cells.is_empty(blk.first_cell + k)) {
+                            block_empty = false;
+                            break;
+                        }
+                    }
+
+                    if (block_empty) {
+                        alloc.free(blk_id);
+                        block_table.erase_page(seq_id, page);
+
+                        if (debug > 1) {
+                            LLAMA_LOG_DEBUG("%s: [paged] seq %d page %u → block %u freed\n",
+                                    __func__, seq_id, page, blk_id);
+                        }
+                    }
+                }
+            }
+
+            // full-range: also purge any remaining table entries
+            const bool full_range = (p0 == 0 && p1 == std::numeric_limits<llama_pos>::max());
+            if (full_range) {
+                paged_seq_rm(seq_id);
+            }
         }
     } else {
         // match any sequence
@@ -1064,88 +1111,138 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
         const auto & cells = v_cells[seq_to_stream[seq_id]];
 
-        uint32_t head_cur = v_heads[seq_to_stream[seq_id]];
+        // ---------------------------------------------------------------
+        // Phase 2 block-table fast path
+        //
+        // For each token in the ubatch, if (seq_id, logical_page(pos)) is
+        // already in the block_table, the physical cell is fully determined:
+        //   cell = block.first_cell + intra_block_offset(pos)
+        //
+        // We try this for every token first.  If ALL tokens map through the
+        // block table we skip the ring-buffer scan entirely.  If any token
+        // has no mapping we fall through to the existing ring-buffer logic
+        // (which will allocate via apply_ubatch / paged_record_cell).
+        // ---------------------------------------------------------------
+        const uint32_t strm      = seq_to_stream[seq_id];
+        bool           use_paged = false;
 
-        // if we have enough unused cells before the current head ->
-        //   better to start searching from the beginning of the cache, hoping to fill it
-        if (head_cur > cells.get_used() + 2*n_tokens) {
-            head_cur = 0;
-        }
+        if (strm < v_block_alloc.size() && v_block_alloc[strm].n_blocks() > 0) {
+            const auto & alloc = v_block_alloc[strm];
+            const uint32_t bs  = alloc.block_size();
 
-        if (n_tokens > cells.size()) {
-            LLAMA_LOG_ERROR("%s: n_tokens = %d > size = %u\n", __func__, n_tokens, cells.size());
-            return { };
-        }
+            res.idxs[s].clear();
 
-        uint32_t n_tested = 0;
+            bool all_mapped = true;
+            for (uint32_t ii = 0; ii < n_tokens; ++ii) {
+                const uint32_t i  = s * n_tokens + ii;
+                const llama_pos pos = ubatch.pos[i];
 
-        // for continuous slots, we test that all tokens in the ubatch fit, starting from the current head
-        // for non-continuous slots, we test the tokens one by one
-        const uint32_t n_test = cont ? n_tokens : 1;
+                const uint32_t page   = llama_kv_block_table::logical_page(pos, bs);
+                const uint32_t intra  = llama_kv_block_table::intra_offset(pos, bs);
+                const uint32_t blk_id = block_table.lookup(seq_id, page);
 
-        while (true) {
-            if (head_cur + n_test > cells.size()) {
-                n_tested += cells.size() - head_cur;
-                head_cur = 0;
-                continue;
+                if (blk_id == LLAMA_KV_BLOCK_ID_NONE) {
+                    all_mapped = false;
+                    break;
+                }
+
+                const uint32_t cell_idx = alloc.get(blk_id).first_cell + intra;
+
+                if (cell_idx >= cells.size()) {
+                    all_mapped = false;
+                    break;
+                }
+
+                res.idxs[s].push_back(cell_idx);
             }
 
-            for (uint32_t i = 0; i < n_test; i++) {
-                const auto idx = head_cur;
+            if (all_mapped && res.idxs[s].size() == n_tokens) {
+                use_paged = true;
 
-                head_cur++;
-                n_tested++;
+                if (debug > 1) {
+                    LLAMA_LOG_DEBUG("%s: [paged] seq %d: all %u tokens resolved via block table\n",
+                            __func__, seq_id, n_tokens);
+                }
+            } else {
+                res.idxs[s].clear();
+            }
+        }
 
-                //const llama_pos    pos    = ubatch.pos[i];
-                //const llama_seq_id seq_id = ubatch.seq_id[i][0];
+        if (!use_paged) {
+            // ---------------------------------------------------------------
+            // Original ring-buffer scan (unchanged)
+            // ---------------------------------------------------------------
+            uint32_t head_cur = v_heads[seq_to_stream[seq_id]];
 
-                // can we use this cell? either:
-                //  - the cell is empty
-                //  - the cell is occupied only by one sequence:
-                //    - (disabled) mask causally, if the sequence is the same as the one we are inserting
-                //    - mask SWA, using current max pos for that sequence in the cache
-                //                always insert in the cell with minimum pos
-                bool can_use = cells.is_empty(idx);
+            // if we have enough unused cells before the current head ->
+            //   better to start searching from the beginning of the cache, hoping to fill it
+            if (head_cur > cells.get_used() + 2*n_tokens) {
+                head_cur = 0;
+            }
 
-                if (!can_use && cells.seq_count(idx) == 1) {
-                    const llama_pos pos_cell = cells.pos_get(idx);
+            if (n_tokens > cells.size()) {
+                LLAMA_LOG_ERROR("%s: n_tokens = %d > size = %u\n", __func__, n_tokens, cells.size());
+                return { };
+            }
 
-                    // (disabled) causal mask
-                    // note: it's better to purge any "future" tokens beforehand
-                    //if (cells.seq_has(idx, seq_id)) {
-                    //    can_use = pos_cell >= pos;
-                    //}
+            uint32_t n_tested = 0;
 
-                    if (!can_use) {
-                        const llama_seq_id seq_id_cell = cells.seq_get(idx);
+            // for continuous slots, we test that all tokens in the ubatch fit, starting from the current head
+            // for non-continuous slots, we test the tokens one by one
+            const uint32_t n_test = cont ? n_tokens : 1;
 
-                        // SWA mask
-                        if (llama_hparams::is_masked_swa(n_swa, swa_type, pos_cell, cells.seq_pos_max(seq_id_cell) + 1)) {
-                            can_use = true;
+            while (true) {
+                if (head_cur + n_test > cells.size()) {
+                    n_tested += cells.size() - head_cur;
+                    head_cur = 0;
+                    continue;
+                }
+
+                for (uint32_t i = 0; i < n_test; i++) {
+                    const auto idx = head_cur;
+
+                    head_cur++;
+                    n_tested++;
+
+                    // can we use this cell? either:
+                    //  - the cell is empty
+                    //  - the cell is occupied only by one sequence:
+                    //    - mask SWA, using current max pos for that sequence in the cache
+                    bool can_use = cells.is_empty(idx);
+
+                    if (!can_use && cells.seq_count(idx) == 1) {
+                        const llama_pos pos_cell = cells.pos_get(idx);
+
+                        if (!can_use) {
+                            const llama_seq_id seq_id_cell = cells.seq_get(idx);
+
+                            // SWA mask
+                            if (llama_hparams::is_masked_swa(n_swa, swa_type, pos_cell, cells.seq_pos_max(seq_id_cell) + 1)) {
+                                can_use = true;
+                            }
+                        }
+                    }
+
+                    if (can_use) {
+                        res.idxs[s].push_back(idx);
+                    } else {
+                        if (cont) {
+                            break;
                         }
                     }
                 }
 
-                if (can_use) {
-                    res.idxs[s].push_back(idx);
-                } else {
-                    if (cont) {
-                        break;
-                    }
+                if (res.idxs[s].size() == n_tokens) {
+                    break;
                 }
-            }
 
-            if (res.idxs[s].size() == n_tokens) {
-                break;
-            }
+                if (cont) {
+                    res.idxs[s].clear();
+                }
 
-            if (cont) {
-                res.idxs[s].clear();
-            }
-
-            if (n_tested >= cells.size()) {
-                //LLAMA_LOG_ERROR("%s: failed to find a slot for %d tokens\n", __func__, n_tokens);
-                return { };
+                if (n_tested >= cells.size()) {
+                    return { };
+                }
             }
         }
 
@@ -1289,9 +1386,13 @@ const llama_kv_block_table & llama_kv_cache::get_block_table() const {
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     uint32_t result = 0;
 
-    // pad the n_kv value so that the graph remains constant across batches and can be reused
-    // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
-    const uint32_t n_pad_cur = std::max(n_pad, 256u);
+    // pad to block_size boundary when paged allocation is active so that the
+    // attention mask covers only whole blocks and graph shape stays stable
+    const uint32_t strm0    = sinfo.strm.empty() ? 0 : sinfo.strm[0];
+    const uint32_t bs       = (strm0 < v_block_alloc.size() && v_block_alloc[strm0].n_blocks() > 0)
+                                ? v_block_alloc[strm0].block_size()
+                                : 1u;
+    const uint32_t n_pad_cur = std::max({n_pad, 256u, bs});
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
