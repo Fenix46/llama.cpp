@@ -1346,6 +1346,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_BLOCK_SCHEDULER").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--kv-prefix-cache"},
+        {"--no-kv-prefix-cache"},
+        "enable experimental cross-slot KV prefix cache: reuses cached KV blocks across requests sharing a common prompt prefix (default: disabled)",
+        [](common_params & params, bool value) {
+            params.kv_prefix_cache = value;
+        }
+    ).set_env("LLAMA_ARG_KV_PREFIX_CACHE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--context-shift"},
         {"--no-context-shift"},
         string_format("whether to use context shift on infinite text generation (default: %s)", params.ctx_shift ? "enabled" : "disabled"),

@@ -540,6 +540,7 @@ struct common_params {
     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
     bool kv_unified        = false; // enable unified KV cache
     bool kv_block_scheduler = false; // enable experimental paged-KV block scheduler (logs metrics, no inference change)
+    bool kv_prefix_cache    = false; // enable experimental cross-slot prefix caching (reuses KV blocks across requests)
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool use_mmap          = true;  // enable mmap to use filesystem cache
