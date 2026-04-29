@@ -2,7 +2,7 @@
 
 > Branch: `paged-kv-cache-phase1`
 > Status: fork-private development plan
-> Last known good build: `cmake --build build --target llama-server -j 8`
+> Last known good build: `cmake --build build-arm64-apple-clang-release --target llama-server -j 8`
 
 ## Current State
 
@@ -12,9 +12,10 @@ The server has an opt-in paged scheduler mode:
 ./build/bin/llama-server \
   -m /path/model.gguf \
   --scheduler paged \
+  --paged-admission actual-len \
   --ctx-size 32768 \
   --max-model-len 8192 \
-  --max-num-seqs auto \
+  --max-num-seqs 32 \
   --max-num-batched-tokens 4096 \
   --kv-block-size 16 \
   -ngl 999 \
@@ -33,19 +34,27 @@ Implemented commits:
 - `c14be8d62 server: add opt-in paged KV scheduler mode`
 - `95a70ef88 server: separate paged KV pool from request context`
 - `ccb64c3e5 server: log paged admission cap`
+- `f02546dab server: support paged scheduler for hybrid memory`
+- `f424a603b kv-cache: handle mixed sequence paged batches`
+- `15ec6b68e server: chunk prefill under paged scheduler`
+- `8cb986903 kv-cache: assert paged block table mask mapping`
 
 Important behavior now:
 
 - `--ctx-size` is the total unified KV pool size.
 - `--max-model-len` is the per-request context limit.
 - `max_full_ctx_concurrency = floor(total_blocks / ceil(max_model_len / 16))`.
-- Initial slots are capped to full-context concurrency in paged mode.
-- Dynamic slot growth respects the same full-context reservation cap.
-- `--paged-admission actual-len` is parsed but not implemented; effective behavior is `full-ctx`.
+- `--paged-admission full-ctx` reserves the full per-request context and caps dynamic slot growth to full-context concurrency.
+- `--paged-admission actual-len` reserves blocks from `prompt_tokens + max_tokens`; if generation is unbounded it falls back to full-context reservation.
+- Decode tokens are batched before prefill tokens; in paged mode, prefill only uses leftover `--max-num-batched-tokens` budget.
+- Paged block-table mapping is asserted in KQ-mask debug mode via `LLAMA_KV_CACHE_DEBUG=1`.
+- Current server still uses slots internally, but paged mode now supports dynamic slot growth toward vLLM-like request admission.
 
-## Next Milestone 1: Runtime Admission Validation
+## Milestone 1: Runtime Admission Validation
 
 Goal: prove no overcommit with `max_full_ctx_concurrency + 1` concurrent requests.
+
+Status: complete.
 
 Tasks:
 
@@ -77,9 +86,11 @@ Acceptance:
 - No block allocator corruption.
 - No KV collision.
 
-## Next Milestone 2: Chunked Prefill
+## Milestone 2: Chunked Prefill
 
 Goal: stop long prompts from blocking real-time decode.
+
+Status: complete for `--scheduler paged`.
 
 Design:
 
@@ -104,9 +115,38 @@ Acceptance:
 - TTFT improves versus monolithic prefill.
 - Existing non-paged scheduler behavior unchanged.
 
-## Next Milestone 3: Paged Mask and Logical Attention
+## Milestone 3: Actual-Length Admission
+
+Goal: move from full-context admission to vLLM-style block reservation based on request size.
+
+Status: initial implementation complete.
+
+Behavior:
+
+- `--paged-admission full-ctx` remains default and unchanged.
+- `--paged-admission actual-len` reserves `ceil((prompt_tokens + max_tokens) / block_size)` blocks per request.
+- Dynamic slots can grow beyond `max_full_ctx_concurrency` up to `--max-num-seqs` if reserved blocks fit.
+- Requests with unbounded `max_tokens` fall back to full-context reservation.
+- Parent/child tasks reserve the sum of all task reservations.
+
+Validated:
+
+- LFM2-2.6B Q4_0 on Apple M2.
+- `--scheduler paged --paged-admission actual-len -c 32768 -np 4 --max-num-seqs 32 --max-num-batched-tokens 128 --max-model-len 8192`.
+- 8 concurrent short requests returned HTTP 200 with no KV errors.
+
+Next validation:
+
+- 16 and 32 concurrent short requests with `max_tokens=32/64`.
+- Mixed short/medium requests with `max_tokens=32/200`.
+- Controlled overcommit: many requests whose total reserved blocks exceed `total_blocks`; expected behavior is queue/defer, not KV error.
+- Compare `full-ctx` vs `actual-len` active slot count under same workload.
+
+## Milestone 4: Paged Mask and Logical Attention
 
 Goal: make attention metadata explicitly logical-sequence based instead of relying on physical slab iteration.
+
+Status: debug invariant added; full logical iterator still pending.
 
 Design:
 
@@ -121,14 +161,16 @@ Implementation points:
 - Introduce helper to iterate logical pages for a seq.
 - Preserve fallback path for non-paged mode.
 - Add debug assertions when paged mode sees a physical cell with wrong `seq_id`.
+- Keep current physical-cell K/V indexing; logical page table selects storage, not sequence order.
 
 Acceptance:
 
 - Single request output matches baseline with fixed seed.
 - Interleaved multi-request output stays stable.
 - No attention to unrelated request cells.
+- `LLAMA_KV_CACHE_DEBUG=1` has no block-table mismatch under paged workloads.
 
-## Next Milestone 4: CUDA H200 Fast Path
+## Milestone 5: CUDA H200 Fast Path
 
 Goal: use paged block table on device side for throughput.
 
@@ -152,22 +194,45 @@ Acceptance:
 
 - Prefix cache vLLM-style is not implemented.
 - Copy-on-write for shared blocks is not implemented.
-- `actual-len` admission is not implemented.
+- `actual-len` admission uses reservation accounting, not exact live block pressure.
+- No explicit preemption/eviction policy for overcommitted running requests.
 - Metal path is correctness-first, not optimized.
-- Current server still uses slots internally; paged mode constrains slots to vLLM-like full-context capacity.
+- Current server still uses slots internally.
+- Paged mask still scans physical cells; debug asserts validate block-table coherence, but logical-page iteration is pending.
+
+## Next Work Queue
+
+1. Add admission debug/metrics:
+   - reserved blocks
+   - live free blocks
+   - requested blocks
+   - active paged slots
+2. Add actual-len stress tests:
+   - 16/32 short parallel requests
+   - mixed short/medium requests
+   - controlled over-reservation queue/defer test
+3. Implement paged logical KQ-mask iterator:
+   - iterate `(seq_id, page)` block table entries for each active seq
+   - preserve physical-cell index as K/V storage selector
+   - compare against current physical scan under `LLAMA_KV_CACHE_DEBUG=1`
+4. Add prefix cache/COW design:
+   - shared block refs
+   - copy-on-write on divergent decode
+   - prompt cache compatibility
+5. Only after correctness: CUDA/H200 paged attention fast path.
 
 ## Useful Commands
 
 Build:
 
 ```bash
-cmake --build build --target llama-server -j 8
+cmake --build build-arm64-apple-clang-release --target llama-server -j 8
 ```
 
 Help smoke:
 
 ```bash
-./build/bin/llama-server --help 2>/dev/null | rg -- "--scheduler|--ctx-size|--max-model-len|--max-num-seqs|--max-num-batched-tokens"
+./build-arm64-apple-clang-release/bin/llama-server --help 2>/dev/null | rg -- "--scheduler|--paged-admission|--ctx-size|--max-model-len|--max-num-seqs|--max-num-batched-tokens"
 ```
 
 Check branch:
