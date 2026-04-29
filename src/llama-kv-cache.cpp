@@ -1785,14 +1785,57 @@ struct args_set_input_kq_mask {
 
     const std::vector<llama_kv_cells> & v_cells;
     const std::vector<uint32_t>       & seq_to_stream;
+    const std::vector<llama_kv_block_allocator> & v_block_alloc;
+    const llama_kv_block_table                  & block_table;
 
     uint32_t       n_swa;
     llama_swa_type swa_type;
+
+    bool paged;
+    int  debug;
 
     int64_t n_kv;
     int64_t n_stream;
     int64_t n_tps;
 };
+
+static void assert_paged_kq_mask_cell(
+        const args_set_input_kq_mask & args,
+              llama_seq_id            seq_id,
+              llama_pos               pos,
+              uint32_t                cell_idx) {
+    if (!args.paged || args.debug <= 0) {
+        return;
+    }
+
+    const uint32_t strm = args.seq_to_stream[seq_id];
+    if (strm >= args.v_block_alloc.size()) {
+        return;
+    }
+
+    const auto & alloc = args.v_block_alloc[strm];
+    if (alloc.n_blocks() == 0) {
+        return;
+    }
+
+    const uint32_t bs     = alloc.block_size();
+    const uint32_t page   = llama_kv_block_table::logical_page(pos, bs);
+    const uint32_t intra  = llama_kv_block_table::intra_offset(pos, bs);
+    const uint32_t blk_id = args.block_table.lookup(seq_id, page);
+
+    if (blk_id == LLAMA_KV_BLOCK_ID_NONE) {
+        LLAMA_LOG_ERROR("%s: [paged] missing block table entry for seq %d, pos %d, page %u, cell %u\n",
+                __func__, seq_id, pos, page, cell_idx);
+        GGML_ASSERT(false);
+    }
+
+    const auto & blk = alloc.get(blk_id);
+    if (intra >= blk.size || blk.first_cell + intra != cell_idx) {
+        LLAMA_LOG_ERROR("%s: [paged] block table mismatch for seq %d, pos %d, page %u: block %u maps to cell %u, actual cell %u\n",
+                __func__, seq_id, pos, page, blk_id, blk.first_cell + intra, cell_idx);
+        GGML_ASSERT(false);
+    }
+}
 
 template<bool causal, bool swa, bool is_2d, bool alibi>
 static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * data) {
@@ -1891,6 +1934,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * 
                 }
 
                 p0 = cells.pos_get(j);
+                assert_paged_kq_mask_cell(args, seq_id, p0, j);
 
                 if (!alibi) {
                     if (!prev) {
@@ -1991,8 +2035,12 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         /*.ubatch           =*/ ubatch,
         /*.v_cells          =*/ v_cells,
         /*.seq_to_stream    =*/ seq_to_stream,
+        /*.v_block_alloc    =*/ v_block_alloc,
+        /*.block_table      =*/ block_table,
         /*.n_swa            =*/ n_swa,
         /*.swa_type         =*/ swa_type,
+        /*.paged            =*/ paged,
+        /*.debug            =*/ debug,
         /*.n_kv             =*/ n_kv,
         /*.n_stream         =*/ n_stream,
         /*.n_tps            =*/ n_tps,
