@@ -2161,6 +2161,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.n_parallel = value;
             }
         ).set_env("LLAMA_ARG_N_PARALLEL").set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--max-parallel"}, "N",
+            "maximum number of slots that --dynamic-slots can grow to (sets KV n_seq_max; default: same as --parallel)",
+            [](common_params & params, int value) {
+                if (value <= 0) {
+                    throw std::invalid_argument("error: --max-parallel must be > 0\n");
+                }
+                params.n_parallel_max = value;
+            }
+        ).set_env("LLAMA_ARG_N_PARALLEL_MAX").set_examples({LLAMA_EXAMPLE_SERVER}));
     } else {
         add_opt(common_arg(
             {"-np", "--parallel"}, "N",

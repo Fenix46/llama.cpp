@@ -983,6 +983,14 @@ private:
             }
         }
 
+        // Dynamic slot scheduler
+        if (params_base.dynamic_slots) {
+            const int32_t seq_max = (int32_t) llama_n_seq_max(ctx);
+            SRV_INF("[dynamic-slots] enabled: initial=%d, max=%d (n_seq_max), free_blocks=%d\n",
+                    params_base.n_parallel, seq_max,
+                    llama_kv_cache_n_free_blocks(llama_get_memory(ctx)));
+        }
+
         // the update_slots() logic will always submit a maximum of n_batch or n_parallel tokens
         // note that n_batch can be > n_ctx (e.g. for non-causal attention models such as BERT where the KV cache is not used)
         {

@@ -425,7 +425,8 @@ struct common_params {
     int32_t n_ubatch              =   512; // physical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
-    int32_t n_parallel            =     1; // number of parallel sequences to decode
+    int32_t n_parallel            =     1; // number of parallel sequences to decode (initial slot count)
+    int32_t n_parallel_max        =     0; // KV n_seq_max ceiling for dynamic-slots (0 = same as n_parallel)
     int32_t n_sequences           =     1; // number of sequences to decode
     int32_t grp_attn_n            =     1; // group-attention factor
     int32_t grp_attn_w            =   512; // group-attention width
