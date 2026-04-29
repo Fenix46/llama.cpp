@@ -140,6 +140,12 @@ llama_kv_cache::llama_kv_cache(
         v_cells[s].resize(kv_size);
     }
 
+    // [paged] initialise one block allocator per stream, covering the same flat slab
+    v_block_alloc.resize(n_stream);
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        v_block_alloc[s].init(kv_size, LLAMA_KV_BLOCK_SIZE_DEFAULT);
+    }
+
     // by default, all sequence ids are mapped to the 0th stream
     seq_to_stream.resize(LLAMA_MAX_SEQ, 0);
 
@@ -337,6 +343,130 @@ void llama_kv_cache::clear(bool data) {
             ggml_backend_buffer_clear(buf.get(), 0);
         }
     }
+
+    paged_clear();
+}
+
+// =============================================================================
+// Paged KV cache — block table sync helpers (Phase 1 preparatory abstraction)
+//
+// These functions keep llama_kv_block_table in sync with cell mutations so
+// that Phase 2 can read an accurate (seq_id, logical_page) → block_id map.
+// None of these functions affect runtime decode output.
+// =============================================================================
+
+void llama_kv_cache::paged_clear() {
+    block_table.clear();
+
+    for (auto & alloc : v_block_alloc) {
+        alloc.reset();
+    }
+
+    if (debug > 1) {
+        LLAMA_LOG_DEBUG("%s: [paged] block table cleared\n", __func__);
+    }
+}
+
+void llama_kv_cache::paged_seq_rm(llama_seq_id seq_id) {
+    if (seq_id < 0) {
+        // seq_id == -1 means "remove all" — clear every seq's pages
+        block_table.clear();
+        for (auto & alloc : v_block_alloc) {
+            alloc.reset();
+        }
+        if (debug > 1) {
+            LLAMA_LOG_DEBUG("%s: [paged] all sequences removed from block table\n", __func__);
+        }
+        return;
+    }
+
+    // Free each block owned by this seq, then erase its table entries.
+    // We iterate through the flat allocator and release blocks whose only
+    // remaining logical owner is seq_id.  For now (Phase 1, unified stream)
+    // we use stream 0 when n_stream == 1, otherwise the seq's stream.
+    const uint32_t strm = (n_stream == 1) ? 0 : seq_to_stream[seq_id];
+    if (strm < v_block_alloc.size()) {
+        auto & alloc = v_block_alloc[strm];
+        for (uint32_t page = 0; ; ++page) {
+            const uint32_t blk_id = block_table.lookup(seq_id, page);
+            if (blk_id == LLAMA_KV_BLOCK_ID_NONE) {
+                break;
+            }
+            alloc.free(blk_id);
+        }
+    }
+
+    block_table.erase_seq(seq_id);
+
+    if (debug > 1) {
+        LLAMA_LOG_DEBUG("%s: [paged] seq %d removed from block table\n", __func__, seq_id);
+    }
+}
+
+void llama_kv_cache::paged_seq_cp(llama_seq_id src, llama_seq_id dst) {
+    // Erase dst's existing pages first, then mirror src → dst.
+    // Same-stream copy: src and dst share physical blocks (copy-on-write
+    // semantics are for Phase 2; here we just duplicate the mapping).
+    block_table.erase_seq(dst);
+    block_table.copy_seq(src, dst);
+
+    if (debug > 1) {
+        LLAMA_LOG_DEBUG("%s: [paged] seq %d block table copied to seq %d\n", __func__, src, dst);
+    }
+}
+
+void llama_kv_cache::paged_seq_keep(llama_seq_id seq_id) {
+    // Erase every sequence except seq_id and release their blocks.
+    for (int32_t s = 0; s < (int32_t) LLAMA_MAX_SEQ; ++s) {
+        if (s == seq_id) {
+            continue;
+        }
+        const uint32_t strm = (n_stream == 1) ? 0 : (uint32_t) seq_to_stream[s];
+        if (strm < v_block_alloc.size()) {
+            auto & alloc = v_block_alloc[strm];
+            for (uint32_t page = 0; ; ++page) {
+                const uint32_t blk_id = block_table.lookup(s, page);
+                if (blk_id == LLAMA_KV_BLOCK_ID_NONE) {
+                    break;
+                }
+                alloc.free(blk_id);
+            }
+        }
+        block_table.erase_seq(s);
+    }
+
+    if (debug > 1) {
+        LLAMA_LOG_DEBUG("%s: [paged] kept only seq %d in block table\n", __func__, seq_id);
+    }
+}
+
+void llama_kv_cache::paged_record_cell(uint32_t strm, uint32_t cell_idx,
+                                        llama_seq_id seq_id, llama_pos pos) {
+    if (strm >= v_block_alloc.size()) {
+        return;
+    }
+
+    auto & alloc = v_block_alloc[strm];
+    if (alloc.n_blocks() == 0) {
+        return; // allocator not initialised yet (can happen during construction)
+    }
+
+    const uint32_t bs   = alloc.block_size();
+    const uint32_t page = llama_kv_block_table::logical_page(pos, bs);
+
+    // Only insert if not already mapped (a block covers multiple cells).
+    if (block_table.lookup(seq_id, page) == LLAMA_KV_BLOCK_ID_NONE) {
+        // The physical block id is the flat block that contains cell_idx.
+        const uint32_t blk_id = cell_idx / bs;
+        if (blk_id < alloc.n_blocks()) {
+            block_table.insert(seq_id, page, blk_id);
+
+            if (debug > 2) {
+                LLAMA_LOG_DEBUG("%s: [paged] seq %d pos %d → page %u → block %u (cell %u)\n",
+                        __func__, seq_id, pos, page, blk_id, cell_idx);
+            }
+        }
+    }
 }
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -372,6 +502,14 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         if (new_head != cells.size() && new_head < head) {
             head = new_head;
         }
+
+        // [paged] full-range remove: erase all block table entries for this seq.
+        // Partial-range removes leave pages intact; full rebuild from cells would
+        // be needed for sub-range accuracy, but Phase 1 only tracks full sequences.
+        const bool full_range = (p0 == 0 && p1 == std::numeric_limits<llama_pos>::max());
+        if (full_range) {
+            paged_seq_rm(seq_id);
+        }
     } else {
         // match any sequence
         for (uint32_t s = 0; s < n_stream; ++s) {
@@ -397,6 +535,9 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
                 head = new_head;
             }
         }
+
+        // [paged] seq_id == -1: nuke all sequences from block table
+        paged_seq_rm(-1);
     }
 
     return true;
@@ -487,6 +628,9 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
     //for (uint32_t s = 0; s < n_stream; ++s) {
     //    LLAMA_LOG_WARN("%s: seq %d: min = %d, max = %d\n", __func__, s, v_cells[s].seq_pos_min(s), v_cells[s].seq_pos_max(s));
     //}
+
+    // [paged] mirror block table from src → dst
+    paged_seq_cp(seq_id_src, seq_id_dst);
 }
 
 void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
@@ -509,6 +653,9 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
     if (new_head != cells.size() && new_head < head) {
         head = new_head;
     }
+
+    // [paged] discard all other sequences from block table
+    paged_seq_keep(seq_id);
 }
 
 void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
@@ -1054,6 +1201,11 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
             for (int32_t s = 0; s < ubatch.n_seq_id[i]; s++) {
                 cells.seq_add(idx, ubatch.seq_id[i][s]);
+            }
+
+            // [paged] record the (seq_id, logical_page) → block mapping for each token
+            for (int32_t sq = 0; sq < ubatch.n_seq_id[i]; sq++) {
+                paged_record_cell(sinfo.strm[s], idx, ubatch.seq_id[i][sq], ubatch.pos[i]);
             }
         }
     }
