@@ -1303,7 +1303,12 @@ private:
 
                 update_cache = false; // fresh slot — nothing to cache
             } else if (n_cur >= seq_cap) {
-                SRV_WRN("[dynamic-slots] cannot grow: n_slots=%d >= seq_cap=%d\n", n_cur, seq_cap);
+                if (params_base.scheduler == "paged") {
+                    SRV_DBG("[paged-scheduler] full-ctx admission cap reached: n_slots=%d, max_full_ctx_concurrency=%d, blocks_per_seq=%d\n",
+                            n_cur, seq_cap, blks_needed);
+                } else {
+                    SRV_WRN("[dynamic-slots] cannot grow: n_slots=%d >= seq_cap=%d\n", n_cur, seq_cap);
+                }
             } else {
                 SRV_WRN("[dynamic-slots] KV pool exhausted: free_blocks=%d < needed=%d\n", n_free_blk, blks_needed);
             }
