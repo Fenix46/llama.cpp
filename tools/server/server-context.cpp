@@ -2497,6 +2497,11 @@ private:
         int32_t n_batch  = llama_n_batch(ctx);
         int32_t n_ubatch = llama_n_ubatch(ctx);
 
+        const bool is_paged_scheduler = params_base.scheduler == "paged";
+        const int32_t decode_tokens_in_batch = batch.n_tokens;
+        const int32_t prefill_budget = is_paged_scheduler ? std::max(0, n_batch - decode_tokens_in_batch) : n_batch;
+        int32_t prefill_added = 0;
+
         float  alora_scale       = -1.0f;
         size_t alora_disabled_id = 0;
 
@@ -2520,6 +2525,10 @@ private:
 
                 // this slot still has a prompt to be processed
                 if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) {
+                    if (is_paged_scheduler && prefill_added >= prefill_budget) {
+                        continue;
+                    }
+
                     const auto & input_tokens = slot.task->tokens;
 
                     // used to determine the number of tokens added to the batch for the current slot
@@ -2814,6 +2823,9 @@ private:
                         if (batch.n_tokens + slot.task->n_tokens() > n_batch) {
                             continue;
                         }
+                        if (is_paged_scheduler && prefill_added + slot.task->n_tokens() > prefill_budget) {
+                            continue;
+                        }
                     }
 
                     // truncate any tokens that are beyond n_past for this slot
@@ -2883,7 +2895,8 @@ private:
                     }
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.n_tokens < n_batch) {
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.n_tokens < n_batch &&
+                           (!is_paged_scheduler || prefill_added < prefill_budget)) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -2904,6 +2917,7 @@ private:
                             slot.prompt.tokens.pos_next(),
                             { slot.id },
                             slot.task->need_embd());
+                        prefill_added++;
                         slot.prompt.tokens.push_back(cur_tok);
 
                         slot.n_prompt_tokens_processed++;
@@ -3000,6 +3014,11 @@ private:
                     break;
                 }
             }
+        }
+
+        if (is_paged_scheduler) {
+            SRV_DBG("[paged-scheduler] chunked prefill: decode_tokens=%d, prefill_budget=%d, prefill_added=%d, batch.n_tokens=%d\n",
+                    decode_tokens_in_batch, prefill_budget, prefill_added, batch.n_tokens);
         }
 
         SRV_DBG("decoding batch, n_tokens = %d\n", batch.n_tokens);
