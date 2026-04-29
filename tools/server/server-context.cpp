@@ -5,6 +5,7 @@
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
+#include "kv-block-scheduler.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -686,6 +687,10 @@ private:
 
     server_metrics metrics;
 
+    // Experimental paged-KV block scheduler (--kv-block-scheduler).
+    // Null when flag is off; constructed after slots are initialised.
+    std::unique_ptr<kv_block_scheduler> kv_sched;
+
     json json_webui_settings = json::object();
 
     // Necessary similarity of prompt for slot selection
@@ -924,6 +929,12 @@ private:
             if (slots_debug) {
                 SRV_WRN("slots debug = %d\n", slots_debug);
             }
+        }
+
+        // Experimental paged-KV block scheduler
+        if (params_base.kv_block_scheduler) {
+            kv_sched = std::make_unique<kv_block_scheduler>((int32_t) slots.size());
+            SRV_INF("%s", "[kv-block-scheduler] enabled (experimental, no inference change)\n");
         }
 
         // the update_slots() logic will always submit a maximum of n_batch or n_parallel tokens
@@ -2784,6 +2795,20 @@ private:
             const int ret = llama_decode(ctx, batch_view);
 
             metrics.on_decoded(slots);
+
+            if (kv_sched) {
+                int32_t n_active = 0;
+                for (const auto & sl : slots) {
+                    if (sl.is_processing()) { ++n_active; }
+                }
+                kv_sched->on_decoded(
+                    ctx,
+                    n_active,
+                    metrics.n_prompt_tokens_processed,
+                    (double) metrics.t_prompt_processing,
+                    metrics.n_tokens_predicted,
+                    (double) metrics.t_tokens_generation);
+            }
 
             if (ret != 0) {
                 {
