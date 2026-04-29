@@ -1,0 +1,249 @@
+#pragma once
+
+// =============================================================================
+// llama-kv-cache-paged.h  —  PREPARATORY ABSTRACTION, PHASE 1
+//
+// This file introduces data structures for a future paged/blocked KV cache.
+// It does NOT change any runtime behavior. The physical KV tensor layout
+// remains a flat pre-allocated slab identical to the current implementation.
+//
+// Purpose:
+//   Establish the vocabulary (block, allocator, block_table) so that Phase 2
+//   can wire these structures into find_slot() / apply_ubatch() / set_input_*
+//   without needing large-scale renaming.
+//
+// Invariants (Phase 1):
+//   - llama_kv_block maps to a contiguous range [first_cell, first_cell+size)
+//     in the existing flat slab. No virtual-to-physical indirection yet.
+//   - llama_kv_block_allocator manages a fixed pool of non-overlapping blocks
+//     that together cover exactly the cells in one llama_kv_cells instance.
+//   - llama_kv_block_table maps (seq_id, logical_page_index) to a physical
+//     block_id, but is currently unused by the decode path.
+//
+// Intended Phase 2 integration points (for reference, not implemented here):
+//   - find_slot()          : replace ring-buffer scan with block_table lookup
+//   - apply_ubatch()       : allocate blocks, fill block_table entries
+//   - set_input_k_idxs()   : cell index = block.first_cell + intra_block_offset
+//   - set_input_kq_mask()  : iterate blocks rather than 0..n_kv
+//   - seq_rm()             : free blocks when all cells in block become empty
+// =============================================================================
+
+#include "llama.h"
+#include "llama-cparams.h"
+
+#include <cassert>
+#include <cstdint>
+#include <limits>
+#include <unordered_map>
+#include <vector>
+
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+
+// Default block size (number of KV cells per block).
+// Must be a power of two for efficient alignment math.
+// 16 is a common choice; vLLM uses 16, PagedAttention paper uses 16/32.
+static constexpr uint32_t LLAMA_KV_BLOCK_SIZE_DEFAULT = 16;
+
+// Sentinel value meaning "no block assigned".
+static constexpr uint32_t LLAMA_KV_BLOCK_ID_NONE = std::numeric_limits<uint32_t>::max();
+
+// -----------------------------------------------------------------------------
+// llama_kv_block
+//
+// Represents a fixed-size aligned region within the flat KV cell slab.
+// In Phase 1 the mapping is trivial: block i covers cells [i*size, (i+1)*size).
+// -----------------------------------------------------------------------------
+struct llama_kv_block {
+    uint32_t id;          // index in the block pool (0-based)
+    uint32_t first_cell;  // index of first cell in the flat slab
+    uint32_t size;        // number of cells in this block (== block_size)
+
+    // Return the physical cell index for the k-th cell within this block.
+    uint32_t cell(uint32_t k) const {
+        assert(k < size);
+        return first_cell + k;
+    }
+
+    bool valid() const {
+        return id != LLAMA_KV_BLOCK_ID_NONE;
+    }
+};
+
+// -----------------------------------------------------------------------------
+// llama_kv_block_allocator
+//
+// Manages a flat pool of llama_kv_block objects that together cover the full
+// KV cell slab for one stream.
+//
+// In Phase 1 blocks are statically laid out: block i = cells [i*bs, (i+1)*bs).
+// Allocation and freeing update a free-list for future use by find_slot().
+//
+// Thread safety: none. The KV cache is accessed under the context mutex.
+// -----------------------------------------------------------------------------
+class llama_kv_block_allocator {
+public:
+    // Initialize the allocator for a slab of `n_cells` cells with the given
+    // block size. If n_cells is not a multiple of block_size the last block
+    // covers only the remaining cells (partial block).
+    void init(uint32_t n_cells, uint32_t block_size = LLAMA_KV_BLOCK_SIZE_DEFAULT) {
+        bs = block_size;
+        assert(bs > 0);
+
+        blocks.clear();
+        free_ids.clear();
+
+        const uint32_t n_blocks = (n_cells + bs - 1) / bs;
+        blocks.reserve(n_blocks);
+
+        for (uint32_t i = 0; i < n_blocks; ++i) {
+            llama_kv_block blk;
+            blk.id         = i;
+            blk.first_cell = i * bs;
+            blk.size       = (i + 1 < n_blocks) ? bs : (n_cells - i * bs);
+            blocks.push_back(blk);
+            free_ids.push_back(i);
+        }
+    }
+
+    // Number of blocks in the pool.
+    uint32_t n_blocks() const { return (uint32_t) blocks.size(); }
+
+    // Number of free (unallocated) blocks.
+    uint32_t n_free() const { return (uint32_t) free_ids.size(); }
+
+    // Block size.
+    uint32_t block_size() const { return bs; }
+
+    // Access block by id.
+    const llama_kv_block & get(uint32_t id) const {
+        assert(id < blocks.size());
+        return blocks[id];
+    }
+
+    // Allocate one free block. Returns LLAMA_KV_BLOCK_ID_NONE if pool is
+    // exhausted. Does not touch the underlying KV tensors.
+    uint32_t alloc() {
+        if (free_ids.empty()) {
+            return LLAMA_KV_BLOCK_ID_NONE;
+        }
+        const uint32_t id = free_ids.back();
+        free_ids.pop_back();
+        return id;
+    }
+
+    // Return a block to the free list. The caller is responsible for clearing
+    // the cell metadata in llama_kv_cells before or after this call.
+    void free(uint32_t id) {
+        assert(id < blocks.size());
+        free_ids.push_back(id);
+    }
+
+    // Reset: return all blocks to the free list.
+    void reset() {
+        free_ids.clear();
+        for (uint32_t i = 0; i < (uint32_t) blocks.size(); ++i) {
+            free_ids.push_back(i);
+        }
+    }
+
+private:
+    uint32_t bs = LLAMA_KV_BLOCK_SIZE_DEFAULT;
+
+    std::vector<llama_kv_block> blocks;
+    std::vector<uint32_t>       free_ids; // stack of free block ids
+};
+
+// -----------------------------------------------------------------------------
+// llama_kv_block_table
+//
+// Maps (seq_id, logical_page_index) → physical block_id.
+//
+// A "logical page" is the page-sized chunk of a sequence's token history.
+// For a sequence of length L with block size B:
+//   logical page p covers tokens [p*B, min((p+1)*B, L)).
+//
+// In Phase 1 this table is populated but not read by the decode path.
+// It exists to validate the mapping logic and will be wired into find_slot()
+// in Phase 2.
+//
+// Key type: packed uint64_t = (seq_id << 32) | logical_page.
+// This avoids std::pair hashing and keeps lookup cache-friendly.
+// -----------------------------------------------------------------------------
+class llama_kv_block_table {
+public:
+    using key_t = uint64_t;
+
+    static key_t make_key(llama_seq_id seq_id, uint32_t logical_page) {
+        return ((uint64_t)(uint32_t) seq_id << 32) | (uint64_t) logical_page;
+    }
+
+    // Record that logical page `page` of sequence `seq_id` is stored in
+    // physical block `block_id`.
+    void insert(llama_seq_id seq_id, uint32_t logical_page, uint32_t block_id) {
+        table[make_key(seq_id, logical_page)] = block_id;
+    }
+
+    // Look up the physical block for (seq_id, logical_page).
+    // Returns LLAMA_KV_BLOCK_ID_NONE if not found.
+    uint32_t lookup(llama_seq_id seq_id, uint32_t logical_page) const {
+        auto it = table.find(make_key(seq_id, logical_page));
+        return (it != table.end()) ? it->second : LLAMA_KV_BLOCK_ID_NONE;
+    }
+
+    // Remove all mappings for seq_id (called by seq_rm / seq_keep).
+    void erase_seq(llama_seq_id seq_id) {
+        // Erase all keys whose upper 32 bits match seq_id.
+        // Linear scan is acceptable: seq_rm is not on the hot decode path.
+        const uint64_t prefix = (uint64_t)(uint32_t) seq_id << 32;
+        const uint64_t mask   = (uint64_t) 0xFFFFFFFF00000000ULL;
+        auto it = table.begin();
+        while (it != table.end()) {
+            if ((it->first & mask) == prefix) {
+                it = table.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    // Copy all logical-page mappings from src_seq to dst_seq (seq_cp).
+    // Existing dst_seq entries are overwritten.
+    void copy_seq(llama_seq_id src_seq, llama_seq_id dst_seq) {
+        const uint64_t src_prefix = (uint64_t)(uint32_t) src_seq << 32;
+        const uint64_t mask       = (uint64_t) 0xFFFFFFFF00000000ULL;
+        const uint64_t dst_prefix = (uint64_t)(uint32_t) dst_seq << 32;
+
+        // collect first to avoid iterator invalidation
+        std::vector<std::pair<uint64_t, uint32_t>> to_insert;
+        for (const auto & kv : table) {
+            if ((kv.first & mask) == src_prefix) {
+                const uint32_t page = (uint32_t)(kv.first & 0xFFFFFFFFULL);
+                to_insert.emplace_back(dst_prefix | page, kv.second);
+            }
+        }
+        for (const auto & kv : to_insert) {
+            table[kv.first] = kv.second;
+        }
+    }
+
+    // Remove all entries (called on cache clear).
+    void clear() { table.clear(); }
+
+    // Number of live (seq, page) → block mappings.
+    size_t size() const { return table.size(); }
+
+    // Compute the logical page index for a given token position.
+    static uint32_t logical_page(llama_pos pos, uint32_t block_size) {
+        return (uint32_t) pos / block_size;
+    }
+
+    // Compute the intra-block offset for a given token position.
+    static uint32_t intra_offset(llama_pos pos, uint32_t block_size) {
+        return (uint32_t) pos % block_size;
+    }
+
+private:
+    std::unordered_map<key_t, uint32_t> table;
+};
