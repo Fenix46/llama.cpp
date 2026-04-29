@@ -1338,6 +1338,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_IDLE_SLOTS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--kv-block-scheduler"},
+        {"--no-kv-block-scheduler"},
+        "enable experimental paged-KV block scheduler: tracks block allocation metrics and logs them periodically (default: disabled, no inference change)",
+        [](common_params & params, bool value) {
+            params.kv_block_scheduler = value;
+        }
+    ).set_env("LLAMA_ARG_KV_BLOCK_SCHEDULER").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--context-shift"},
         {"--no-context-shift"},
         string_format("whether to use context shift on infinite text generation (default: %s)", params.ctx_shift ? "enabled" : "disabled"),
