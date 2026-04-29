@@ -1211,12 +1211,20 @@ private:
         // has enough free blocks to service at least one more request and we
         // haven't hit the hard n_seq_max cap of the llama context.
         if (ret == nullptr && params_base.dynamic_slots) {
-            const int32_t seq_max   = (int32_t) llama_n_seq_max(ctx);
-            const int32_t n_cur     = (int32_t) slots.size();
-            const int32_t n_free_blk = llama_kv_cache_n_free_blocks(llama_get_memory(ctx));
-            // require at least n_ctx_slot / block_size blocks free for new slot
-            const int32_t bs        = (int32_t) LLAMA_KV_BLOCK_SIZE_DEFAULT;
+            const int32_t seq_max    = (int32_t) llama_n_seq_max(ctx);
+            const int32_t n_cur      = (int32_t) slots.size();
+            const int32_t bs         = (int32_t) LLAMA_KV_BLOCK_SIZE_DEFAULT;
             const int32_t blks_needed = (n_ctx_slot_ + bs - 1) / bs;
+
+            int32_t n_free_blk = llama_kv_cache_n_free_blocks(llama_get_memory(ctx));
+
+            // if blocks are tight, evict idle slots to prompt cache first
+            if (n_cur < seq_max && n_free_blk < blks_needed) {
+                if (try_clear_idle_slots()) {
+                    n_free_blk = llama_kv_cache_n_free_blocks(llama_get_memory(ctx));
+                    SRV_INF("[dynamic-slots] evicted idle slot KV, free_blocks now=%d\n", n_free_blk);
+                }
+            }
 
             if (n_cur < seq_max && n_free_blk >= blks_needed) {
                 slots.emplace_back();
@@ -1230,7 +1238,7 @@ private:
             } else if (n_cur >= seq_max) {
                 SRV_WRN("[dynamic-slots] cannot grow: n_slots=%d >= n_seq_max=%d\n", n_cur, seq_max);
             } else {
-                SRV_WRN("[dynamic-slots] cannot grow: free_blocks=%d < needed=%d\n", n_free_blk, blks_needed);
+                SRV_WRN("[dynamic-slots] KV pool exhausted: free_blocks=%d < needed=%d\n", n_free_blk, blks_needed);
             }
         }
 
