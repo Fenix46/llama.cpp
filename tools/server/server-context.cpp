@@ -6,6 +6,7 @@
 #include "server-task.h"
 #include "server-queue.h"
 #include "kv-block-scheduler.h"
+#include "kv-prefix-cache.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -691,6 +692,10 @@ private:
     // Null when flag is off; constructed after slots are initialised.
     std::unique_ptr<kv_block_scheduler> kv_sched;
 
+    // Experimental cross-slot KV prefix cache (--kv-prefix-cache).
+    // Null when flag is off. Registered on slot release, invalidated on eviction.
+    std::unique_ptr<kv_prefix_cache> prefix_cache_;
+
     json json_webui_settings = json::object();
 
     // Necessary similarity of prompt for slot selection
@@ -720,6 +725,13 @@ private:
         llama_batch_free(batch);
     }
 
+    // Invalidate prefix cache entry for a slot whose KV is about to be cleared.
+    void prefix_cache_invalidate(int id_slot) {
+        if (prefix_cache_) {
+            prefix_cache_->invalidate(id_slot);
+        }
+    }
+
     void slot_save_and_clear(server_slot & slot) {
         if (slot.prompt.n_tokens() == 0) {
             return;
@@ -727,6 +739,7 @@ private:
         SLT_INF(slot, "%s", "saving idle slot to prompt cache\n");
         SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
         slot.prompt_save(*prompt_cache);
+        prefix_cache_invalidate(slot.id);
         slot.prompt_clear(false);
         prompt_cache->update();
     }
@@ -917,6 +930,13 @@ private:
 
             slot.callback_on_release = [this](int id_slot) {
                 queue_tasks.pop_deferred_task(id_slot);
+                // register released slot's KV prefix so other requests can reuse it
+                if (prefix_cache_) {
+                    const server_slot * sl = get_slot_by_id(id_slot);
+                    if (sl && !sl->prompt.tokens.has_mtmd && !sl->prompt.tokens.empty()) {
+                        prefix_cache_->register_slot(id_slot, sl->prompt.tokens.get_tokens());
+                    }
+                }
             };
 
             slot.reset();
@@ -935,6 +955,13 @@ private:
         if (params_base.kv_block_scheduler) {
             kv_sched = std::make_unique<kv_block_scheduler>((int32_t) slots.size());
             SRV_INF("%s", "[kv-block-scheduler] enabled (experimental, no inference change)\n");
+        }
+
+        // Experimental cross-slot KV prefix cache
+        if (params_base.kv_prefix_cache) {
+            prefix_cache_ = std::make_unique<kv_prefix_cache>(LLAMA_KV_BLOCK_SIZE_DEFAULT);
+            SRV_INF("%s", "[kv-prefix-cache] enabled (experimental): cross-slot prefix reuse, block_size=%d\n",
+                    (int)LLAMA_KV_BLOCK_SIZE_DEFAULT);
         }
 
         // the update_slots() logic will always submit a maximum of n_batch or n_parallel tokens
@@ -1171,12 +1198,63 @@ private:
                 }
 
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                    prefix_cache_invalidate(ret->id);
                     ret->prompt_clear(false);
                 }
 
                 prompt_cache->update();
 
                 SRV_WRN("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+            }
+        }
+
+        // Cross-slot KV prefix reuse (--kv-prefix-cache)
+        // If the prefix cache has a donor slot with more cached tokens than the
+        // currently selected slot's own common prefix, copy its KV blocks into
+        // ret and set up the prompt token list so n_past picks them up.
+        if (ret && prefix_cache_ && !task.tokens.has_mtmd && task.type == SERVER_TASK_TYPE_COMPLETION) {
+            const auto & task_toks = task.tokens.get_tokens();
+
+            // how many tokens does ret already share with the incoming prompt?
+            const int32_t cur_common = (int32_t) ret->prompt.tokens.get_common_prefix(task.tokens);
+            // align to block boundary
+            const uint32_t bs = prefix_cache_->block_size();
+            const int32_t cur_pages = (cur_common / (int32_t)bs) * (int32_t)bs;
+
+            auto res = prefix_cache_->lookup(task_toks);
+
+            if (res.donor_slot_id >= 0 &&
+                res.donor_slot_id != ret->id &&
+                res.n_cached_tokens > cur_pages) {
+
+                // verify donor is still idle
+                server_slot * donor = get_slot_by_id(res.donor_slot_id);
+                if (donor && !donor->is_processing() &&
+                    (int32_t)donor->prompt.tokens.get_tokens().size() >= res.n_cached_tokens) {
+
+                    SRV_INF("[kv-prefix-cache] cross-slot reuse: donor=%d -> slot=%d, n_cached=%d (cur_common=%d)\n",
+                            res.donor_slot_id, ret->id, res.n_cached_tokens, cur_pages);
+
+                    // clear ret's current KV (it had less prefix overlap)
+                    prefix_cache_invalidate(ret->id);
+                    ret->prompt_clear(false);
+
+                    // copy donor's KV for positions [0, n_cached) into ret's seq_id
+                    llama_memory_seq_cp(
+                        llama_get_memory(ctx),
+                        donor->id,  // src seq_id
+                        ret->id,    // dst seq_id
+                        0,
+                        (llama_pos) res.n_cached_tokens);
+
+                    // prime ret->prompt.tokens with the cached prefix tokens so
+                    // get_common_prefix() later returns n_cached_tokens and n_past is set
+                    ret->prompt.tokens.clear();
+                    const auto & donor_toks = donor->prompt.tokens.get_tokens();
+                    for (int32_t i = 0; i < res.n_cached_tokens && i < (int32_t)donor_toks.size(); ++i) {
+                        ret->prompt.tokens.push_back(donor_toks[i]);
+                    }
+                }
             }
         }
 
@@ -1203,6 +1281,7 @@ private:
             if (slot.prompt.n_tokens() > 0) {
                 SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
 
+                prefix_cache_invalidate(slot.id);
                 slot.prompt_clear(false);
 
                 res = true;
@@ -2079,6 +2158,7 @@ private:
                     // Erase token cache
                     const size_t n_erased = slot->prompt.tokens.size();
 
+                    prefix_cache_invalidate(slot->id);
                     slot->prompt_clear(false);
 
                     auto res = std::make_unique<server_task_result_slot_erase>();
@@ -2841,6 +2921,7 @@ private:
 
                                 // note: it's complicated to keep track of how much of the current batch has been
                                 //       processed before the error occurred, so we simply clear the entire context
+                                prefix_cache_invalidate(slot.id);
                                 slot.prompt_clear(false);
                             }
                         }
