@@ -1361,13 +1361,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_KV_BLOCK_SIZE").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--max-model-len"}, "N",
-        "vLLM-style maximum model length per request; server alias for --ctx-size in paged scheduler mode",
+        "vLLM-style maximum model length per request for paged scheduler mode",
         [](common_params & params, int value) {
             if (value <= 0) {
                 throw std::invalid_argument("error: --max-model-len must be > 0\n");
             }
             params.max_model_len = value;
-            params.n_ctx = value;
         }
     ).set_env("LLAMA_ARG_MAX_MODEL_LEN").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(

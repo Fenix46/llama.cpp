@@ -428,6 +428,7 @@ struct common_params {
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode (initial slot count)
     int32_t n_parallel_max        =     0; // KV n_seq_max ceiling for dynamic-slots (0 = same as n_parallel)
+    bool    n_parallel_auto       = false; // server --parallel was auto (-1)
     int32_t n_sequences           =     1; // number of sequences to decode
     int32_t grp_attn_n            =     1; // group-attention factor
     int32_t grp_attn_w            =   512; // group-attention width

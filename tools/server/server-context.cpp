@@ -684,6 +684,8 @@ private:
     // cached slot init parameters (used for dynamic slot creation)
     int32_t n_ctx_slot_ = 0;
     common_context_seq_rm_type ctx_seq_rm_type_ = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+    int32_t paged_blocks_per_seq_ = 0;
+    int32_t paged_max_full_ctx_concurrency_ = 0;
 
     int slots_debug = 0;
     int n_empty_consecutive = 0;
@@ -916,12 +918,56 @@ private:
         // Necessary similarity of prompt for slot selection
         slot_prompt_similarity = params_base.slot_prompt_similarity;
 
-        // setup slots
-        SRV_INF("initializing slots, n_slots = %d\n", params_base.n_parallel);
-
         const int n_ctx_train = llama_model_n_ctx_train(model);
 
         int n_ctx_slot = llama_n_ctx_seq(ctx);
+        int paged_max_model_len = n_ctx_slot;
+        int paged_total_blocks = 0;
+        int paged_blocks_per_seq = 0;
+        int paged_max_full_ctx_concurrency = 0;
+
+        if (params_base.scheduler == "paged") {
+            paged_max_model_len = params_base.max_model_len > 0 ? params_base.max_model_len : n_ctx_slot;
+            if (paged_max_model_len > n_ctx_slot) {
+                SRV_WRN("[paged-scheduler] max_model_len (%d) exceeds KV pool ctx_size (%d) - capping\n",
+                        paged_max_model_len, n_ctx_slot);
+                paged_max_model_len = n_ctx_slot;
+            }
+            if (paged_max_model_len > n_ctx_train) {
+                SRV_WRN("[paged-scheduler] max_model_len (%d) exceeds training context (%d) - capping\n",
+                        paged_max_model_len, n_ctx_train);
+                paged_max_model_len = n_ctx_train;
+            }
+
+            const int32_t bs = (int32_t) LLAMA_KV_BLOCK_SIZE_DEFAULT;
+            paged_total_blocks = llama_kv_cache_n_free_blocks(llama_get_memory(ctx));
+            paged_blocks_per_seq = (paged_max_model_len + bs - 1) / bs;
+            paged_max_full_ctx_concurrency = paged_blocks_per_seq > 0 ? paged_total_blocks / paged_blocks_per_seq : 0;
+            if (paged_max_full_ctx_concurrency <= 0) {
+                SRV_ERR("[paged-scheduler] KV pool too small: total_blocks=%d, blocks_per_seq=%d, ctx_size=%d, max_model_len=%d\n",
+                        paged_total_blocks, paged_blocks_per_seq, llama_n_ctx(ctx), paged_max_model_len);
+                return false;
+            }
+
+            const int32_t seq_max = (int32_t) llama_n_seq_max(ctx);
+            const int32_t capped_concurrency = std::min(paged_max_full_ctx_concurrency, seq_max);
+
+            if (params_base.n_parallel_auto) {
+                params_base.n_parallel = capped_concurrency;
+            } else if (params_base.n_parallel > capped_concurrency) {
+                SRV_WRN("[paged-scheduler] requested --parallel %d exceeds full-ctx concurrency %d - capping\n",
+                        params_base.n_parallel, capped_concurrency);
+                params_base.n_parallel = capped_concurrency;
+            }
+
+            n_ctx_slot = paged_max_model_len;
+            paged_blocks_per_seq_ = paged_blocks_per_seq;
+            paged_max_full_ctx_concurrency_ = paged_max_full_ctx_concurrency;
+        }
+
+        // setup slots
+        SRV_INF("initializing slots, n_slots = %d\n", params_base.n_parallel);
+
         if (n_ctx_slot > n_ctx_train) {
             SRV_WRN("the slot context (%d) exceeds the training context of the model (%d) - capping\n", n_ctx_slot, n_ctx_train);
             n_ctx_slot = n_ctx_train;
@@ -994,13 +1040,12 @@ private:
         if (params_base.dynamic_slots) {
             const int32_t seq_max = (int32_t) llama_n_seq_max(ctx);
             const int32_t bs      = (int32_t) LLAMA_KV_BLOCK_SIZE_DEFAULT;
-            const int32_t blks_per_full_ctx = (n_ctx_slot + bs - 1) / bs;
+            const int32_t blks_per_full_ctx = params_base.scheduler == "paged" ? paged_blocks_per_seq : (n_ctx_slot + bs - 1) / bs;
             const int32_t free_blocks = llama_kv_cache_n_free_blocks(llama_get_memory(ctx));
-            const int32_t max_full_ctx = blks_per_full_ctx > 0 ? free_blocks / blks_per_full_ctx : 0;
 
             if (params_base.scheduler == "paged") {
-                SRV_INF("[paged-scheduler] enabled: block_size=%d, max_model_len=%d, total_blocks=%d, blocks_per_full_ctx=%d, max_full_ctx_concurrency=%d, n_seq_max=%d\n",
-                        bs, n_ctx_slot, free_blocks, blks_per_full_ctx, max_full_ctx, seq_max);
+                SRV_INF("[paged-scheduler] enabled: block_size=%d, ctx_size=%d, max_model_len=%d, total_blocks=%d, blocks_per_seq=%d, max_full_ctx_concurrency=%d, n_seq_max=%d\n",
+                        bs, llama_n_ctx(ctx), n_ctx_slot, paged_total_blocks, blks_per_full_ctx, paged_max_full_ctx_concurrency, seq_max);
             }
 
             SRV_INF("[dynamic-slots] enabled: initial=%d, max=%d (n_seq_max), free_blocks=%d\n",
@@ -1231,29 +1276,34 @@ private:
             const int32_t seq_max    = (int32_t) llama_n_seq_max(ctx);
             const int32_t n_cur      = (int32_t) slots.size();
             const int32_t bs         = (int32_t) LLAMA_KV_BLOCK_SIZE_DEFAULT;
-            const int32_t blks_needed = (n_ctx_slot_ + bs - 1) / bs;
+            const int32_t blks_needed = params_base.scheduler == "paged" && paged_blocks_per_seq_ > 0
+                ? paged_blocks_per_seq_
+                : (n_ctx_slot_ + bs - 1) / bs;
+            const int32_t seq_cap = params_base.scheduler == "paged" && paged_max_full_ctx_concurrency_ > 0
+                ? std::min(seq_max, paged_max_full_ctx_concurrency_)
+                : seq_max;
 
             int32_t n_free_blk = llama_kv_cache_n_free_blocks(llama_get_memory(ctx));
 
             // if blocks are tight, evict idle slots to prompt cache first
-            if (n_cur < seq_max && n_free_blk < blks_needed) {
+            if (n_cur < seq_cap && n_free_blk < blks_needed) {
                 if (try_clear_idle_slots()) {
                     n_free_blk = llama_kv_cache_n_free_blocks(llama_get_memory(ctx));
                     SRV_INF("[dynamic-slots] evicted idle slot KV, free_blocks now=%d\n", n_free_blk);
                 }
             }
 
-            if (n_cur < seq_max && n_free_blk >= blks_needed) {
+            if (n_cur < seq_cap && n_free_blk >= blks_needed) {
                 slots.emplace_back();
                 init_slot(slots.back(), n_cur, n_ctx_slot_, ctx_seq_rm_type_);
                 ret = &slots.back();
 
-                SRV_INF("[dynamic-slots] created slot %d (free_blocks=%d, seq_max=%d)\n",
-                        n_cur, n_free_blk, seq_max);
+                SRV_INF("[dynamic-slots] created slot %d (free_blocks=%d, seq_cap=%d)\n",
+                        n_cur, n_free_blk, seq_cap);
 
                 update_cache = false; // fresh slot — nothing to cache
-            } else if (n_cur >= seq_max) {
-                SRV_WRN("[dynamic-slots] cannot grow: n_slots=%d >= n_seq_max=%d\n", n_cur, seq_max);
+            } else if (n_cur >= seq_cap) {
+                SRV_WRN("[dynamic-slots] cannot grow: n_slots=%d >= seq_cap=%d\n", n_cur, seq_cap);
             } else {
                 SRV_WRN("[dynamic-slots] KV pool exhausted: free_blocks=%d < needed=%d\n", n_free_blk, blks_needed);
             }

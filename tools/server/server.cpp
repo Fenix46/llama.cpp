@@ -92,7 +92,9 @@ int main(int argc, char ** argv) {
         params.n_batch = params.n_ubatch;
     }
 
-    if (params.n_parallel < 0) {
+    params.n_parallel_auto = params.n_parallel < 0;
+
+    if (params.n_parallel < 0 && params.scheduler != "paged") {
         LOG_INF("%s: n_parallel is set to auto, using n_parallel = 4 and kv_unified = true\n", __func__);
 
         params.n_parallel = 4;
@@ -113,6 +115,11 @@ int main(int argc, char ** argv) {
 
         if (params.n_parallel_max == 0) {
             params.n_parallel_max = 256;
+        }
+        if (params.n_parallel_auto) {
+            // Use a valid initial value for context creation. The real initial
+            // slot count is computed after KV allocation, from full-ctx blocks.
+            params.n_parallel = 1;
         }
     }
 
