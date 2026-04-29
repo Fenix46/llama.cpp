@@ -1341,7 +1341,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_SCHEDULER").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--paged-admission"}, "full-ctx|actual-len",
-        "paged scheduler admission policy (default: full-ctx; actual-len reserved for future work)",
+        "paged scheduler admission policy (default: full-ctx; actual-len reserves blocks from prompt + max predicted tokens)",
         [](common_params & params, const std::string & value) {
             if (value != "full-ctx" && value != "actual-len") {
                 throw std::invalid_argument("error: --paged-admission must be 'full-ctx' or 'actual-len'\n");

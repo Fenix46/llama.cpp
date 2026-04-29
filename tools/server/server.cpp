@@ -108,9 +108,8 @@ int main(int argc, char ** argv) {
         params.dynamic_slots      = true;
         params.kv_block_scheduler = true;
 
-        if (params.paged_admission != "full-ctx") {
-            LOG_WRN("%s: --paged-admission=%s parsed, but only full-ctx admission is implemented in this milestone\n",
-                    __func__, params.paged_admission.c_str());
+        if (params.paged_admission == "actual-len") {
+            LOG_INF("%s: enabling paged actual-len admission\n", __func__);
         }
 
         if (params.n_parallel_max == 0) {
