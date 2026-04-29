@@ -1165,22 +1165,25 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
             const auto & alloc = v_block_alloc[strm];
             const uint32_t bs  = alloc.block_size();
 
-            std::unordered_map<uint32_t, uint32_t> planned_pages;
+            std::unordered_map<llama_kv_block_table::key_t, uint32_t> planned_pages;
             uint32_t n_planned = 0;
 
             res.idxs[s].clear();
             res.idxs[s].reserve(n_tokens);
 
             for (uint32_t ii = 0; ii < n_tokens; ++ii) {
-                const uint32_t i    = s * n_tokens + ii;
-                const llama_pos pos = ubatch.pos[i];
+                const uint32_t i = s * n_tokens + ii;
+
+                const llama_seq_id token_seq_id = n_stream == 1 ? ubatch.seq_id[i][0] : seq_id;
+                const llama_pos    pos          = ubatch.pos[i];
 
                 const uint32_t page  = llama_kv_block_table::logical_page(pos, bs);
                 const uint32_t intra = llama_kv_block_table::intra_offset(pos, bs);
+                const auto     key   = llama_kv_block_table::make_key(token_seq_id, page);
 
-                uint32_t blk_id = block_table.lookup(seq_id, page);
+                uint32_t blk_id = block_table.lookup(token_seq_id, page);
                 if (blk_id == LLAMA_KV_BLOCK_ID_NONE) {
-                    auto it = planned_pages.find(page);
+                    auto it = planned_pages.find(key);
                     if (it != planned_pages.end()) {
                         blk_id = it->second;
                     } else {
@@ -1188,7 +1191,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                         if (blk_id == LLAMA_KV_BLOCK_ID_NONE) {
                             return { };
                         }
-                        planned_pages[page] = blk_id;
+                        planned_pages[key] = blk_id;
                         ++n_planned;
                     }
                 }
@@ -1198,7 +1201,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                     return { };
                 }
 
-                if (!cells.is_empty(cell_idx) && !cells.seq_has(cell_idx, seq_id)) {
+                if (!cells.is_empty(cell_idx) && !cells.seq_has(cell_idx, token_seq_id)) {
                     // Copy-on-write for shared blocks is not implemented yet.
                     return { };
                 }
@@ -1220,12 +1223,14 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
             bool all_mapped = true;
             for (uint32_t ii = 0; ii < n_tokens; ++ii) {
-                const uint32_t i  = s * n_tokens + ii;
-                const llama_pos pos = ubatch.pos[i];
+                const uint32_t i = s * n_tokens + ii;
+
+                const llama_seq_id token_seq_id = n_stream == 1 ? ubatch.seq_id[i][0] : seq_id;
+                const llama_pos    pos          = ubatch.pos[i];
 
                 const uint32_t page   = llama_kv_block_table::logical_page(pos, bs);
                 const uint32_t intra  = llama_kv_block_table::intra_offset(pos, bs);
-                const uint32_t blk_id = block_table.lookup(seq_id, page);
+                const uint32_t blk_id = block_table.lookup(token_seq_id, page);
 
                 if (blk_id == LLAMA_KV_BLOCK_ID_NONE) {
                     all_mapped = false;
@@ -1235,6 +1240,11 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                 const uint32_t cell_idx = alloc.get(blk_id).first_cell + intra;
 
                 if (cell_idx >= cells.size()) {
+                    all_mapped = false;
+                    break;
+                }
+
+                if (!cells.is_empty(cell_idx) && !cells.seq_has(cell_idx, token_seq_id)) {
                     all_mapped = false;
                     break;
                 }
