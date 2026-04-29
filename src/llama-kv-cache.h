@@ -156,6 +156,10 @@ public:
     ggml_type type_k() const;
     ggml_type type_v() const;
 
+    // Paged block scheduler metrics accessors (Phase 1, read-only)
+    const llama_kv_block_allocator & get_block_alloc(uint32_t strm = 0) const;
+    const llama_kv_block_table     & get_block_table() const;
+
     //
     // graph_build API
     //

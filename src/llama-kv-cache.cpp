@@ -1277,6 +1277,15 @@ ggml_type llama_kv_cache::type_v() const {
     return layers[0].v->type;
 }
 
+const llama_kv_block_allocator & llama_kv_cache::get_block_alloc(uint32_t strm) const {
+    GGML_ASSERT(strm < v_block_alloc.size());
+    return v_block_alloc[strm];
+}
+
+const llama_kv_block_table & llama_kv_cache::get_block_table() const {
+    return block_table;
+}
+
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     uint32_t result = 0;
 
