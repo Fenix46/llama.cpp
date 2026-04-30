@@ -1296,6 +1296,90 @@ private:
         return nullptr;
     }
 
+    server_slot * create_paged_request_handle(const server_task & task) {
+        const int32_t seq_max     = (int32_t) llama_n_seq_max(ctx);
+        const int32_t n_handles   = (int32_t) slots.size();
+        const int32_t blks_needed = paged_task_reserved_blocks(task);
+        const int32_t seq_cap     = params_base.paged_admission != "actual-len"
+            ? std::min(seq_max, paged_max_full_ctx_concurrency_)
+            : seq_max;
+
+        int32_t n_free_blk = llama_kv_cache_n_free_blocks(llama_get_memory(ctx));
+
+        if (n_handles < seq_cap && n_free_blk < blks_needed) {
+            if (try_clear_idle_slots()) {
+                n_free_blk = llama_kv_cache_n_free_blocks(llama_get_memory(ctx));
+                SRV_INF("[paged-scheduler] evicted idle request KV, free_blocks now=%d\n", n_free_blk);
+            }
+        }
+
+        if (n_handles < seq_cap && n_free_blk >= blks_needed) {
+            slots.emplace_back();
+            init_slot(slots.back(), n_handles, n_ctx_slot_, ctx_seq_rm_type_);
+
+            SRV_INF("[paged-scheduler] created request handle seq_id=%d (free_blocks=%d, seq_cap=%d)\n",
+                    n_handles, n_free_blk, seq_cap);
+
+            return &slots.back();
+        }
+
+        if (n_handles >= seq_cap) {
+            SRV_DBG("[paged-scheduler] request handle cap reached: handles=%d, seq_cap=%d, blocks_needed=%d\n",
+                    n_handles, seq_cap, blks_needed);
+        } else {
+            SRV_WRN("[paged-scheduler] KV pool exhausted for new request handle: free_blocks=%d < needed=%d\n",
+                    n_free_blk, blks_needed);
+        }
+
+        return nullptr;
+    }
+
+    server_slot * create_dynamic_slot(const server_task &) {
+        if (!params_base.dynamic_slots) {
+            return nullptr;
+        }
+
+        const int32_t seq_max     = (int32_t) llama_n_seq_max(ctx);
+        const int32_t n_cur       = (int32_t) slots.size();
+        const int32_t bs          = (int32_t) LLAMA_KV_BLOCK_SIZE_DEFAULT;
+        const int32_t blks_needed = (n_ctx_slot_ + bs - 1) / bs;
+
+        int32_t n_free_blk = llama_kv_cache_n_free_blocks(llama_get_memory(ctx));
+
+        if (n_cur < seq_max && n_free_blk < blks_needed) {
+            if (try_clear_idle_slots()) {
+                n_free_blk = llama_kv_cache_n_free_blocks(llama_get_memory(ctx));
+                SRV_INF("[dynamic-slots] evicted idle slot KV, free_blocks now=%d\n", n_free_blk);
+            }
+        }
+
+        if (n_cur < seq_max && n_free_blk >= blks_needed) {
+            slots.emplace_back();
+            init_slot(slots.back(), n_cur, n_ctx_slot_, ctx_seq_rm_type_);
+
+            SRV_INF("[dynamic-slots] created slot %d (free_blocks=%d, seq_cap=%d)\n",
+                    n_cur, n_free_blk, seq_max);
+
+            return &slots.back();
+        }
+
+        if (n_cur >= seq_max) {
+            SRV_WRN("[dynamic-slots] cannot grow: n_slots=%d >= seq_cap=%d\n", n_cur, seq_max);
+        } else {
+            SRV_WRN("[dynamic-slots] KV pool exhausted: free_blocks=%d < needed=%d\n", n_free_blk, blks_needed);
+        }
+
+        return nullptr;
+    }
+
+    server_slot * create_request_handle(const server_task & task) {
+        if (params_base.scheduler == "paged") {
+            return create_paged_request_handle(task);
+        }
+
+        return create_dynamic_slot(task);
+    }
+
     server_slot * get_available_slot(const server_task & task) {
         server_slot * ret = nullptr;
 
@@ -1366,50 +1450,9 @@ private:
             }
         }
 
-        // Dynamic slot allocation (--dynamic-slots)
-        // All existing slots are busy. Grow the pool if the KV block allocator
-        // has enough free blocks to service at least one more request and we
-        // haven't hit the hard n_seq_max cap of the llama context.
-        if (ret == nullptr && params_base.dynamic_slots) {
-            const int32_t seq_max    = (int32_t) llama_n_seq_max(ctx);
-            const int32_t n_cur      = (int32_t) slots.size();
-            const int32_t bs         = (int32_t) LLAMA_KV_BLOCK_SIZE_DEFAULT;
-            const int32_t blks_needed = params_base.scheduler == "paged"
-                ? paged_task_reserved_blocks(task)
-                : (n_ctx_slot_ + bs - 1) / bs;
-            const int32_t seq_cap = params_base.scheduler == "paged" && paged_max_full_ctx_concurrency_ > 0 && params_base.paged_admission != "actual-len"
-                ? std::min(seq_max, paged_max_full_ctx_concurrency_)
-                : seq_max;
-
-            int32_t n_free_blk = llama_kv_cache_n_free_blocks(llama_get_memory(ctx));
-
-            // if blocks are tight, evict idle slots to prompt cache first
-            if (n_cur < seq_cap && n_free_blk < blks_needed) {
-                if (try_clear_idle_slots()) {
-                    n_free_blk = llama_kv_cache_n_free_blocks(llama_get_memory(ctx));
-                    SRV_INF("[dynamic-slots] evicted idle slot KV, free_blocks now=%d\n", n_free_blk);
-                }
-            }
-
-            if (n_cur < seq_cap && n_free_blk >= blks_needed) {
-                slots.emplace_back();
-                init_slot(slots.back(), n_cur, n_ctx_slot_, ctx_seq_rm_type_);
-                ret = &slots.back();
-
-                SRV_INF("[dynamic-slots] created slot %d (free_blocks=%d, seq_cap=%d)\n",
-                        n_cur, n_free_blk, seq_cap);
-
-                update_cache = false; // fresh slot — nothing to cache
-            } else if (n_cur >= seq_cap) {
-                if (params_base.scheduler == "paged") {
-                    SRV_DBG("[paged-scheduler] admission slot cap reached: n_slots=%d, seq_cap=%d, blocks_needed=%d\n",
-                            n_cur, seq_cap, blks_needed);
-                } else {
-                    SRV_WRN("[dynamic-slots] cannot grow: n_slots=%d >= seq_cap=%d\n", n_cur, seq_cap);
-                }
-            } else {
-                SRV_WRN("[dynamic-slots] KV pool exhausted: free_blocks=%d < needed=%d\n", n_free_blk, blks_needed);
-            }
+        if (ret == nullptr) {
+            ret = create_request_handle(task);
+            update_cache = false; // fresh handle has no prompt state to save
         }
 
         if (ret) {
@@ -1431,7 +1474,7 @@ private:
                 }
 
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
-                    prefix_cache_invalidate(ret->id);
+                    prefix_cache_invalidate(ret->seq_id());
                     ret->prompt_clear(false);
                 }
 

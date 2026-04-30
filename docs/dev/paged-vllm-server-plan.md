@@ -248,6 +248,9 @@ Implemented:
 - Paged request metadata is now split from the legacy slot wrapper:
   - `paged_request_state` tracks `request_id`, `seq_id`, and reserved KV blocks
   - KV/sampler call sites use `seq_id()` as the bridge toward slotless state
+- Paged request-handle allocation is split from legacy dynamic-slot allocation:
+  - paged mode creates request handles through `create_paged_request_handle()`
+  - non-paged dynamic slots keep the old `create_dynamic_slot()` path
 
 Design:
 
