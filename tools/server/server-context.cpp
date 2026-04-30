@@ -693,6 +693,7 @@ private:
     // slots / clients
     std::vector<server_slot> slots;
     std::vector<paged_request_state> paged_requests;
+    paged_seq_lease_pool paged_seq_leases;
 
     // cached slot init parameters (used for dynamic slot creation)
     int32_t n_ctx_slot_ = 0;
@@ -836,9 +837,34 @@ private:
                     prefix_cache_->register_slot(id_slot, sl->prompt.tokens.get_tokens());
                 }
             }
+            if (params_base.scheduler == "paged") {
+                paged_seq_leases.mark_cached(id_slot);
+            }
         };
 
         slot.reset();
+    }
+
+    bool assign_paged_seq_id(server_slot & slot) {
+        if (params_base.scheduler != "paged") {
+            return true;
+        }
+
+        if (slot.seq_id() >= 0) {
+            paged_seq_leases.active_seq_ids.insert(slot.seq_id());
+            paged_seq_leases.cached_seq_ids.erase(slot.seq_id());
+            return true;
+        }
+
+        const int32_t seq_id = paged_seq_leases.lease();
+        if (seq_id < 0) {
+            SRV_WRN("%s", "[paged-scheduler] no free seq_id lease available\n");
+            return false;
+        }
+
+        slot.id = seq_id;
+        SLT_INF(slot, "[paged-scheduler] leased seq_id=%d\n", seq_id);
+        return true;
     }
 
     int32_t initial_slot_count() const {
@@ -858,6 +884,10 @@ private:
         slot.prompt_save(*prompt_cache);
         prefix_cache_invalidate(slot.seq_id());
         slot.prompt_clear(false);
+        if (params_base.scheduler == "paged") {
+            paged_seq_leases.release_uncached(slot.seq_id());
+            slot.id = -1;
+        }
         prompt_cache->update();
     }
 
@@ -1060,6 +1090,9 @@ private:
 
         slots.clear();
         paged_requests.clear();
+        if (params_base.scheduler == "paged") {
+            paged_seq_leases.reset((int32_t) llama_n_seq_max(ctx));
+        }
 
         const auto ctx_seq_rm_type = common_context_can_seq_rm(ctx);
         if (ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
@@ -1313,10 +1346,16 @@ private:
 
         if (n_handles < seq_cap && n_free_blk >= blks_needed) {
             slots.emplace_back();
-            init_slot(slots.back(), n_handles, n_ctx_slot_, ctx_seq_rm_type_);
+            const int32_t seq_id = params_base.scheduler == "paged" ? paged_seq_leases.lease() : n_handles;
+            if (seq_id < 0) {
+                slots.pop_back();
+                SRV_WRN("%s", "[paged-scheduler] cannot create request handle: no seq_id lease\n");
+                return nullptr;
+            }
+            init_slot(slots.back(), seq_id, n_ctx_slot_, ctx_seq_rm_type_);
 
             SRV_INF("[paged-scheduler] created request handle seq_id=%d (free_blocks=%d, seq_cap=%d)\n",
-                    n_handles, n_free_blk, seq_cap);
+                    seq_id, n_free_blk, seq_cap);
 
             return &slots.back();
         }
@@ -1417,6 +1456,7 @@ private:
         req.t_token_generation        = slot.t_token_generation;
         req.sampled                   = slot.sampled;
         req.alora_invocation_start    = slot.alora_invocation_start;
+        req.lora                      = slot.lora;
     }
 
     server_slot * get_paged_available_handle(const server_task & task) {
@@ -1547,6 +1587,11 @@ private:
             SLT_INF(*ret, "%s", "[paged-scheduler] clearing stale request handle KV before launch\n");
             prefix_cache_invalidate(ret->seq_id());
             ret->prompt_clear(false);
+            paged_seq_leases.release_uncached(ret->seq_id());
+            ret->id = -1;
+            if (!assign_paged_seq_id(*ret)) {
+                return nullptr;
+            }
         }
 
         // Cross-slot KV prefix reuse (--kv-prefix-cache)
@@ -1650,6 +1695,11 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        if (!assign_paged_seq_id(slot)) {
+            send_error(task, "No free sequence id available for paged scheduler", ERROR_TYPE_UNAVAILABLE);
+            return false;
+        }
+
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -2222,6 +2272,10 @@ private:
     }
 
     int32_t count_paged_active_requests() const {
+        if (params_base.scheduler == "paged") {
+            return paged_seq_leases.n_active();
+        }
+
         return count_processing_slots();
     }
 
@@ -2516,6 +2570,13 @@ private:
                             { "invalidations", st.invalidations },
                             { "reuse_events",  st.reuse_events },
                             { "reused_tokens", st.reused_tokens },
+                        };
+                    }
+                    if (params_base.scheduler == "paged") {
+                        res->prefix_cache_data["seq_leases"] = json {
+                            { "active", paged_seq_leases.n_active() },
+                            { "cached", paged_seq_leases.n_cached() },
+                            { "free",   paged_seq_leases.n_free() },
                         };
                     }
 

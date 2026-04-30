@@ -8,7 +8,9 @@
 #include "speculative.h"
 
 #include <cstdint>
+#include <algorithm>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -140,5 +142,67 @@ struct paged_request_state {
         n_ctx = 0;
         prompt.tokens.clear();
         prompt.checkpoints.clear();
+    }
+};
+
+struct paged_seq_lease_pool {
+    std::vector<int32_t> free_seq_ids;
+    std::set<int32_t> active_seq_ids;
+    std::set<int32_t> cached_seq_ids;
+
+    void reset(int32_t n_seq_max) {
+        free_seq_ids.clear();
+        active_seq_ids.clear();
+        cached_seq_ids.clear();
+        free_seq_ids.reserve(std::max<int32_t>(0, n_seq_max));
+        for (int32_t i = n_seq_max - 1; i >= 0; --i) {
+            free_seq_ids.push_back(i);
+        }
+    }
+
+    int32_t lease() {
+        if (free_seq_ids.empty()) {
+            return -1;
+        }
+        const int32_t seq_id = free_seq_ids.back();
+        free_seq_ids.pop_back();
+        active_seq_ids.insert(seq_id);
+        cached_seq_ids.erase(seq_id);
+        return seq_id;
+    }
+
+    void mark_cached(int32_t seq_id) {
+        if (seq_id < 0) {
+            return;
+        }
+        active_seq_ids.erase(seq_id);
+        cached_seq_ids.insert(seq_id);
+    }
+
+    void release_uncached(int32_t seq_id) {
+        if (seq_id < 0) {
+            return;
+        }
+        active_seq_ids.erase(seq_id);
+        cached_seq_ids.erase(seq_id);
+        if (std::find(free_seq_ids.begin(), free_seq_ids.end(), seq_id) == free_seq_ids.end()) {
+            free_seq_ids.push_back(seq_id);
+        }
+    }
+
+    bool is_active(int32_t seq_id) const {
+        return active_seq_ids.find(seq_id) != active_seq_ids.end();
+    }
+
+    int32_t n_active() const {
+        return (int32_t) active_seq_ids.size();
+    }
+
+    int32_t n_cached() const {
+        return (int32_t) cached_seq_ids.size();
+    }
+
+    int32_t n_free() const {
+        return (int32_t) free_seq_ids.size();
     }
 };

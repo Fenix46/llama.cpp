@@ -277,6 +277,10 @@ Implemented:
   - owns slotless request state types for phase, prompt/decode/output/sampler/spec state
   - adds `paged_requests` container shadowing current slot bridge
   - syncs request phase during launch, prefill, decode, and release
+- Added paged seq lease pool:
+  - tracks free, active, and cached seq ids
+  - paged request handles lease seq ids instead of using vector index
+  - metrics expose lease counts under prefix-cache data
 
 Design:
 
@@ -328,9 +332,9 @@ Acceptance:
    - batch from `paged_requests`
    - send output from `paged_request_state`
    - leave non-paged scheduler unchanged
-2. Add seq id lease pool:
-   - lease `seq_id` per active request
-   - release `seq_id` on request completion
+2. Move seq ownership fully out of slot handles:
+   - detach cached prefix pages from handle lifetime
+   - allow completed request handle to release seq id safely
 3. Add pre-context VRAM auto-fit:
    - estimate residual device memory after model weights
    - compute KV bytes/token for selected KV types
