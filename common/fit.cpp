@@ -276,19 +276,29 @@ static void common_params_fit_impl(
             }
         }
 
-        if (cparams->n_ctx == 0 && n_ctx_min != UINT32_MAX && hp_nct > n_ctx_min) {
-            int64_t sum_projected_used_min_ctx = 0;
-            std::vector<int64_t> projected_used_min_ctx_per_device;
+        if (cparams->n_ctx == 0 && n_ctx_min != UINT32_MAX) {
+            int64_t sum_projected_used_ref1 = sum_projected_used;
+            uint32_t n_ctx_ref1 = hp_nct;
+
+            int64_t sum_projected_used_ref2 = 0;
+            std::vector<int64_t> projected_used_ref2_per_device;
+            uint32_t n_ctx_ref2 = n_ctx_min;
+
+            if (n_ctx_ref2 == n_ctx_ref1) {
+                n_ctx_ref2 = n_ctx_ref1 > 1024 ? n_ctx_ref1 - 1024 : 0;
+            }
+
             {
-                llama_context_params cparams_min = *cparams;
-                cparams_min.n_ctx = n_ctx_min;
-                const dmds_t dmds_min_ctx = common_get_device_memory_data(path_model, mparams, &cparams_min, devs, hp_ngl, hp_nct, hp_nex, log_level);
+                llama_context_params cparams_ref2 = *cparams;
+                cparams_ref2.n_ctx = n_ctx_ref2;
+                cparams_ref2.n_ctx_seq = std::min(cparams_ref2.n_ctx_seq, cparams_ref2.n_ctx);
+                const dmds_t dmds_ref2 = common_get_device_memory_data(path_model, mparams, &cparams_ref2, devs, hp_ngl, hp_nct, hp_nex, log_level);
                 if (nd == 0) {
-                    sum_projected_used_min_ctx = dmds_min_ctx.back().mb.total();
+                    sum_projected_used_ref2 = dmds_ref2.back().mb.total();
                 } else {
                     for (size_t id = 0; id < nd; id++) {
-                        sum_projected_used_min_ctx += dmds_min_ctx[id].mb.total();
-                        projected_used_min_ctx_per_device.push_back(dmds_min_ctx[id].mb.total());
+                        sum_projected_used_ref2 += dmds_ref2[id].mb.total();
+                        projected_used_ref2_per_device.push_back(dmds_ref2[id].mb.total());
                     }
                 }
             }
@@ -316,15 +326,15 @@ static void common_params_fit_impl(
                     sum_used_target -= (nd + 1) * model_per_layer / (hp_nex == 0 ? 2 : 6);
                 }
 
-                if (sum_used_target > sum_projected_used_min_ctx) {
-                    // linear interpolation between minimum and maximum context size:
-                    cparams->n_ctx = n_ctx_min + (hp_nct - n_ctx_min) * (sum_used_target - sum_projected_used_min_ctx)
-                        / (sum_projected_used - sum_projected_used_min_ctx);
+                if (sum_used_target > sum_projected_used_ref2) {
+                    // linear interpolation between reference points:
+                    cparams->n_ctx = n_ctx_ref2 + (n_ctx_ref1 - n_ctx_ref2) * (sum_used_target - sum_projected_used_ref2)
+                        / (sum_projected_used_ref1 - sum_projected_used_ref2);
                     cparams->n_ctx = std::max(cparams->n_ctx - cparams->n_ctx % 256, n_ctx_min); // round down context for CUDA backend
 
-                    const int64_t bytes_per_ctx = (sum_projected_used - sum_projected_used_min_ctx) / (hp_nct - n_ctx_min);
+                    const int64_t bytes_per_ctx = (sum_projected_used_ref1 - sum_projected_used_ref2) / (n_ctx_ref1 - n_ctx_ref2);
                     const int64_t memory_reduction = (hp_nct - cparams->n_ctx) * bytes_per_ctx;
-                    LOG_INF("%s: context size reduced from %" PRIu32 " to %" PRIu32 " -> need %" PRId64 " MiB less memory in total\n",
+                    LOG_INF("%s: context size adjusted from %" PRIu32 " to %" PRIu32 " -> need %" PRId64 " MiB less memory in total\n",
                         __func__, hp_nct, cparams->n_ctx, memory_reduction/MiB);
                     if (nd <= 1) {
                         LOG_INF("%s: entire model can be fit by reducing context\n", __func__);
@@ -333,7 +343,7 @@ static void common_params_fit_impl(
                     LOG_INF("%s: entire model should be fit across devices by reducing context\n", __func__);
                 } else {
                     cparams->n_ctx = n_ctx_min;
-                    const int64_t memory_reduction = sum_projected_used - sum_projected_used_min_ctx;
+                    const int64_t memory_reduction = sum_projected_used - sum_projected_used_ref2;
                     LOG_INF("%s: context size reduced from %" PRIu32 " to %" PRIu32 " -> need %" PRId64 " MiB less memory in total\n",
                         __func__, hp_nct, cparams->n_ctx, memory_reduction/MiB);
                 }
@@ -345,13 +355,13 @@ static void common_params_fit_impl(
 
                 int64_t max_extra_tokens = INT64_MAX;
                 if (nd == 0) {
-                    const int64_t bpc = (sum_projected_used - sum_projected_used_min_ctx) / (hp_nct - n_ctx_min);
+                    const int64_t bpc = (sum_projected_used_ref1 - sum_projected_used_ref2) / (n_ctx_ref1 - n_ctx_ref2);
                     if (bpc > 0) {
                         max_extra_tokens = global_surplus_safe / bpc;
                     }
                 } else {
                     for (size_t id = 0; id < nd; id++) {
-                        const int64_t bpc_id = (dmds_full[id].mb.total() - projected_used_min_ctx_per_device[id]) / (hp_nct - n_ctx_min);
+                        const int64_t bpc_id = (dmds_full[id].mb.total() - projected_used_ref2_per_device[id]) / (n_ctx_ref1 - n_ctx_ref2);
                         if (bpc_id > 0) {
                             const int64_t extra = (int64_t)((projected_free_per_device[id] - margins[id]) * safety_factor) / bpc_id;
                             max_extra_tokens = std::min(max_extra_tokens, extra);
