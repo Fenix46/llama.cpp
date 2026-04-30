@@ -285,6 +285,9 @@ Implemented:
   - `server_slot::seq_id()` now prefers paged request state
   - prompt save/load, KV clear/copy, sampler reset, batch append, and speculative checkpoints use `seq_id()`
   - stale paged handles clear both the legacy id and paged seq id before leasing again
+- Released empty paged handles back to the seq lease pool immediately:
+  - only non-empty text prompts stay cached after completion
+  - paged `get_slot_by_id()` looks up exact leased seq ids instead of modulo-mapping by handle count
 
 Design:
 

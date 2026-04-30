@@ -832,14 +832,27 @@ private:
 
         slot.callback_on_release = [this](int id_slot) {
             queue_tasks.pop_deferred_task(id_slot);
+            server_slot * sl = get_slot_by_id(id_slot);
+            const bool can_cache =
+                sl != nullptr &&
+                !sl->prompt.tokens.has_mtmd &&
+                !sl->prompt.tokens.empty();
+
             if (prefix_cache_) {
-                const server_slot * sl = get_slot_by_id(id_slot);
-                if (sl && !sl->prompt.tokens.has_mtmd && !sl->prompt.tokens.empty()) {
+                if (can_cache) {
                     prefix_cache_->register_slot(id_slot, sl->prompt.tokens.get_tokens());
                 }
             }
             if (params_base.scheduler == "paged") {
-                paged_seq_leases.mark_cached(id_slot);
+                if (can_cache) {
+                    paged_seq_leases.mark_cached(id_slot);
+                } else {
+                    paged_seq_leases.release_uncached(id_slot);
+                    if (sl != nullptr) {
+                        sl->id = -1;
+                        sl->paged.seq_id = -1;
+                    }
+                }
             }
         };
 
@@ -1314,15 +1327,17 @@ private:
     }
 
     server_slot * get_slot_by_id(int id_slot) {
-        if (slots.empty()) {
+        if (slots.empty() || id_slot < 0) {
             return nullptr;
         }
 
-        // note: allow id_slot to be out of bounds (wrap around)
-        id_slot = id_slot % slots.size();
+        // note: legacy slot APIs allow id_slot to be out of bounds (wrap around).
+        // Paged mode uses leased seq ids, so the requested id is already the
+        // actual llama sequence id and must not be modulo-mapped by handle count.
+        const int id_lookup = params_base.scheduler == "paged" ? id_slot : id_slot % slots.size();
 
         for (server_slot & slot : slots) {
-            if (slot.seq_id() == id_slot) {
+            if (slot.seq_id() == id_lookup) {
                 return &slot;
             }
         }
