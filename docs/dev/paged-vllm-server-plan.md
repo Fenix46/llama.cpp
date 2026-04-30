@@ -254,6 +254,11 @@ Implemented:
 - External slot operations are disabled in paged mode:
   - `/slots` returns not-supported for paged scheduler
   - slot save/restore/erase are not exposed for paged scheduler
+- Paged mode no longer uses legacy slot prompt-cache selection:
+  - no LCP slot similarity selection
+  - no LRU prompt-state reuse
+  - stale KV on a reused request handle is cleared before launch
+  - cross-request reuse is routed through the paged prefix-cache path
 
 Design:
 

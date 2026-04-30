@@ -1380,13 +1380,33 @@ private:
         return create_dynamic_slot(task);
     }
 
+    server_slot * get_paged_available_handle(const server_task & task) {
+        for (server_slot & slot : slots) {
+            if (!slot.is_processing() && slot.prompt.n_tokens() == 0) {
+                SLT_INF(slot, "%s", "[paged-scheduler] selected empty request handle\n");
+                return &slot;
+            }
+        }
+
+        for (server_slot & slot : slots) {
+            if (!slot.is_processing()) {
+                SLT_INF(slot, "%s", "[paged-scheduler] selected reusable request handle\n");
+                return &slot;
+            }
+        }
+
+        return create_paged_request_handle(task);
+    }
+
     server_slot * get_available_slot(const server_task & task) {
         server_slot * ret = nullptr;
 
         bool update_cache = false;
 
         // find the slot that has at least n% prompt similarity
-        if (ret == nullptr && slot_prompt_similarity != 0.0f) {
+        if (params_base.scheduler == "paged") {
+            ret = get_paged_available_handle(task);
+        } else if (ret == nullptr && slot_prompt_similarity != 0.0f) {
             float sim_best = 0;
 
             for (server_slot & slot : slots) {
@@ -1427,7 +1447,7 @@ private:
         }
 
         // find the slot that has been least recently used
-        if (ret == nullptr) {
+        if (params_base.scheduler != "paged" && ret == nullptr) {
             int64_t t_last = -1;
 
             for (server_slot & slot : slots) {
@@ -1482,6 +1502,12 @@ private:
 
                 SRV_WRN("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
             }
+        }
+
+        if (ret && params_base.scheduler == "paged" && ret->prompt.n_tokens() > 0) {
+            SLT_INF(*ret, "%s", "[paged-scheduler] clearing stale request handle KV before launch\n");
+            prefix_cache_invalidate(ret->seq_id());
+            ret->prompt_clear(false);
         }
 
         // Cross-slot KV prefix reuse (--kv-prefix-cache)
