@@ -831,6 +831,14 @@ private:
         slot.reset();
     }
 
+    int32_t initial_slot_count() const {
+        if (params_base.scheduler == "paged") {
+            return 0;
+        }
+
+        return params_base.n_parallel;
+    }
+
     void slot_save_and_clear(server_slot & slot) {
         if (slot.prompt.n_tokens() == 0) {
             return;
@@ -1026,8 +1034,14 @@ private:
             log_paged_capacity_plan(n_ctx_slot, paged_max_model_len, paged_total_blocks, paged_blocks_per_seq, paged_max_full_ctx_concurrency);
         }
 
-        // setup slots
-        SRV_INF("initializing slots, n_slots = %d\n", params_base.n_parallel);
+        // setup request handles
+        const int32_t n_initial_slots = initial_slot_count();
+        if (params_base.scheduler == "paged") {
+            SRV_INF("[paged-scheduler] initializing request handles lazily, initial_slots=%d, admission_cap=%d\n",
+                    n_initial_slots, params_base.n_parallel);
+        } else {
+            SRV_INF("initializing slots, n_slots = %d\n", n_initial_slots);
+        }
 
         if (n_ctx_slot > n_ctx_train) {
             SRV_WRN("the slot context (%d) exceeds the training context of the model (%d) - capping\n", n_ctx_slot, n_ctx_train);
@@ -1065,7 +1079,7 @@ private:
         }
 
         // initialize slots
-        for (int i = 0; i < params_base.n_parallel; i++) {
+        for (int i = 0; i < n_initial_slots; i++) {
             slots.emplace_back();
             init_slot(slots.back(), i, n_ctx_slot, ctx_seq_rm_type);
         }
@@ -1247,6 +1261,10 @@ private:
     }
 
     server_slot * get_slot_by_id(int id_slot) {
+        if (slots.empty()) {
+            return nullptr;
+        }
+
         // note: allow id_slot to be out of bounds (wrap around)
         id_slot = id_slot % slots.size();
 
@@ -2065,6 +2083,10 @@ private:
         return n_processing;
     }
 
+    int32_t count_paged_active_requests() const {
+        return count_processing_slots();
+    }
+
     int32_t paged_task_reserved_blocks(const server_task & task) const {
         if (params_base.scheduler != "paged" || paged_blocks_per_seq_ <= 0) {
             return 0;
@@ -2121,10 +2143,10 @@ private:
         const int32_t cap     = params_base.paged_admission == "actual-len"
             ? seq_max
             : std::min(seq_max, paged_max_full_ctx_concurrency_);
-        const int32_t running = count_processing_slots();
-        const size_t n_slots_needed = task.is_parent() ? 1 + task.child_tasks.size() : 1;
+        const int32_t running = count_paged_active_requests();
+        const size_t n_requests_needed = task.is_parent() ? 1 + task.child_tasks.size() : 1;
 
-        if (running + (int32_t) n_slots_needed <= cap) {
+        if (running + (int32_t) n_requests_needed <= cap) {
             if (params_base.paged_admission != "actual-len") {
                 return true;
             }
@@ -2134,18 +2156,18 @@ private:
             const int32_t free_blk = llama_kv_cache_n_free_blocks(llama_get_memory(ctx));
 
             if (reserved + needed <= paged_total_blocks_) {
-                SRV_DBG("[paged-scheduler] admission accepted: reserved_blocks=%d, requested_blocks=%d, total_blocks=%d, free_blocks=%d, active_slots=%d, requested_slots=%zu\n",
-                        reserved, needed, paged_total_blocks_, free_blk, running, n_slots_needed);
+                SRV_DBG("[paged-scheduler] admission accepted: reserved_blocks=%d, requested_blocks=%d, total_blocks=%d, free_blocks=%d, active_requests=%d, requested_requests=%zu\n",
+                        reserved, needed, paged_total_blocks_, free_blk, running, n_requests_needed);
                 return true;
             }
 
-            SRV_DBG("[paged-scheduler] admission deferred: reserved_blocks=%d, requested_blocks=%d, total_blocks=%d, free_blocks=%d, active_slots=%d, requested_slots=%zu\n",
-                    reserved, needed, paged_total_blocks_, free_blk, running, n_slots_needed);
+            SRV_DBG("[paged-scheduler] admission deferred: reserved_blocks=%d, requested_blocks=%d, total_blocks=%d, free_blocks=%d, active_requests=%d, requested_requests=%zu\n",
+                    reserved, needed, paged_total_blocks_, free_blk, running, n_requests_needed);
             return false;
         }
 
-        SRV_DBG("[paged-scheduler] admission deferred: running=%d, requested_slots=%zu, cap=%d, blocks_per_seq=%d, policy=%s\n",
-                running, n_slots_needed, cap, paged_blocks_per_seq_, params_base.paged_admission.c_str());
+        SRV_DBG("[paged-scheduler] admission deferred: active_requests=%d, requested_requests=%zu, cap=%d, blocks_per_seq=%d, policy=%s\n",
+                running, n_requests_needed, cap, paged_blocks_per_seq_, params_base.paged_admission.c_str());
         return false;
     }
 
@@ -2237,7 +2259,12 @@ private:
                         break;
                     }
 
-                    server_slot * slot = id_slot != -1 ? get_slot_by_id(id_slot) : get_available_slot(task);
+                    if (id_slot != -1 && params_base.scheduler == "paged") {
+                        SRV_DBG("[paged-scheduler] ignoring requested slot id %d; paged mode assigns request handles by admission\n",
+                                id_slot);
+                    }
+
+                    server_slot * slot = id_slot != -1 && params_base.scheduler != "paged" ? get_slot_by_id(id_slot) : get_available_slot(task);
 
                     //
                     // slot scheduling logic

@@ -241,6 +241,10 @@ Implemented:
   - full-context concurrency at `max_model_len`
   - accounted model/context/compute memory
   - backend device free/total memory after model and context allocation
+- Paged mode initializes request handles lazily:
+  - no fixed `n_parallel` slot pool is created at startup
+  - a request handle is created only after admission accepts work
+  - non-paged scheduler still preallocates normal slots
 
 Design:
 
@@ -281,6 +285,7 @@ Acceptance:
 - No explicit preemption/eviction policy for overcommitted running requests.
 - Metal path is correctness-first, not optimized.
 - Current server still uses slots internally; slotless paged request state is pending.
+- Paged mode no longer preallocates fixed slots at startup, but it still uses `server_slot` as the temporary per-request handle after admission.
 - Automatic KV pool sizing from residual VRAM is pending; current paged mode reports capacity after context allocation and uses explicit `--ctx-size`.
 - Paged mask uses block-table logical-page iteration in the portable path; optimized device kernels are still pending.
 
