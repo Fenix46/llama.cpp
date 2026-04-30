@@ -21,6 +21,13 @@ using json = nlohmann::ordered_json;
 #define SLT_ERR(slot, fmt, ...) LOG_ERR("slot %12.*s: id %2d | task %d | " fmt, 12, __func__, (slot).id, ((slot).task ? (slot).task->id : -1), __VA_ARGS__)
 #define SLT_DBG(slot, fmt, ...) LOG_DBG("slot %12.*s: id %2d | task %d | " fmt, 12, __func__, (slot).id, ((slot).task ? (slot).task->id : -1), __VA_ARGS__)
 
+// Logging macros for paged_request_state (slotless paged execution path)
+#define PGD_INF(req, fmt, ...) LOG_INF("preq %12.*s: seq %2d | task %d | " fmt, 12, __func__, (req).seq_id, ((req).task ? (req).task->id : -1), __VA_ARGS__)
+#define PGD_CNT(req, fmt, ...) LOG_CNT(""                                  fmt,                                                                  __VA_ARGS__)
+#define PGD_WRN(req, fmt, ...) LOG_WRN("preq %12.*s: seq %2d | task %d | " fmt, 12, __func__, (req).seq_id, ((req).task ? (req).task->id : -1), __VA_ARGS__)
+#define PGD_ERR(req, fmt, ...) LOG_ERR("preq %12.*s: seq %2d | task %d | " fmt, 12, __func__, (req).seq_id, ((req).task ? (req).task->id : -1), __VA_ARGS__)
+#define PGD_DBG(req, fmt, ...) LOG_DBG("preq %12.*s: seq %2d | task %d | " fmt, 12, __func__, (req).seq_id, ((req).task ? (req).task->id : -1), __VA_ARGS__)
+
 #define SRV_INF(fmt, ...) LOG_INF("srv  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SRV_CNT(fmt, ...) LOG_CNT(""              fmt,               __VA_ARGS__)
 #define SRV_WRN(fmt, ...) LOG_WRN("srv  %12.*s: " fmt, 12, __func__, __VA_ARGS__)

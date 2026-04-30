@@ -40,30 +40,6 @@ using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
-static server_prompt_checkpoint server_get_checkpoint(llama_context * ctx, int id, int64_t n_tokens, llama_pos pos_min = -1, llama_pos pos_max = -1) {
-    if (pos_min == -1) {
-        pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), id);
-    }
-    if (pos_max == -1) {
-        pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx), id);
-    }
-
-    const size_t checkpoint_size = llama_state_seq_get_size_ext(ctx, id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-
-    auto cur = server_prompt_checkpoint {
-        /*.pos_min  = */ pos_min,
-        /*.pos_max  = */ pos_max,
-        /*.n_tokens = */ n_tokens,
-        /*.data     = */ std::vector<uint8_t>(checkpoint_size),
-    };
-
-    const size_t n = llama_state_seq_get_data_ext(ctx, cur.data.data(), checkpoint_size, id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-    if (n != checkpoint_size) {
-        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", checkpoint_size, n);
-    }
-
-    return cur;
-}
 
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
 enum slot_state {
@@ -612,11 +588,27 @@ struct server_metrics {
         n_tokens_max = std::max(n_tokens_max, (uint64_t) slot.prompt.n_tokens());
     }
 
+    void on_prompt_eval(const paged_request_state & req) {
+        n_prompt_tokens_processed_total += req.n_prompt_tokens_processed;
+        n_prompt_tokens_processed       += req.n_prompt_tokens_processed;
+        t_prompt_processing             += req.t_prompt_processing;
+        t_prompt_processing_total       += req.t_prompt_processing;
+
+        n_tokens_max = std::max(n_tokens_max, (uint64_t) req.prompt.n_tokens());
+    }
+
     void on_prediction(const server_slot & slot) {
         n_tokens_predicted_total   += slot.n_decoded;
         n_tokens_predicted         += slot.n_decoded;
         t_tokens_generation        += slot.t_token_generation;
         t_tokens_generation_total  += slot.t_token_generation;
+    }
+
+    void on_prediction(const paged_request_state & req) {
+        n_tokens_predicted_total   += req.n_decoded;
+        n_tokens_predicted         += req.n_decoded;
+        t_tokens_generation        += req.t_token_generation;
+        t_tokens_generation_total  += req.t_token_generation;
     }
 
     void on_decoded(const std::vector<server_slot> & slots) {
@@ -626,6 +618,16 @@ struct server_metrics {
                 n_busy_slots_total++;
             }
             n_tokens_max = std::max(n_tokens_max, (uint64_t) slot.prompt.n_tokens());
+        }
+    }
+
+    void on_decoded(const std::vector<paged_request_state> & reqs) {
+        n_decode_total++;
+        for (const auto & req : reqs) {
+            if (req.is_processing()) {
+                n_busy_slots_total++;
+            }
+            n_tokens_max = std::max(n_tokens_max, (uint64_t) req.prompt.n_tokens());
         }
     }
 
@@ -1989,6 +1991,125 @@ private:
         return slot.has_next_token; // continue
     }
 
+    bool process_token(completion_token_output & result, paged_request_state & req) {
+        const std::string token_str = result.text_to_send;
+        req.sampled = result.tok;
+
+        req.output.generated_text += token_str;
+        if (req.task->params.return_tokens) {
+            req.output.generated_tokens.push_back(result.tok);
+        }
+        req.output.has_next_token = true;
+
+        bool incomplete = validate_utf8(req.output.generated_text) < req.output.generated_text.size();
+
+        if (!incomplete) {
+            size_t pos = std::min(req.output.n_sent_text, req.output.generated_text.size());
+
+            const std::string str_test = req.output.generated_text.substr(pos);
+            bool send_text = true;
+
+            size_t stop_pos = req.find_stopping_strings(str_test, token_str.size(), true);
+            if (stop_pos != std::string::npos) {
+                req.output.generated_text.erase(
+                    req.output.generated_text.begin() + pos + stop_pos,
+                    req.output.generated_text.end());
+                pos = std::min(req.output.n_sent_text, req.output.generated_text.size());
+            } else if (req.output.has_next_token && !llama_vocab_is_eog(vocab, result.tok)) {
+                stop_pos = req.find_stopping_strings(str_test, token_str.size(), false);
+                send_text = stop_pos == std::string::npos;
+            }
+
+            if (send_text) {
+                result.text_to_send = req.output.generated_text.substr(pos, std::string::npos);
+                req.output.n_sent_text += result.text_to_send.size();
+            } else {
+                result.text_to_send = "";
+            }
+
+            req.add_token(result);
+            if (req.task->params.stream) {
+                send_partial_response(req, result, false);
+            }
+        }
+
+        if (incomplete) {
+            req.output.has_next_token = true;
+        }
+
+        if (!params_base.ctx_shift && req.prompt.n_tokens() + 1 >= req.n_ctx) {
+            req.output.truncated      = true;
+            req.output.stop           = STOP_TYPE_LIMIT;
+            req.output.has_next_token = false;
+
+            PGD_DBG(req, "stopped due to context limit, n_tokens=%d, n_ctx=%d\n",
+                    req.prompt.n_tokens(), req.n_ctx);
+        }
+
+        if (req.n_decoded > 0 && req.output.has_next_token && !req.has_budget(params_base)) {
+            req.output.stop           = STOP_TYPE_LIMIT;
+            req.output.has_next_token = false;
+
+            PGD_DBG(req, "stopped by limit, n_decoded=%d, n_predict=%d\n",
+                    req.n_decoded, req.task->params.n_predict);
+        }
+
+        if (req.output.has_new_line) {
+            if (req.task->params.n_indent > 0) {
+                if (req.output.last_nl_pos > 0) {
+                    size_t pos = req.output.last_nl_pos;
+
+                    int n_indent = 0;
+                    while (pos < req.output.generated_text.size() &&
+                           (req.output.generated_text[pos] == ' ' || req.output.generated_text[pos] == '\t')) {
+                        n_indent++;
+                        pos++;
+                    }
+
+                    if (pos < req.output.generated_text.size() && n_indent < req.task->params.n_indent) {
+                        req.output.stop           = STOP_TYPE_LIMIT;
+                        req.output.has_next_token = false;
+                        req.output.generated_text.erase(pos, std::string::npos);
+
+                        PGD_DBG(req, "stopped by indentation limit, n_decoded=%d, n_indent=%d\n",
+                                req.n_decoded, n_indent);
+                    }
+                }
+
+                {
+                    const size_t pos = req.output.generated_text.find('\n', req.output.last_nl_pos);
+                    if (pos != std::string::npos) {
+                        req.output.last_nl_pos = pos + 1;
+                    }
+                }
+            }
+        }
+
+        if (result.text_to_send.find('\n') != std::string::npos) {
+            req.output.has_new_line = true;
+
+            if (req.task->params.t_max_predict_ms > 0 &&
+                (ggml_time_us() - req.t_start_generation > 1000.0f * req.task->params.t_max_predict_ms)) {
+                req.output.stop           = STOP_TYPE_LIMIT;
+                req.output.has_next_token = false;
+
+                PGD_DBG(req, "stopped by time limit, n_decoded=%d\n", req.n_decoded);
+            }
+        }
+
+        if (llama_vocab_is_eog(vocab, result.tok)) {
+            req.output.stop           = STOP_TYPE_EOS;
+            req.output.has_next_token = false;
+
+            PGD_DBG(req, "%s", "stopped by EOS\n");
+        }
+
+        PGD_DBG(req, "n_decoded=%d, n_remaining=%d, next token: %5d '%s'\n",
+                req.n_decoded, req.n_remaining, result.tok, token_str.c_str());
+
+        return req.output.has_next_token;
+    }
+
     void populate_token_probs(const server_slot & slot, completion_token_output & result, bool post_sampling, bool special, int idx) const {
         const size_t n_probs_request = slot.task->params.sampling.n_probs;
 
@@ -2047,6 +2168,10 @@ private:
 
     void send_error(const server_slot & slot, const std::string & error, const enum error_type type = ERROR_TYPE_SERVER) {
         send_error(slot.task->id, error, type, slot.task->n_tokens(), slot.n_ctx);
+    }
+
+    void send_error(const paged_request_state & req, const std::string & error, const enum error_type type = ERROR_TYPE_SERVER) {
+        send_error(req.task->id, error, type, req.task->n_tokens(), req.n_ctx);
     }
 
     void send_error(const int id_task, const std::string & error, const enum error_type type = ERROR_TYPE_SERVER, const int32_t n_prompt_tokens = 0, const int32_t n_ctx = 0) {
@@ -2177,6 +2302,153 @@ private:
 
         queue_results.send(std::move(res));
     }
+
+    // --- paged_request_state overloads ---
+
+    void populate_token_probs(const paged_request_state & req, completion_token_output & result, bool post_sampling, bool special, int idx) const {
+        const size_t n_probs_request = req.task->params.sampling.n_probs;
+
+        if (post_sampling) {
+            const auto * cur_p = common_sampler_get_candidates(req.smpl.get(), true);
+            const size_t max_probs = cur_p->size;
+            const size_t n_probs = std::min(max_probs, n_probs_request);
+
+            for (size_t i = 0; i < max_probs; i++) {
+                if (cur_p->data[i].id == result.tok) {
+                    result.prob = cur_p->data[i].p;
+                    break;
+                }
+            }
+
+            result.probs.reserve(n_probs);
+            for (size_t i = 0; i < n_probs; i++) {
+                result.probs.push_back({
+                    cur_p->data[i].id,
+                    common_token_to_piece(ctx, cur_p->data[i].id, special),
+                    cur_p->data[i].p
+                });
+            }
+        } else {
+            std::vector<llama_token_data> cur = get_token_probabilities(ctx, idx);
+            const size_t max_probs = cur.size();
+            const size_t n_probs = std::min(max_probs, n_probs_request);
+
+            for (size_t i = 0; i < max_probs; i++) {
+                if (cur[i].id == result.tok) {
+                    result.prob = cur[i].p;
+                    break;
+                }
+            }
+
+            result.probs.reserve(n_probs);
+            for (size_t i = 0; i < n_probs; i++) {
+                result.probs.push_back({
+                    cur[i].id,
+                    common_token_to_piece(ctx, cur[i].id, special),
+                    cur[i].p
+                });
+            }
+        }
+    }
+
+    void send_partial_response(paged_request_state & req, const completion_token_output & tkn, bool is_progress) {
+        auto res = std::make_unique<server_task_result_cmpl_partial>();
+
+        res->id    = req.task->id;
+        res->index = req.task->index;
+
+        if (is_progress) {
+            res->is_progress        = true;
+            res->progress.total     = req.task->n_tokens();
+            res->progress.cache     = req.n_prompt_tokens_cache;
+            res->progress.processed = req.prompt.tokens.size();
+            res->progress.time_ms   = (ggml_time_us() - req.t_start_process_prompt) / 1000;
+        } else {
+            res->content = tkn.text_to_send;
+            res->tokens  = { tkn.tok };
+        }
+
+        res->n_decoded             = req.n_decoded;
+        res->n_prompt_tokens       = req.task->n_tokens();
+        res->n_prompt_tokens_cache = req.n_prompt_tokens_cache;
+        res->post_sampling_probs   = req.task->params.post_sampling_probs;
+
+        res->verbose           = req.task->params.verbose;
+        res->res_type          = req.task->params.res_type;
+        res->oaicompat_model   = req.task->params.oaicompat_model;
+        res->oaicompat_cmpl_id = req.task->params.oaicompat_cmpl_id;
+
+        if (req.task->params.sampling.n_probs > 0) {
+            res->prob_output = tkn;
+        }
+
+        if (req.output.stop != STOP_TYPE_NONE || req.task->params.timings_per_token) {
+            res->timings = req.get_timings();
+        }
+
+        queue_results.send(std::move(res));
+    }
+
+    void send_final_response(paged_request_state & req) {
+        auto res = std::make_unique<server_task_result_cmpl_final>();
+
+        res->id      = req.task->id;
+        res->id_slot = req.seq_id;
+        res->index   = req.task->index;
+
+        if (slots_debug) {
+            req.output.debug_generated_text = req.output.generated_text;
+        }
+
+        if (req.task->params.stream) {
+            res->content = "";
+            res->tokens  = llama_tokens{};
+        } else {
+            res->content = std::move(req.output.generated_text);
+            res->tokens  = std::move(req.output.generated_tokens);
+        }
+
+        res->timings         = req.get_timings();
+        res->prompt          = req.task->tokens.detokenize(ctx, true);
+        res->response_fields = std::move(req.task->params.response_fields);
+
+        res->truncated             = req.output.truncated;
+        res->n_decoded             = req.n_decoded;
+        res->n_prompt_tokens       = req.task->n_tokens();
+        res->n_prompt_tokens_cache = req.n_prompt_tokens_cache;
+        res->n_tokens_cached       = req.prompt.n_tokens();
+        res->has_new_line          = req.output.has_new_line;
+        res->stopping_word         = req.output.stopping_word;
+        res->stop                  = req.output.stop;
+        res->post_sampling_probs   = req.task->params.post_sampling_probs;
+
+        res->verbose           = req.task->params.verbose;
+        res->stream            = req.task->params.stream;
+        res->include_usage     = req.task->params.include_usage;
+        res->res_type          = req.task->params.res_type;
+        res->oaicompat_model   = req.task->params.oaicompat_model;
+        res->oaicompat_cmpl_id = req.task->params.oaicompat_cmpl_id;
+
+        if (req.task->params.sampling.n_probs > 0) {
+            if (!req.task->params.stream && req.output.stop == STOP_TYPE_WORD) {
+                const llama_tokens stop_word_toks = common_tokenize(ctx, req.output.stopping_word, false);
+                size_t safe_offset = std::min(req.output.generated_token_probs.size(), stop_word_toks.size());
+                res->probs_output = std::vector<completion_token_output>(
+                        req.output.generated_token_probs.begin(),
+                        req.output.generated_token_probs.end() - safe_offset);
+            } else {
+                res->probs_output = std::vector<completion_token_output>(
+                        req.output.generated_token_probs.begin(),
+                        req.output.generated_token_probs.end());
+            }
+        }
+
+        res->generation_params = req.task->params;
+
+        queue_results.send(std::move(res));
+    }
+
+    // --- end paged overloads ---
 
     void send_embedding(const server_slot & slot, const llama_batch & batch) {
         auto res = std::make_unique<server_task_result_embd>();
