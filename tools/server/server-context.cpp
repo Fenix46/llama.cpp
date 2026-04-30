@@ -59,11 +59,8 @@ enum server_state {
 struct server_slot {
     int id;
 
-    // Bridge toward slotless paged scheduling: current implementation still
-    // stores the llama seq_id in server_slot::id, but all new KV/sampler code
-    // should use seq_id() so the request state can move out of server_slot.
     int seq_id() const {
-        return paged.seq_id >= 0 ? paged.seq_id : id;
+        return id;
     }
 
     llama_context * ctx = nullptr;
@@ -93,7 +90,6 @@ struct server_slot {
     int32_t n_decoded   = 0;
     int32_t n_remaining = -1;
     int32_t i_batch     = -1;
-    paged_request_state paged;
 
     int32_t n_prompt_tokens_cache     = 0;
     int32_t n_prompt_tokens_processed = 0;
@@ -205,7 +201,6 @@ struct server_slot {
         // clear speculative decoding stats
         n_draft_total = 0;
         n_draft_accepted = 0;
-        paged.clear_runtime();
 
         task_prev = std::move(task);
         task.reset();
@@ -403,7 +398,6 @@ struct server_slot {
             t_token_generation = (ggml_time_us() - t_start_generation) / 1e3;
 
             state = SLOT_STATE_IDLE;
-            paged.phase = PAGED_REQUEST_IDLE;
 
             // do not keep context of the child slots - the parent's context is enough
             if (task->is_child()) {
@@ -825,8 +819,6 @@ private:
         slot.id    = id;
         slot.ctx   = ctx;
         slot.n_ctx = n_ctx_slot;
-        slot.paged.seq_id = id;
-
         slot.ctx_seq_rm_type = ctx_seq_rm_type;
 
         slot.mctx                   = mctx;
@@ -861,36 +853,12 @@ private:
                     paged_seq_leases.release_uncached(id_slot);
                     if (sl != nullptr) {
                         sl->id = -1;
-                        sl->paged.seq_id = -1;
                     }
                 }
             }
         };
 
         slot.reset();
-    }
-
-    bool assign_paged_seq_id(server_slot & slot) {
-        if (params_base.scheduler != "paged") {
-            return true;
-        }
-
-        if (slot.seq_id() >= 0) {
-            paged_seq_leases.active_seq_ids.insert(slot.seq_id());
-            paged_seq_leases.cached_seq_ids.erase(slot.seq_id());
-            return true;
-        }
-
-        const int32_t seq_id = paged_seq_leases.lease();
-        if (seq_id < 0) {
-            SRV_WRN("%s", "[paged-scheduler] no free seq_id lease available\n");
-            return false;
-        }
-
-        slot.id = seq_id;
-        slot.paged.seq_id = seq_id;
-        SLT_INF(slot, "[paged-scheduler] leased seq_id=%d\n", seq_id);
-        return true;
     }
 
     int32_t initial_slot_count() const {
@@ -913,7 +881,6 @@ private:
         if (params_base.scheduler == "paged") {
             paged_seq_leases.release_uncached(slot.seq_id());
             slot.id = -1;
-            slot.paged.seq_id = -1;
         }
         prompt_cache->update();
     }
@@ -1446,46 +1413,58 @@ private:
         return create_dynamic_slot(task);
     }
 
-    paged_request_state & ensure_paged_request_shadow(server_slot & slot) {
-        GGML_ASSERT(params_base.scheduler == "paged");
+    // Find or create a paged_request_state ready for a new task.
+    // Returns nullptr if KV pool is exhausted or seq_id pool is empty.
+    paged_request_state * get_or_create_paged_request(const server_task & task) {
+        const int32_t seq_max     = (int32_t) llama_n_seq_max(ctx);
+        const int32_t blks_needed = paged_task_reserved_blocks(task);
+        const int32_t seq_cap     = params_base.paged_admission != "actual-len"
+            ? std::min(seq_max, paged_max_full_ctx_concurrency_)
+            : seq_max;
 
+        // look for an idle entry already in paged_requests
         for (auto & req : paged_requests) {
-            if (req.seq_id == slot.seq_id()) {
-                return req;
+            if (!req.is_processing()) {
+                SRV_INF("[paged] reusing idle request entry seq_id=%d\n", req.seq_id);
+                return &req;
             }
         }
 
-        auto & req = paged_requests.emplace_back();
-        req.seq_id = slot.seq_id();
-        req.n_ctx  = slot.n_ctx;
-        req.prompt.tokens.has_mtmd = mctx != nullptr;
-        return req;
-    }
-
-    void sync_paged_request_shadow(server_slot & slot) {
-        if (params_base.scheduler != "paged") {
-            return;
+        // check cap and KV availability before creating a new entry
+        const int32_t n_active = paged_seq_leases.n_active();
+        if (n_active >= seq_cap) {
+            SRV_DBG("[paged] request cap reached: active=%d, seq_cap=%d\n", n_active, seq_cap);
+            return nullptr;
         }
 
-        auto & req = ensure_paged_request_shadow(slot);
-        req.request_id      = slot.paged.request_id;
-        req.parent_id       = slot.task ? slot.task->id_parent : -1;
-        req.seq_id          = slot.seq_id();
-        req.reserved_blocks = slot.paged.reserved_blocks;
-        req.n_ctx           = slot.n_ctx;
-        req.phase           = slot.paged.phase;
-        req.n_decoded       = slot.n_decoded;
-        req.n_remaining     = slot.n_remaining;
-        req.i_batch         = slot.i_batch;
-        req.n_prompt_tokens_cache     = slot.n_prompt_tokens_cache;
-        req.n_prompt_tokens_processed = slot.n_prompt_tokens_processed;
-        req.t_start_process_prompt    = slot.t_start_process_prompt;
-        req.t_start_generation        = slot.t_start_generation;
-        req.t_prompt_processing       = slot.t_prompt_processing;
-        req.t_token_generation        = slot.t_token_generation;
-        req.sampled                   = slot.sampled;
-        req.alora_invocation_start    = slot.alora_invocation_start;
-        req.lora                      = slot.lora;
+        int32_t n_free_blk = llama_kv_cache_n_free_blocks(llama_get_memory(ctx));
+        if (n_free_blk < blks_needed) {
+            if (try_clear_idle_paged_requests()) {
+                n_free_blk = llama_kv_cache_n_free_blocks(llama_get_memory(ctx));
+                SRV_INF("[paged] evicted idle KV, free_blocks now=%d\n", n_free_blk);
+            }
+        }
+
+        if (n_free_blk < blks_needed) {
+            SRV_WRN("[paged] KV pool exhausted: free_blocks=%d < needed=%d\n", n_free_blk, blks_needed);
+            return nullptr;
+        }
+
+        // lease a new seq_id
+        const int32_t seq_id = paged_seq_leases.lease();
+        if (seq_id < 0) {
+            SRV_WRN("%s", "[paged] no free seq_id lease\n");
+            return nullptr;
+        }
+
+        auto & req = paged_requests.emplace_back();
+        req.seq_id = seq_id;
+        req.n_ctx  = n_ctx_slot_;
+        req.prompt.tokens.has_mtmd = mctx != nullptr;
+
+        SRV_INF("[paged] created request entry seq_id=%d (free_blocks=%d, seq_cap=%d)\n",
+                seq_id, n_free_blk, seq_cap);
+        return &req;
     }
 
     server_slot * get_paged_available_handle(const server_task & task) {
@@ -1612,18 +1591,6 @@ private:
             }
         }
 
-        if (ret && params_base.scheduler == "paged" && ret->prompt.n_tokens() > 0) {
-            SLT_INF(*ret, "%s", "[paged-scheduler] clearing stale request handle KV before launch\n");
-            prefix_cache_invalidate(ret->seq_id());
-            ret->prompt_clear(false);
-            paged_seq_leases.release_uncached(ret->seq_id());
-            ret->id = -1;
-            ret->paged.seq_id = -1;
-            if (!assign_paged_seq_id(*ret)) {
-                return nullptr;
-            }
-        }
-
         // Cross-slot KV prefix reuse (--kv-prefix-cache)
         // If the prefix cache has a donor slot with more cached tokens than the
         // currently selected slot's own common prefix, copy its KV blocks into
@@ -1743,11 +1710,6 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
-        if (!assign_paged_seq_id(slot)) {
-            send_error(task, "No free sequence id available for paged scheduler", ERROR_TYPE_UNAVAILABLE);
-            return false;
-        }
-
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -1855,21 +1817,10 @@ private:
         }
 
         slot.task = std::make_unique<const server_task>(std::move(task));
-        if (params_base.scheduler == "paged") {
-            slot.paged.request_id      = slot.task->id;
-            slot.paged.parent_id       = slot.task->id_parent;
-            slot.paged.seq_id          = slot.seq_id();
-            slot.paged.n_ctx           = slot.n_ctx;
-            slot.paged.reserved_blocks = paged_task_reserved_blocks(*slot.task);
-            slot.paged.phase           = slot.task->is_child()
-                ? PAGED_REQUEST_WAIT_PARENT
-                : PAGED_REQUEST_STARTED;
-        }
 
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
             : SLOT_STATE_STARTED;
-        sync_paged_request_shadow(slot);
 
         // reset server kill-switch counter
         n_empty_consecutive = 0;
@@ -1881,31 +1832,31 @@ private:
     // Populate a paged_request_state directly from a task (paged-scheduler primary launch path).
     // The server_slot handle provides the seq_id and KV slot management; all execution state
     // lives in the paged_request_state from this point on.
-    bool launch_paged_request(server_slot & slot, server_task && task) {
+    bool launch_paged_request(paged_request_state & req, server_task && task) {
         GGML_ASSERT(params_base.scheduler == "paged");
 
         // lora
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
-            if (!are_lora_equal(task_loras, slot.lora)) {
-                if (lora_should_clear_cache(slot.lora, task_loras)) {
-                    slot.prompt.tokens.clear();
+            if (!are_lora_equal(task_loras, req.lora)) {
+                if (lora_should_clear_cache(req.lora, task_loras)) {
+                    req.prompt.tokens.clear();
                 }
-                slot.lora = task_loras;
+                req.lora = task_loras;
             }
         } else {
-            slot.lora = params_base.lora_adapters;
+            req.lora = params_base.lora_adapters;
         }
 
         // alora invocation start
         size_t alora_invocation_start = task.tokens.size();
-        if (lora_all_alora(slot.lora)) {
-            const auto & enabled_ids = lora_get_enabled_ids(slot.lora);
+        if (lora_all_alora(req.lora)) {
+            const auto & enabled_ids = lora_get_enabled_ids(req.lora);
             if (enabled_ids.size() != 1) {
                 send_error(task, "Cannot run multiple aLoRAs in a single request", ERROR_TYPE_INVALID_REQUEST);
                 return false;
             }
-            const auto & lora_ptr = slot.lora[enabled_ids[0]].ptr;
+            const auto & lora_ptr = req.lora[enabled_ids[0]].ptr;
             const uint64_t      n_inv = llama_adapter_get_alora_n_invocation_tokens(lora_ptr);
             const llama_token * inv   = llama_adapter_get_alora_invocation_tokens(lora_ptr);
             int match_idx = (int) n_inv - 1;
@@ -1918,7 +1869,7 @@ private:
                 }
             }
             if (alora_invocation_start == task.tokens.size()) {
-                slot.lora[enabled_ids[0]].scale = 0.0f;
+                req.lora[enabled_ids[0]].scale = 0.0f;
             }
         }
 
@@ -1927,71 +1878,36 @@ private:
             return false;
         }
 
-        // find or create the paged_request_state for this seq_id
-        paged_request_state * req = nullptr;
-        for (auto & r : paged_requests) {
-            if (r.seq_id == slot.seq_id()) {
-                req = &r;
-                break;
-            }
-        }
-        if (!req) {
-            req = &paged_requests.emplace_back();
-            req->seq_id = slot.seq_id();
-            req->n_ctx  = slot.n_ctx;
-            req->prompt.tokens.has_mtmd = mctx != nullptr;
-        }
-
-        req->ctx              = ctx;
-        req->mctx             = mctx;
-        req->ctx_seq_rm_type  = ctx_seq_rm_type_;
-        req->n_ctx            = slot.n_ctx;
-        req->lora             = slot.lora;
-        req->alora_invocation_start = (int32_t) alora_invocation_start;
-        req->reserved_blocks  = paged_task_reserved_blocks(task);
-        req->callback_on_release = [this](int32_t sid) {
+        req.ctx              = ctx;
+        req.mctx             = mctx;
+        req.ctx_seq_rm_type  = ctx_seq_rm_type_;
+        req.alora_invocation_start = (int32_t) alora_invocation_start;
+        req.reserved_blocks  = paged_task_reserved_blocks(task);
+        req.callback_on_release = [this](int32_t sid) {
             paged_seq_leases.mark_cached(sid);
-            // reset the slot handle so it can be reused
-            for (auto & s : slots) {
-                if (s.seq_id() == sid) {
-                    s.state = SLOT_STATE_IDLE;
-                    break;
-                }
-            }
         };
 
         // sampler
         if (task.need_sampling()) {
             try {
-                req->smpl.reset(common_sampler_init(model, task.params.sampling));
+                req.smpl.reset(common_sampler_init(model, task.params.sampling));
             } catch (std::exception & e) {
                 send_error(task, std::string("Failed to initialize samplers: ") + e.what(), ERROR_TYPE_INVALID_REQUEST);
                 return false;
             }
-            llama_set_sampler(ctx, req->seq_id, nullptr); // CPU sampler always for paged
+            llama_set_sampler(ctx, req.seq_id, nullptr);
         } else {
-            req->smpl.reset();
+            req.smpl.reset();
         }
 
-        req->request_id = task.id;
-        req->parent_id  = task.id_parent;
-        req->phase      = task.is_child() ? PAGED_REQUEST_WAIT_PARENT : PAGED_REQUEST_STARTED;
-
-        req->task = std::make_unique<const server_task>(std::move(task));
-
-        // set slot state so admission/handle tracking still works
-        // (slot.task is intentionally left null — all task data lives in req)
-        slot.state = req->phase == PAGED_REQUEST_WAIT_PARENT
-            ? SLOT_STATE_WAIT_OTHER
-            : SLOT_STATE_STARTED;
-        slot.paged.phase          = req->phase;
-        slot.paged.request_id     = req->request_id;
-        slot.paged.seq_id         = req->seq_id;
-        slot.paged.reserved_blocks = req->reserved_blocks;
+        req.request_id = task.id;
+        req.parent_id  = task.id_parent;
+        req.phase      = task.is_child() ? PAGED_REQUEST_WAIT_PARENT : PAGED_REQUEST_STARTED;
+        req.task       = std::make_unique<const server_task>(std::move(task));
 
         n_empty_consecutive = 0;
         SRV_INF("[paged] launched request seq_id=%d, task=%d, is_child=%d\n",
-                req->seq_id, req->request_id, req->task->is_child() ? 1 : 0);
+                req.seq_id, req.request_id, req.task->is_child() ? 1 : 0);
         return true;
     }
 
@@ -2949,78 +2865,94 @@ private:
                         break;
                     }
 
-                    if (id_slot != -1 && params_base.scheduler == "paged") {
-                        SRV_DBG("[paged-scheduler] ignoring requested slot id %d; paged mode assigns request handles by admission\n",
-                                id_slot);
+                    // ---- paged scheduler: work directly with paged_request_state ----
+                    if (params_base.scheduler == "paged") {
+                        if (id_slot != -1) {
+                            SRV_DBG("[paged] ignoring requested slot id %d; admission selects request\n", id_slot);
+                        }
+
+                        if (task.is_parent()) {
+                            const size_t n_children = task.child_tasks.size();
+                            const int    id_parent  = task.id;
+
+                            // acquire entries for all children + parent
+                            std::vector<paged_request_state *> child_reqs;
+                            child_reqs.reserve(n_children);
+                            bool ok = true;
+                            for (size_t ci = 0; ci < n_children; ++ci) {
+                                paged_request_state * cr = get_or_create_paged_request(task.child_tasks[ci]);
+                                if (!cr) {
+                                    SRV_DBG("[paged] not enough capacity for child tasks, defer id_task=%d\n", id_task);
+                                    ok = false;
+                                    break;
+                                }
+                                child_reqs.push_back(cr);
+                            }
+                            if (!ok) {
+                                queue_tasks.defer(std::move(task));
+                                break;
+                            }
+
+                            paged_request_state * parent_req = get_or_create_paged_request(task);
+                            if (!parent_req) {
+                                SRV_DBG("[paged] not enough capacity for parent task, defer id_task=%d\n", id_task);
+                                queue_tasks.defer(std::move(task));
+                                break;
+                            }
+
+                            auto release_acquired = [&]() {
+                                for (auto & req : paged_requests) {
+                                    if (req.is_processing() && (
+                                            req.request_id == id_parent ||
+                                            req.parent_id  == id_parent)) {
+                                        req.release();
+                                    }
+                                }
+                            };
+
+                            for (size_t ci = 0; ci < n_children; ++ci) {
+                                if (!launch_paged_request(*child_reqs[ci], std::move(task.child_tasks[ci]))) {
+                                    SRV_ERR("[paged] failed to launch child task ci=%zu\n", ci);
+                                    release_acquired();
+                                    break;
+                                }
+                            }
+                            if (!launch_paged_request(*parent_req, std::move(task))) {
+                                SRV_ERR("[paged] failed to launch parent task id=%d\n", id_parent);
+                                release_acquired();
+                                break;
+                            }
+                        } else {
+                            paged_request_state * req = get_or_create_paged_request(task);
+                            if (!req) {
+                                SRV_DBG("[paged] no capacity, defer id_task=%d\n", id_task);
+                                queue_tasks.defer(std::move(task));
+                                break;
+                            }
+                            if (!launch_paged_request(*req, std::move(task))) {
+                                SRV_ERR("[paged] failed to launch task id=%d\n", id_task);
+                                break;
+                            }
+                        }
+                        break; // done with paged dispatch
                     }
 
-                    server_slot * slot = id_slot != -1 && params_base.scheduler != "paged" ? get_slot_by_id(id_slot) : get_available_slot(task);
-
-                    //
-                    // slot scheduling logic
-                    //
+                    // ---- legacy slot-based scheduler ----
+                    server_slot * slot = id_slot != -1 ? get_slot_by_id(id_slot) : get_available_slot(task);
 
                     if (slot == nullptr) {
-                        // if no slot is available, we defer this task for processing later
                         SRV_DBG("no slot is available, defer task, id_task = %d\n", id_task);
                         queue_tasks.defer(std::move(task));
                         break;
                     }
 
                     if (slot->is_processing()) {
-                        // if requested slot is unavailable, we defer this task for processing later
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", id_task);
                         queue_tasks.defer(std::move(task));
                         break;
                     }
 
-                    if (params_base.scheduler == "paged") {
-                        if (task.is_parent()) {
-                            size_t n_child_tasks = task.child_tasks.size();
-                            std::vector<server_slot *> child_slots = get_free_slots(n_child_tasks, slot->seq_id());
-                            if (child_slots.size() < n_child_tasks) {
-                                SRV_DBG("[paged] not enough handles for child tasks, defer id_task=%d\n", id_task);
-                                queue_tasks.defer(std::move(task));
-                                break;
-                            }
-                            int id_parent = task.id;
-                            size_t idx = 0;
-                            bool ok = true;
-                            for (auto * child_slot : child_slots) {
-                                if (!launch_paged_request(*child_slot, std::move(task.child_tasks[idx]))) {
-                                    SRV_ERR("[paged] failed to launch child task idx=%zu\n", idx);
-                                    ok = false;
-                                    break;
-                                }
-                                idx++;
-                            }
-                            if (!ok) {
-                                for (auto & req : paged_requests) {
-                                    if (req.is_processing() && (
-                                            req.request_id == id_parent ||
-                                            req.parent_id  == id_parent)) {
-                                        req.release();
-                                    }
-                                }
-                                break;
-                            }
-                            if (!launch_paged_request(*slot, std::move(task))) {
-                                SRV_ERR("[paged] failed to launch parent task id=%d\n", id_parent);
-                                for (auto & req : paged_requests) {
-                                    if (req.is_processing() && (
-                                            req.request_id == id_parent ||
-                                            req.parent_id  == id_parent)) {
-                                        req.release();
-                                    }
-                                }
-                                break;
-                            }
-                        } else if (!launch_paged_request(*slot, std::move(task))) {
-                            SRV_ERR("[paged] failed to launch task id=%d\n", id_task);
-                            break;
-                        }
-                    } else if (task.is_parent()) {
-                        // try getting free slots for all child tasks
+                    if (task.is_parent()) {
                         size_t n_child_tasks = task.child_tasks.size();
                         std::vector<server_slot *> child_slots = get_free_slots(n_child_tasks, slot->seq_id());
                         if (child_slots.size() < n_child_tasks) {
@@ -3030,11 +2962,11 @@ private:
                         }
                         if (!launch_slots_with_parent_task(*slot, child_slots, std::move(task))) {
                             SRV_ERR("failed to launch slot with parent task, id_task = %d\n", id_task);
-                            break; // drop the task
+                            break;
                         }
                     } else if (!launch_slot_with_task(*slot, std::move(task))) {
                         SRV_ERR("failed to launch slot with task, id_task = %d\n", id_task);
-                        break; // drop the task
+                        break;
                     }
 
                     if (params_base.cache_idle_slots) {
@@ -3074,16 +3006,28 @@ private:
                     int n_idle_slots       = 0;
                     int n_processing_slots = 0;
 
-                    for (server_slot & slot : slots) {
-                        json slot_data = slot.to_json(slots_debug == 0);
-
-                        if (slot.is_processing()) {
-                            n_processing_slots++;
-                        } else {
-                            n_idle_slots++;
+                    if (params_base.scheduler == "paged") {
+                        n_processing_slots = paged_seq_leases.n_active();
+                        n_idle_slots       = (int) paged_requests.size() - n_processing_slots;
+                        if (n_idle_slots < 0) { n_idle_slots = 0; }
+                        for (const auto & req : paged_requests) {
+                            slots_data.push_back(json {
+                                {"id",            req.seq_id},
+                                {"is_processing", req.is_processing()},
+                                {"n_ctx",         req.n_ctx},
+                                {"id_task",       req.request_id},
+                            });
                         }
-
-                        slots_data.push_back(slot_data);
+                    } else {
+                        for (server_slot & slot : slots) {
+                            json slot_data = slot.to_json(slots_debug == 0);
+                            if (slot.is_processing()) {
+                                n_processing_slots++;
+                            } else {
+                                n_idle_slots++;
+                            }
+                            slots_data.push_back(slot_data);
+                        }
                     }
                     SRV_DBG("n_idle_slots = %d, n_processing_slots = %d\n", n_idle_slots, n_processing_slots);
 
@@ -3956,7 +3900,6 @@ private:
                         slot.t_start_generation = 0;
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
-                        slot.paged.phase = PAGED_REQUEST_PREFILLING;
 
                         SLT_INF(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                 slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
@@ -4367,7 +4310,6 @@ private:
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
                         slot.state = SLOT_STATE_DONE_PROMPT;
-                        slot.paged.phase = PAGED_REQUEST_DONE_PREFILL;
 
                         GGML_ASSERT(batch.n_tokens > 0);
 
@@ -4571,7 +4513,6 @@ private:
 
                         slot.copy_state_to(*child);
                         child->state = SLOT_STATE_DONE_PROMPT;
-                        child->paged.phase = PAGED_REQUEST_DONE_PREFILL;
                     }
                 }
             }
@@ -4608,7 +4549,6 @@ private:
 
                     // prompt evaluated for next-token prediction
                     slot.state = SLOT_STATE_GENERATING;
-                    slot.paged.phase = PAGED_REQUEST_DECODING;
 
                     if (slot.can_speculate()) {
                         common_speculative_begin(slot.spec.get(), slot.prompt.tokens.get_text_tokens());
