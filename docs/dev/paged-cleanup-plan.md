@@ -3,21 +3,21 @@
 > Branch: `paged-kv-cache-phase1`
 > Status: fork-private
 > Last good build: `cmake --build build --target llama-server -j8`
-> Last good commit: `c39a4678a server: execute paged requests directly from paged_requests, bypass slots`
+> Last good commit: `959d871c3 server: remove server_slot from paged execution path (A1+A2+A3)`
 
-## Current State (post-Milestone 7 partial)
+## Current State (post-A3)
 
-Paged execution path now lives entirely in `paged_requests` inside `update_slots()`.
-Early-return branch handles: all-idle check, decode batch, chunked prefill, llama_decode,
-sampling, speculative decoding, response sending.
+Paged execution path lives entirely in `paged_requests` inside `update_slots()`.
+`server_slot` is completely absent from paged mode — no slots created, no slot fields used.
+`paged_request_state` is the sole runtime container for all paged requests.
 
-`server_slot` still exists in paged mode as a thin handle for seq_id management.
-All task execution state lives in `paged_request_state`.
+`get_or_create_paged_request()` finds or allocates a `paged_request_state` directly,
+leasing a seq_id from `paged_seq_leases` without touching `slots`.
 
 Known remaining issues:
-- Slots created as handles, never fully eliminated from paged mode
-- `sync_paged_request_shadow` / `ensure_paged_request_shadow` — dead code
-- `slot.paged.*` fields still in `server_slot` — dead in paged execution
+- Paged prefill does not reuse KV prefix (n_past always 0 or simple match, no KV shift)
+- Paged prefill does not create/restore SWA checkpoints (crash risk on SWA models)
+- Copy-on-write uses portable tensor get/set (slow for large blocks)
 - Paged prefill does not do KV shift / cache-reuse (n_past always 0 or simple prefix)
 - Paged prefill does not create/restore SWA checkpoints (crash risk on SWA models)
 - KV dashboard `slots: N` reads from `slots`, not `paged_requests`
@@ -25,9 +25,9 @@ Known remaining issues:
 
 ---
 
-## Phase A — Remove slots from paged execution (architectural debt)
+## Phase A — Remove slots from paged execution (architectural debt) ✓ DONE
 
-### A1 — Eliminate slot as runtime handle
+### A1 — Eliminate slot as runtime handle ✓ DONE `959d871c3`
 
 **Goal**: `paged_requests` becomes sole container; no `server_slot` created in paged mode.
 
@@ -50,7 +50,7 @@ Acceptance:
 - `paged_requests` size tracks active requests correctly
 - `paged_seq_leases.n_active()` matches concurrent request count
 
-### A2 — Remove dead code
+### A2 — Remove dead code ✓ DONE `959d871c3`
 
 Files: `tools/server/server-context.cpp`, `tools/server/server-context.h` (server_slot struct)
 
@@ -67,7 +67,7 @@ Acceptance:
 - Build clean, no references to `slot.paged.*` remain
 - `grep -n "paged_slot_state\|slot\.paged\.\|sync_paged_request_shadow\|ensure_paged_request_shadow"` returns 0
 
-### A3 — Fix metrics and dashboard
+### A3 — Fix metrics and dashboard ✓ DONE `959d871c3`
 
 Files: `tools/server/server-context.cpp`
 
@@ -193,9 +193,9 @@ Changes:
 
 | Phase | Effort | Impact | Order |
 |-------|--------|--------|-------|
-| A1 — slot handle removal | High | Eliminates slot from paged execution entirely | 1 |
-| A2 — dead code removal | Low | Clean build, no dead paths | 1 (with A1) |
-| A3 — metrics fix | Low | Correct dashboard/metrics | 1 (with A1) |
+| A1 — slot handle removal | High | Eliminates slot from paged execution entirely | ✓ DONE |
+| A2 — dead code removal | Low | Clean build, no dead paths | ✓ DONE |
+| A3 — metrics fix | Low | Correct dashboard/metrics | ✓ DONE |
 | B1 — prefix reuse n_past | Low | Correctness for multi-turn | 2 |
 | B2 — prefix cache lookup | Medium | Performance (cache hits) | 2 |
 | C1-C2 — SWA checkpoints | Medium | Correctness for SWA models | 3 |
