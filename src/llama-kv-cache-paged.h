@@ -1,24 +1,26 @@
 #pragma once
 
 // =============================================================================
-// llama-kv-cache-paged.h  —  PREPARATORY ABSTRACTION, PHASE 1
+// llama-kv-cache-paged.h  —  EXPERIMENTAL PAGED-KV SUPPORT
 //
-// This file introduces data structures for a future paged/blocked KV cache.
-// It does NOT change any runtime behavior. The physical KV tensor layout
-// remains a flat pre-allocated slab identical to the current implementation.
+// This file provides data structures for paged/blocked KV cache operation.
+// The physical KV tensor layout remains a flat pre-allocated slab, but logical
+// sequence pages are tracked through a block table.
 //
 // Purpose:
-//   Establish the vocabulary (block, allocator, block_table) so that Phase 2
-//   can wire these structures into find_slot() / apply_ubatch() / set_input_*
-//   without needing large-scale renaming.
+//   Track block allocation, logical-page mappings, and shared-block ownership
+//   so server paged scheduling can approach vLLM-like request admission and
+//   prefix reuse while preserving portable fallback paths.
 //
-// Invariants (Phase 1):
+// Invariants:
 //   - llama_kv_block maps to a contiguous range [first_cell, first_cell+size)
-//     in the existing flat slab. No virtual-to-physical indirection yet.
+//     in the existing flat slab.
 //   - llama_kv_block_allocator manages a fixed pool of non-overlapping blocks
 //     that together cover exactly the cells in one llama_kv_cells instance.
 //   - llama_kv_block_table maps (seq_id, logical_page_index) to a physical
-//     block_id, but is currently unused by the decode path.
+//     block_id.
+//   - block refcounts protect shared pages created by sequence copies; the
+//     write-side copy-on-write path is still pending.
 //
 // Intended Phase 2 integration points (for reference, not implemented here):
 //   - find_slot()          : replace ring-buffer scan with block_table lookup
@@ -93,9 +95,11 @@ public:
 
         blocks.clear();
         free_ids.clear();
+        ref_counts.clear();
 
         const uint32_t n_blocks = (n_cells + bs - 1) / bs;
         blocks.reserve(n_blocks);
+        ref_counts.assign(n_blocks, 0);
 
         for (uint32_t i = 0; i < n_blocks; ++i) {
             llama_kv_block blk;
@@ -131,6 +135,15 @@ public:
         return blocks[id];
     }
 
+    uint32_t ref_count(uint32_t id) const {
+        assert(id < ref_counts.size());
+        return ref_counts[id];
+    }
+
+    bool is_shared(uint32_t id) const {
+        return ref_count(id) > 1;
+    }
+
     // Allocate one free block. Returns LLAMA_KV_BLOCK_ID_NONE if pool is
     // exhausted. Does not touch the underlying KV tensors.
     uint32_t alloc() {
@@ -139,6 +152,8 @@ public:
         }
         const uint32_t id = free_ids.back();
         free_ids.pop_back();
+        assert(ref_counts[id] == 0);
+        ref_counts[id] = 1;
         return id;
     }
 
@@ -152,16 +167,31 @@ public:
             if (free_ids[i] == id) {
                 free_ids[i] = free_ids.back();
                 free_ids.pop_back();
+                ref_counts[id] = 1;
                 return;
             }
         }
         // not in free list → already allocated, nothing to do
     }
 
+    // Add one logical owner for an already allocated block.
+    void retain(uint32_t id) {
+        assert(id < blocks.size());
+        assert(ref_counts[id] > 0);
+        ref_counts[id]++;
+    }
+
     // Return a block to the free list. The caller is responsible for clearing
     // the cell metadata in llama_kv_cells before or after this call.
     void free(uint32_t id) {
         assert(id < blocks.size());
+        if (ref_counts[id] == 0) {
+            return;
+        }
+        ref_counts[id]--;
+        if (ref_counts[id] > 0) {
+            return;
+        }
         for (uint32_t cur : free_ids) {
             if (cur == id) {
                 return;
@@ -174,6 +204,7 @@ public:
     void reset() {
         free_ids.clear();
         for (uint32_t i = 0; i < (uint32_t) blocks.size(); ++i) {
+            ref_counts[i] = 0;
             free_ids.push_back(i);
         }
     }
@@ -183,6 +214,7 @@ private:
 
     std::vector<llama_kv_block> blocks;
     std::vector<uint32_t>       free_ids; // stack of free block ids
+    std::vector<uint32_t>       ref_counts;
 };
 
 // -----------------------------------------------------------------------------
@@ -260,6 +292,19 @@ public:
         }
         for (const auto & kv : to_insert) {
             table[kv.first] = kv.second;
+        }
+    }
+
+    template<typename Fn>
+    void for_each_seq_page(llama_seq_id seq_id, Fn && fn) const {
+        const uint64_t prefix = (uint64_t)(uint32_t) seq_id << 32;
+        const uint64_t mask   = (uint64_t) 0xFFFFFFFF00000000ULL;
+
+        for (const auto & kv : table) {
+            if ((kv.first & mask) == prefix) {
+                const uint32_t page = (uint32_t)(kv.first & 0xFFFFFFFFULL);
+                fn(page, kv.second);
+            }
         }
     }
 

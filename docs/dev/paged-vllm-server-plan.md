@@ -119,7 +119,7 @@ Acceptance:
 
 Goal: move from full-context admission to vLLM-style block reservation based on request size.
 
-Status: initial implementation complete.
+Status: implementation and manual validation complete.
 
 Behavior:
 
@@ -134,19 +134,22 @@ Validated:
 - LFM2-2.6B Q4_0 on Apple M2.
 - `--scheduler paged --paged-admission actual-len -c 32768 -np 4 --max-num-seqs 32 --max-num-batched-tokens 128 --max-model-len 8192`.
 - 8 concurrent short requests returned HTTP 200 with no KV errors.
+- Llama-3.2-3B-Instruct Q5_K_M on Apple Silicon.
+- `full-ctx` admission handled 4/5 concurrent requests with no KV errors.
+- `actual-len` admission handled 16 and 32 concurrent short requests with no KV errors.
+- Mixed short/medium requests completed with no KV errors.
+- Controlled over-reservation deferred instead of overcommitting the KV pool.
 
-Next validation:
+Debug / metrics:
 
-- 16 and 32 concurrent short requests with `max_tokens=32/64`.
-- Mixed short/medium requests with `max_tokens=32/200`.
-- Controlled overcommit: many requests whose total reserved blocks exceed `total_blocks`; expected behavior is queue/defer, not KV error.
-- Compare `full-ctx` vs `actual-len` active slot count under same workload.
+- Admission debug logs include reserved blocks, requested blocks, total blocks, live free blocks, active slots, and requested slots.
+- KV block scheduler report includes reserved blocks held by active requests.
 
 ## Milestone 4: Paged Mask and Logical Attention
 
 Goal: make attention metadata explicitly logical-sequence based instead of relying on physical slab iteration.
 
-Status: debug invariant added; full logical iterator still pending.
+Status: portable logical block-table iterator implemented and manually validated.
 
 Design:
 
@@ -158,7 +161,7 @@ Design:
 Implementation points:
 
 - Audit `set_input_kq_mask()`.
-- Introduce helper to iterate logical pages for a seq.
+- Introduce helper to iterate logical pages for a seq. Done via `llama_kv_block_table::for_each_seq_page()`.
 - Preserve fallback path for non-paged mode.
 - Add debug assertions when paged mode sees a physical cell with wrong `seq_id`.
 - Keep current physical-cell K/V indexing; logical page table selects storage, not sequence order.
@@ -170,7 +173,40 @@ Acceptance:
 - No attention to unrelated request cells.
 - `LLAMA_KV_CACHE_DEBUG=1` has no block-table mismatch under paged workloads.
 
-## Milestone 5: CUDA H200 Fast Path
+Validated:
+
+- 32 concurrent short requests.
+- Long prefill plus concurrent short requests.
+- 32 long decode requests with `max_tokens=1024`.
+- No block-table mismatch or KV error observed under debug mode.
+
+## Milestone 5: Prefix Cache and Shared Blocks
+
+Goal: add block-aligned cross-slot prefix reuse as a stepping stone toward vLLM-style prefix caching.
+
+Status: initial implementation and manual HTTP validation complete.
+
+Implemented:
+
+- `--kv-prefix-cache` registers complete block-aligned prompt pages when a slot becomes idle.
+- Prefix lookup uses cumulative page hashes and verifies exact stored tokens before reuse.
+- Cross-slot reuse copies matching donor KV pages into the selected slot with `llama_memory_seq_cp()`.
+- Paged block allocator refcounts protect shared blocks from premature free after `seq_cp()`.
+
+Validated:
+
+- Warm donor request returned HTTP 200.
+- 6 same-prefix divergent-tail requests returned HTTP 200.
+- 16 repeated-prefix batch requests returned HTTP 200.
+- 8 no-prefix control requests returned HTTP 200.
+
+Remaining:
+
+- Add explicit runtime metric for prefix-cache hits/misses.
+- Validate `cross-slot reuse` from retained server logs in automated/manual scripts.
+- Implement write-side copy-on-write for shared blocks before treating shared pages as fully vLLM-equivalent.
+
+## Milestone 6: CUDA H200 Fast Path
 
 Goal: use paged block table on device side for throughput.
 
@@ -192,34 +228,26 @@ Acceptance:
 
 ## Known Limitations
 
-- Prefix cache vLLM-style is not implemented.
-- Copy-on-write for shared blocks is not implemented.
+- Prefix cache vLLM-style is initial only: cross-slot block-aligned reuse exists, with exact-token verification after hash lookup.
+- Copy-on-write write path for shared blocks is not implemented; block refcounts now prevent shared blocks from being returned to the free list too early.
 - `actual-len` admission uses reservation accounting, not exact live block pressure.
 - No explicit preemption/eviction policy for overcommitted running requests.
 - Metal path is correctness-first, not optimized.
 - Current server still uses slots internally.
-- Paged mask still scans physical cells; debug asserts validate block-table coherence, but logical-page iteration is pending.
+- Paged mask uses block-table logical-page iteration in the portable path; optimized device kernels are still pending.
 
 ## Next Work Queue
 
-1. Add admission debug/metrics:
-   - reserved blocks
-   - live free blocks
-   - requested blocks
-   - active paged slots
-2. Add actual-len stress tests:
-   - 16/32 short parallel requests
-   - mixed short/medium requests
-   - controlled over-reservation queue/defer test
-3. Implement paged logical KQ-mask iterator:
-   - iterate `(seq_id, page)` block table entries for each active seq
-   - preserve physical-cell index as K/V storage selector
-   - compare against current physical scan under `LLAMA_KV_CACHE_DEBUG=1`
-4. Add prefix cache/COW design:
-   - shared block refs
-   - copy-on-write on divergent decode
-   - prompt cache compatibility
-5. Only after correctness: CUDA/H200 paged attention fast path.
+1. Implement copy-on-write for shared blocks:
+   - detect write into a block with ref_count > 1
+   - allocate a replacement block
+   - copy old KV page into replacement block
+   - update only the writing sequence's block-table entry
+2. Add prefix-cache observability:
+   - expose hit/miss counters
+   - include donor slot and cached token count in periodic metrics
+   - preserve server logs in manual test scripts
+3. Only after correctness: CUDA/H200 paged attention fast path.
 
 ## Useful Commands
 

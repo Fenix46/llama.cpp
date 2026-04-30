@@ -2074,13 +2074,16 @@ private:
 
             const int32_t reserved = count_paged_reserved_blocks();
             const int32_t needed   = paged_task_tree_reserved_blocks(task);
+            const int32_t free_blk = llama_kv_cache_n_free_blocks(llama_get_memory(ctx));
 
             if (reserved + needed <= paged_total_blocks_) {
+                SRV_DBG("[paged-scheduler] admission accepted: reserved_blocks=%d, requested_blocks=%d, total_blocks=%d, free_blocks=%d, active_slots=%d, requested_slots=%zu\n",
+                        reserved, needed, paged_total_blocks_, free_blk, running, n_slots_needed);
                 return true;
             }
 
-            SRV_DBG("[paged-scheduler] admission deferred: reserved_blocks=%d, requested_blocks=%d, total_blocks=%d, running=%d, requested_slots=%zu\n",
-                    reserved, needed, paged_total_blocks_, running, n_slots_needed);
+            SRV_DBG("[paged-scheduler] admission deferred: reserved_blocks=%d, requested_blocks=%d, total_blocks=%d, free_blocks=%d, active_slots=%d, requested_slots=%zu\n",
+                    reserved, needed, paged_total_blocks_, free_blk, running, n_slots_needed);
             return false;
         }
 
@@ -3142,6 +3145,8 @@ private:
                 kv_sched->on_decoded(
                     ctx,
                     n_active,
+                    (int32_t) slots.size(),
+                    count_paged_reserved_blocks(),
                     metrics.n_prompt_tokens_processed,
                     (double) metrics.t_prompt_processing,
                     metrics.n_tokens_predicted,

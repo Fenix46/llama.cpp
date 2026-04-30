@@ -404,15 +404,67 @@ void llama_kv_cache::paged_seq_rm(llama_seq_id seq_id) {
     }
 }
 
-void llama_kv_cache::paged_seq_cp(llama_seq_id src, llama_seq_id dst) {
-    // Erase dst's existing pages first, then mirror src → dst.
-    // Same-stream copy: src and dst share physical blocks (copy-on-write
-    // semantics are for Phase 2; here we just duplicate the mapping).
-    block_table.erase_seq(dst);
-    block_table.copy_seq(src, dst);
+void llama_kv_cache::paged_seq_cp(llama_seq_id src, llama_seq_id dst, llama_pos p0, llama_pos p1) {
+    // Erase dst's existing copied pages first, then mirror src → dst.
+    // Same-stream copy: src and dst share physical blocks. Refcounts keep
+    // shared blocks out of the free list until copy-on-write is implemented.
+    if (p0 < 0) {
+        p0 = 0;
+    }
+    if (p1 < 0) {
+        p1 = std::numeric_limits<llama_pos>::max();
+    }
+
+    if (dst >= 0 && (size_t) dst < seq_to_stream.size()) {
+        const uint32_t dst_strm = (n_stream == 1) ? 0 : seq_to_stream[dst];
+        if (dst_strm < v_block_alloc.size()) {
+            auto & alloc = v_block_alloc[dst_strm];
+            const uint32_t bs = alloc.block_size();
+            const uint32_t page0 = llama_kv_block_table::logical_page(p0, bs);
+            const uint32_t page1 = p1 == std::numeric_limits<llama_pos>::max()
+                ? std::numeric_limits<uint32_t>::max()
+                : llama_kv_block_table::logical_page(std::max<llama_pos>(p0, p1 - 1), bs) + 1;
+
+            std::vector<uint32_t> dst_pages;
+            block_table.for_each_seq_page(dst, [&](uint32_t page, uint32_t) {
+                if (page >= page0 && page < page1) {
+                    dst_pages.push_back(page);
+                }
+            });
+
+            for (uint32_t page : dst_pages) {
+                const uint32_t blk_id = block_table.lookup(dst, page);
+                alloc.free(blk_id);
+                block_table.erase_page(dst, page);
+            }
+        }
+    }
+
+    if (src >= 0 && (size_t) src < seq_to_stream.size()) {
+        const uint32_t src_strm = (n_stream == 1) ? 0 : seq_to_stream[src];
+        if (src_strm < v_block_alloc.size()) {
+            auto & alloc = v_block_alloc[src_strm];
+            const uint32_t bs = alloc.block_size();
+            const uint32_t page0 = llama_kv_block_table::logical_page(p0, bs);
+            const uint32_t page1 = p1 == std::numeric_limits<llama_pos>::max()
+                ? std::numeric_limits<uint32_t>::max()
+                : llama_kv_block_table::logical_page(std::max<llama_pos>(p0, p1 - 1), bs) + 1;
+
+            block_table.for_each_seq_page(src, [&](uint32_t page, uint32_t blk_id) {
+                if (page < page0 || page >= page1) {
+                    return;
+                }
+                if (blk_id != LLAMA_KV_BLOCK_ID_NONE && blk_id < alloc.n_blocks()) {
+                    alloc.retain(blk_id);
+                    block_table.insert(dst, page, blk_id);
+                }
+            });
+        }
+    }
 
     if (debug > 1) {
-        LLAMA_LOG_DEBUG("%s: [paged] seq %d block table copied to seq %d\n", __func__, src, dst);
+        LLAMA_LOG_DEBUG("%s: [paged] seq %d block table copied to seq %d, range [%d, %d)\n",
+                __func__, src, dst, p0, p1);
     }
 }
 
@@ -654,6 +706,7 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
             }
         }
 
+        paged_seq_cp(seq_id_src, seq_id_dst, p0, p1);
         return;
     }
 
@@ -706,7 +759,7 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
     //}
 
     // [paged] mirror block table from src → dst
-    paged_seq_cp(seq_id_src, seq_id_dst);
+    paged_seq_cp(seq_id_src, seq_id_dst, p0, p1);
 }
 
 void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
@@ -1838,6 +1891,93 @@ static void assert_paged_kq_mask_cell(
 }
 
 template<bool causal, bool swa, bool is_2d, bool alibi>
+static bool set_input_kq_mask_paged_impl(const args_set_input_kq_mask & args, float * data) {
+    const auto & ubatch = args.ubatch;
+
+    if (!args.paged) {
+        return false;
+    }
+
+    const int64_t n_kv     = args.n_kv;
+    const int64_t n_stream = args.n_stream;
+    const int64_t n_tps    = args.n_tps;
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        for (uint32_t ii = 0; ii < n_tps; ++ii) {
+            const uint32_t i = s*n_tps + ii;
+
+            const llama_seq_id seq_id = ubatch->seq_id[i][0];
+            const uint32_t strm = args.seq_to_stream[seq_id];
+            if (strm >= args.v_block_alloc.size()) {
+                return false;
+            }
+
+            const auto & alloc = args.v_block_alloc[strm];
+            if (alloc.n_blocks() == 0) {
+                return false;
+            }
+
+            const auto & cells = args.v_cells.at(strm);
+
+            const llama_pos p1 = ubatch->pos[i];
+            const llama_pos p1_x = is_2d ? ubatch->pos[i + ubatch->n_tokens*2] : 0;
+            const llama_pos p1_y = is_2d ? ubatch->pos[i + ubatch->n_tokens]   : 0;
+
+            const uint64_t idst = n_kv*i;
+            std::fill(data + idst, data + idst + n_kv, -INFINITY);
+
+            bool found_page = false;
+            args.block_table.for_each_seq_page(seq_id, [&](uint32_t, uint32_t blk_id) {
+                if (blk_id == LLAMA_KV_BLOCK_ID_NONE || blk_id >= alloc.n_blocks()) {
+                    return;
+                }
+
+                const auto & blk = alloc.get(blk_id);
+                for (uint32_t k = 0; k < blk.size; ++k) {
+                    const uint32_t j = blk.first_cell + k;
+                    if (j >= (uint32_t) n_kv || j >= cells.size()) {
+                        continue;
+                    }
+
+                    if (cells.is_empty(j) || !cells.seq_has(j, seq_id)) {
+                        continue;
+                    }
+
+                    const llama_pos p0 = cells.pos_get(j);
+                    assert_paged_kq_mask_cell(args, seq_id, p0, j);
+
+                    bool masked = false;
+                    if (causal) {
+                        masked = masked || p0 > p1;
+
+                        if (is_2d && p0 == p1) {
+                            const auto & p0_ext = cells.ext_get(j);
+                            masked = masked || p0_ext.is_2d_gt(p1_x, p1_y);
+                        }
+                    }
+
+                    if (swa) {
+                        masked = masked || llama_hparams::is_masked_swa(args.n_swa, args.swa_type, p0, p1);
+                    }
+
+                    if (!masked) {
+                        data[idst + j] = alibi ? -std::abs(p0 - p1) : 0.0f;
+                    }
+                }
+
+                found_page = true;
+            });
+
+            if (!found_page) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+template<bool causal, bool swa, bool is_2d, bool alibi>
 static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * data) {
   //const auto & hparams = args.hparams;
     const auto & ubatch  = args.ubatch;
@@ -1860,6 +2000,10 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * 
         const llama_seq_id seq_id = ubatch->seq_id[i][0];
 
         seq_pos_min[seq_id] = std::min(seq_pos_min[seq_id], ubatch->pos[i]);
+    }
+
+    if (set_input_kq_mask_paged_impl<causal, swa, is_2d, alibi>(args, data)) {
+        return;
     }
 
     for (uint32_t s = 0; s < n_stream; ++s) {

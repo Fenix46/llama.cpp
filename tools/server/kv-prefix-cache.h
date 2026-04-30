@@ -8,6 +8,8 @@
 // Cross-slot prefix caching: when a new request shares a block-aligned prefix
 // with an idle slot's cached KV, the KV blocks are copied into the new slot's
 // sequence via llama_memory_seq_cp(), skipping re-prefill for those tokens.
+// Shared blocks are protected by paged KV block refcounts; divergent write-side
+// copy-on-write is implemented separately.
 //
 // Granularity: LLAMA_KV_BLOCK_SIZE_DEFAULT (16 tokens/page).
 // Only complete block pages are eligible for reuse.
@@ -20,7 +22,7 @@
 //                                {-1, 0} on miss
 //
 // Hashing: FNV-1a over the raw token bytes of each page.
-// Collision policy: last-writer-wins per (page_hash chain), LRU eviction.
+// Collision policy: hash hit is verified against stored tokens before reuse.
 //
 // Thread safety: none. Called only from the main server loop.
 // =============================================================================
@@ -31,6 +33,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <algorithm>
 #include <unordered_map>
 #include <vector>
 
@@ -69,6 +72,7 @@ public:
         }
 
         slot_hashes_[slot_id] = build_hashes(tokens, n_full_pages);
+        slot_tokens_[slot_id] = tokens;
 
         LOG_DBG("[kv-prefix-cache] registered slot %d: %u full pages (%u tokens)\n",
                 slot_id, n_full_pages, n_full_pages * bs_);
@@ -88,6 +92,7 @@ public:
             }
         }
         slot_hashes_.erase(it);
+        slot_tokens_.erase(slot_id);
 
         LOG_DBG("[kv-prefix-cache] invalidated slot %d\n", slot_id);
     }
@@ -111,6 +116,14 @@ public:
             auto it = page_map_.find(h);
             if (it == page_map_.end()) {
                 break; // prefix chain broken — stop
+            }
+
+            const auto st = slot_tokens_.find(it->second.slot_id);
+            if (st == slot_tokens_.end() ||
+                st->second.size() < (size_t) it->second.n_tokens ||
+                tokens.size() < (size_t) it->second.n_tokens ||
+                !std::equal(tokens.begin(), tokens.begin() + it->second.n_tokens, st->second.begin())) {
+                break; // hash collision or stale entry
             }
 
             best.donor_slot_id   = it->second.slot_id;
@@ -164,4 +177,7 @@ private:
 
     // slot_id → list of cumulative hashes (for invalidation)
     std::unordered_map<int, std::vector<uint64_t>> slot_hashes_;
+
+    // slot_id → exact token sequence (collision verification)
+    std::unordered_map<int, std::vector<llama_token>> slot_tokens_;
 };

@@ -299,7 +299,7 @@ private:
     // Sync helpers — keep block_table consistent with cell mutations.
     // Called only from seq_rm / seq_cp / seq_keep / apply_ubatch / clear.
     void paged_seq_rm  (llama_seq_id seq_id);
-    void paged_seq_cp  (llama_seq_id src, llama_seq_id dst);
+    void paged_seq_cp  (llama_seq_id src, llama_seq_id dst, llama_pos p0, llama_pos p1);
     void paged_seq_keep(llama_seq_id seq_id);
     void paged_clear   ();
     // Record that cell `cell_idx` in stream `strm` now belongs to seq_id/pos.

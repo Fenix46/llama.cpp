@@ -48,6 +48,7 @@ struct kv_block_scheduler_snapshot {
 
     int32_t  n_active_slots  = 0;
     int32_t  n_total_slots   = 0;
+    int32_t  n_reserved_blocks = 0;
 
     double   tokens_per_sec  = 0.0;
     double   avg_prefill_ms  = 0.0;
@@ -81,12 +82,16 @@ public:
     void on_decoded(
             llama_context * ctx,
             int32_t  n_active_slots,
+            int32_t  n_total_slots,
+            int32_t  n_reserved_blocks,
             uint64_t n_prompt_tokens,
             double   t_prompt_ms,
             uint64_t n_decode_tokens,
             double   t_decode_ms)
     {
-        bucket_.n_active_slots   = n_active_slots;
+        bucket_.n_active_slots    = n_active_slots;
+        bucket_.n_total_slots     = n_total_slots;
+        bucket_.n_reserved_blocks = n_reserved_blocks;
         bucket_.n_prompt_tokens += n_prompt_tokens;
         bucket_.t_prompt_ms     += t_prompt_ms;
         bucket_.n_decode_tokens += n_decode_tokens;
@@ -116,6 +121,8 @@ public:
 private:
     struct bucket_t {
         int32_t  n_active_slots  = 0;
+        int32_t  n_total_slots   = 0;
+        int32_t  n_reserved_blocks = 0;
         uint64_t n_prompt_tokens = 0;
         double   t_prompt_ms     = 0.0;
         uint64_t n_decode_tokens = 0;
@@ -137,8 +144,9 @@ private:
     kv_block_scheduler_snapshot take_snapshot(llama_context * ctx, int64_t elapsed_us) {
         kv_block_scheduler_snapshot s;
         s.t_snapshot_us  = ggml_time_us();
-        s.n_total_slots  = n_total_slots_;
-        s.n_active_slots = bucket_.n_active_slots;
+        s.n_total_slots     = bucket_.n_total_slots > 0 ? bucket_.n_total_slots : n_total_slots_;
+        s.n_active_slots    = bucket_.n_active_slots;
+        s.n_reserved_blocks = bucket_.n_reserved_blocks;
 
         auto read_kv = [&](const llama_kv_cache * kvc) {
             const auto & alloc = kvc->get_block_alloc(0);
@@ -200,6 +208,7 @@ private:
             "┌─ KV Block Scheduler ─────────────────────────────────────\n"
             "│  blocks : %s  %u / %u  (%u free, size=%u cells)\n"
             "│  pages  : %zu entries in block table\n"
+            "│  reserv : %d blocks held by active requests\n"
             "│  frag   : %.1f%%  (free / total blocks)\n"
             "│  slots  : %d active / %d total\n"
             "│  toks/s : %.1f  (prompt+decode)\n"
@@ -207,6 +216,7 @@ private:
             "└───────────────────────────────────────────────────────────\n",
             bar, s.n_blocks_used, s.n_blocks_total, s.n_blocks_free, s.block_size,
             s.n_pages_mapped,
+            s.n_reserved_blocks,
             s.fragmentation * 100.0f,
             s.n_active_slots, s.n_total_slots,
             s.tokens_per_sec,
