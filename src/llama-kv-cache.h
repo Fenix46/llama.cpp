@@ -194,7 +194,7 @@ public:
     // find a slot of kv cells that can hold the ubatch
     // if cont == true, then the slot must be continuous
     // return empty slot_info on failure
-    slot_info find_slot(const llama_ubatch & ubatch, bool cont) const;
+    slot_info find_slot(const llama_ubatch & ubatch, bool cont);
 
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
     void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
@@ -305,6 +305,8 @@ private:
     // Record that cell `cell_idx` in stream `strm` now belongs to seq_id/pos.
     void paged_record_cell(uint32_t strm, uint32_t cell_idx,
                            llama_seq_id seq_id, llama_pos pos);
+    bool paged_cow_block(uint32_t strm, llama_seq_id seq_id, uint32_t page, uint32_t old_blk_id, uint32_t new_blk_id);
+    void paged_copy_block_data(uint32_t strm, uint32_t old_blk_id, uint32_t new_blk_id);
 
     std::vector<kv_layer> layers;
 

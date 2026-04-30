@@ -192,6 +192,7 @@ Implemented:
 - Prefix lookup uses cumulative page hashes and verifies exact stored tokens before reuse.
 - Cross-slot reuse copies matching donor KV pages into the selected slot with `llama_memory_seq_cp()`.
 - Paged block allocator refcounts protect shared blocks from premature free after `seq_cp()`.
+- Write-side copy-on-write splits shared blocks before a sequence writes into a reused page.
 - Prefix-cache stats expose lookups, hits, misses, registrations, invalidations, reuse events, and reused tokens.
 - Prometheus metrics expose prefix-cache lookups, hits, reused tokens, and entry count.
 
@@ -205,7 +206,7 @@ Validated:
 Remaining:
 
 - Validate `cross-slot reuse` from retained server logs in automated/manual scripts.
-- Implement write-side copy-on-write for shared blocks before treating shared pages as fully vLLM-equivalent.
+- Optimize copy-on-write with backend/device block-copy kernels; current path is portable and correctness-first.
 
 ## Milestone 6: CUDA H200 Fast Path
 
@@ -266,6 +267,12 @@ Implemented:
   - registration/invalidation counters
   - reuse event and reused-token counters
   - Prometheus metrics for lookups, hits, reused tokens, and entry count
+- Shared-block copy-on-write added:
+  - detects `ref_count > 1` on paged write
+  - allocates replacement block
+  - copies old K/V page to replacement
+  - updates only the writing sequence's block-table entry
+  - releases the old shared block ref
 
 Design:
 
@@ -301,7 +308,7 @@ Acceptance:
 ## Known Limitations
 
 - Prefix cache vLLM-style is initial only: cross-slot block-aligned reuse exists, with exact-token verification after hash lookup.
-- Copy-on-write write path for shared blocks is not implemented; block refcounts now prevent shared blocks from being returned to the free list too early.
+- Copy-on-write write path for shared blocks is implemented as a portable backend tensor get/set copy; optimized device-side page copy is pending.
 - `actual-len` admission uses reservation accounting, not exact live block pressure.
 - No explicit preemption/eviction policy for overcommitted running requests.
 - Metal path is correctness-first, not optimized.
@@ -312,20 +319,17 @@ Acceptance:
 
 ## Next Work Queue
 
-1. Implement copy-on-write for shared blocks:
-   - detect write into a block with ref_count > 1
-   - allocate a replacement block
-   - copy old KV page into replacement block
-   - update only the writing sequence's block-table entry
-2. Add slotless paged request state:
+1. Add slotless paged request state:
    - introduce request-owned lifecycle state separate from `server_slot`
    - lease `seq_id` per active request
    - batch active decode tokens first, then prefill chunks
    - keep non-paged scheduler unchanged
-3. Add pre-context VRAM auto-fit:
+2. Add pre-context VRAM auto-fit:
    - estimate residual device memory after model weights
    - compute KV bytes/token for selected KV types
    - choose `ctx_size` and full-context concurrency before `llama_init_from_model()`
+3. Optimize copy-on-write:
+   - replace portable tensor get/set copy with backend/device block-copy path
 4. Only after correctness: CUDA/H200 paged attention fast path.
 
 ## Useful Commands

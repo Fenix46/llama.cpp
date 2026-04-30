@@ -532,6 +532,100 @@ void llama_kv_cache::paged_record_cell(uint32_t strm, uint32_t cell_idx,
     }
 }
 
+void llama_kv_cache::paged_copy_block_data(uint32_t strm, uint32_t old_blk_id, uint32_t new_blk_id) {
+    auto & alloc = v_block_alloc[strm];
+
+    const auto & old_blk = alloc.get(old_blk_id);
+    const auto & new_blk = alloc.get(new_blk_id);
+    const uint32_t n_cells = std::min(old_blk.size, new_blk.size);
+
+    for (const auto & layer : layers) {
+        const uint32_t il = layer.il;
+
+        if (auto * k = layer.k_stream[strm]) {
+            const size_t k_size_row = ggml_row_size(k->type, hparams.n_embd_k_gqa(il));
+            std::vector<uint8_t> buf(n_cells * k_size_row);
+            ggml_backend_tensor_get(k, buf.data(), old_blk.first_cell * k_size_row, buf.size());
+            ggml_backend_tensor_set(k, buf.data(), new_blk.first_cell * k_size_row, buf.size());
+        }
+
+        auto * v = layer.v_stream[strm];
+        if (!v) {
+            continue;
+        }
+
+        const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
+        if (!v_trans) {
+            const size_t v_size_row = ggml_row_size(v->type, n_embd_v_gqa);
+            std::vector<uint8_t> buf(n_cells * v_size_row);
+            ggml_backend_tensor_get(v, buf.data(), old_blk.first_cell * v_size_row, buf.size());
+            ggml_backend_tensor_set(v, buf.data(), new_blk.first_cell * v_size_row, buf.size());
+        } else {
+            const size_t v_size_el = ggml_type_size(v->type);
+            std::vector<uint8_t> buf(n_cells * v_size_el);
+            const uint32_t kv_size = v_cells[strm].size();
+            for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
+                const size_t src_offset = (old_blk.first_cell + j * kv_size) * v_size_el;
+                const size_t dst_offset = (new_blk.first_cell + j * kv_size) * v_size_el;
+                ggml_backend_tensor_get(v, buf.data(), src_offset, buf.size());
+                ggml_backend_tensor_set(v, buf.data(), dst_offset, buf.size());
+            }
+        }
+    }
+}
+
+bool llama_kv_cache::paged_cow_block(uint32_t strm, llama_seq_id seq_id, uint32_t page, uint32_t old_blk_id, uint32_t new_blk_id) {
+    if (strm >= v_block_alloc.size()) {
+        return false;
+    }
+
+    auto & alloc = v_block_alloc[strm];
+    if (old_blk_id >= alloc.n_blocks() || new_blk_id >= alloc.n_blocks()) {
+        return false;
+    }
+
+    const auto & old_blk = alloc.get(old_blk_id);
+    const auto & new_blk = alloc.get(new_blk_id);
+    const uint32_t n_cells = std::min(old_blk.size, new_blk.size);
+    auto & cells = v_cells[strm];
+
+    paged_copy_block_data(strm, old_blk_id, new_blk_id);
+
+    for (uint32_t i = 0; i < n_cells; ++i) {
+        const uint32_t old_cell = old_blk.cell(i);
+        const uint32_t new_cell = new_blk.cell(i);
+
+        if (new_cell >= cells.size() || old_cell >= cells.size()) {
+            return false;
+        }
+
+        if (!cells.is_empty(new_cell)) {
+            cells.rm(new_cell);
+        }
+
+        if (!cells.is_empty(old_cell) && cells.seq_has(old_cell, seq_id)) {
+            const llama_pos pos = cells.pos_get(old_cell);
+            const llama_kv_cell_ext ext = cells.ext_get(old_cell);
+
+            cells.pos_set(new_cell, pos);
+            cells.ext_set(new_cell, ext);
+            cells.seq_add(new_cell, seq_id);
+
+            cells.seq_rm(old_cell, seq_id);
+        }
+    }
+
+    block_table.insert(seq_id, page, new_blk_id);
+    alloc.free(old_blk_id);
+
+    if (debug > 1) {
+        LLAMA_LOG_DEBUG("%s: [paged] COW seq %d page %u: block %u -> %u\n",
+                __func__, seq_id, page, old_blk_id, new_blk_id);
+    }
+
+    return true;
+}
+
 void llama_kv_cache::rebuild_block_table_for_seq(llama_seq_id seq_id) {
     if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
         return;
@@ -1096,7 +1190,7 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
     return updated;
 }
 
-llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch, bool cont) const {
+llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch, bool cont) {
 
     if (debug > 0) {
         for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
@@ -1215,10 +1309,11 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
         bool           use_paged = false;
 
         if (paged && strm < v_block_alloc.size() && v_block_alloc[strm].n_blocks() > 0) {
-            const auto & alloc = v_block_alloc[strm];
+            auto & alloc = v_block_alloc[strm];
             const uint32_t bs  = alloc.block_size();
 
             std::unordered_map<llama_kv_block_table::key_t, uint32_t> planned_pages;
+            std::unordered_map<llama_kv_block_table::key_t, uint32_t> cow_pages;
             uint32_t n_planned = 0;
 
             res.idxs[s].clear();
@@ -1247,6 +1342,22 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                         planned_pages[key] = blk_id;
                         ++n_planned;
                     }
+                } else if (alloc.is_shared(blk_id)) {
+                    auto it = cow_pages.find(key);
+                    if (it != cow_pages.end()) {
+                        blk_id = it->second;
+                    } else {
+                        const uint32_t new_blk_id = alloc.alloc();
+                        if (new_blk_id == LLAMA_KV_BLOCK_ID_NONE) {
+                            return { };
+                        }
+                        if (!paged_cow_block(strm, token_seq_id, page, blk_id, new_blk_id)) {
+                            alloc.free(new_blk_id);
+                            return { };
+                        }
+                        cow_pages[key] = new_blk_id;
+                        blk_id = new_blk_id;
+                    }
                 }
 
                 const uint32_t cell_idx = alloc.get(blk_id).first_cell + intra;
@@ -1265,8 +1376,8 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
             use_paged = true;
 
             if (debug > 1) {
-                LLAMA_LOG_DEBUG("%s: [paged] seq %d: planned %u tokens, new_pages=%zu\n",
-                        __func__, seq_id, n_tokens, planned_pages.size());
+                LLAMA_LOG_DEBUG("%s: [paged] seq %d: planned %u tokens, new_pages=%zu, cow_pages=%zu\n",
+                        __func__, seq_id, n_tokens, planned_pages.size(), cow_pages.size());
             }
         } else if (strm < v_block_alloc.size() && v_block_alloc[strm].n_blocks() > 0) {
             const auto & alloc = v_block_alloc[strm];
