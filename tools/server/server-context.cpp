@@ -79,8 +79,27 @@ enum server_state {
     SERVER_STATE_READY,          // Server is ready and model is loaded
 };
 
+struct paged_request_state {
+    int32_t request_id      = -1;
+    int32_t seq_id          = -1;
+    int32_t reserved_blocks = 0;
+
+    void clear() {
+        request_id      = -1;
+        seq_id          = -1;
+        reserved_blocks = 0;
+    }
+};
+
 struct server_slot {
     int id;
+
+    // Bridge toward slotless paged scheduling: current implementation still
+    // stores the llama seq_id in server_slot::id, but all new KV/sampler code
+    // should use seq_id() so the request state can move out of server_slot.
+    int seq_id() const {
+        return id;
+    }
 
     llama_context * ctx = nullptr;
 
@@ -109,7 +128,7 @@ struct server_slot {
     int32_t n_decoded   = 0;
     int32_t n_remaining = -1;
     int32_t i_batch     = -1;
-    int32_t paged_reserved_blocks = 0;
+    paged_request_state paged;
 
     int32_t n_prompt_tokens_cache     = 0;
     int32_t n_prompt_tokens_processed = 0;
@@ -221,7 +240,7 @@ struct server_slot {
         // clear speculative decoding stats
         n_draft_total = 0;
         n_draft_accepted = 0;
-        paged_reserved_blocks = 0;
+        paged.clear();
 
         task_prev = std::move(task);
         task.reset();
@@ -846,7 +865,7 @@ private:
         SLT_INF(slot, "%s", "saving idle slot to prompt cache\n");
         SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
         slot.prompt_save(*prompt_cache);
-        prefix_cache_invalidate(slot.id);
+        prefix_cache_invalidate(slot.seq_id());
         slot.prompt_clear(false);
         prompt_cache->update();
     }
@@ -1269,7 +1288,7 @@ private:
         id_slot = id_slot % slots.size();
 
         for (server_slot & slot : slots) {
-            if (slot.id == id_slot) {
+            if (slot.seq_id() == id_slot) {
                 return &slot;
             }
         }
@@ -1438,7 +1457,7 @@ private:
             auto res = prefix_cache_->lookup(task_toks);
 
             if (res.donor_slot_id >= 0 &&
-                res.donor_slot_id != ret->id &&
+                res.donor_slot_id != ret->seq_id() &&
                 res.n_cached_tokens > cur_pages) {
 
                 // verify donor is still idle
@@ -1446,18 +1465,18 @@ private:
                 if (donor && !donor->is_processing() &&
                     (int32_t)donor->prompt.tokens.get_tokens().size() >= res.n_cached_tokens) {
 
-                    SRV_INF("[kv-prefix-cache] cross-slot reuse: donor=%d -> slot=%d, n_cached=%d (cur_common=%d)\n",
-                            res.donor_slot_id, ret->id, res.n_cached_tokens, cur_pages);
+                    SRV_INF("[kv-prefix-cache] cross-slot reuse: donor=%d -> seq=%d, n_cached=%d (cur_common=%d)\n",
+                            res.donor_slot_id, ret->seq_id(), res.n_cached_tokens, cur_pages);
 
                     // clear ret's current KV (it had less prefix overlap)
-                    prefix_cache_invalidate(ret->id);
+                    prefix_cache_invalidate(ret->seq_id());
                     ret->prompt_clear(false);
 
                     // copy donor's KV for positions [0, n_cached) into ret's seq_id
                     llama_memory_seq_cp(
                         llama_get_memory(ctx),
-                        donor->id,  // src seq_id
-                        ret->id,    // dst seq_id
+                        donor->seq_id(), // src seq_id
+                        ret->seq_id(),   // dst seq_id
                         0,
                         (llama_pos) res.n_cached_tokens);
 
@@ -1493,9 +1512,9 @@ private:
             }
 
             if (slot.prompt.n_tokens() > 0) {
-                SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
+                SRV_WRN("purging slot %d with %zu tokens\n", slot.seq_id(), slot.prompt.tokens.size());
 
-                prefix_cache_invalidate(slot.id);
+                prefix_cache_invalidate(slot.seq_id());
                 slot.prompt_clear(false);
 
                 res = true;
@@ -1618,9 +1637,9 @@ private:
 
             // TODO: tmp until backend sampling is fully implemented
             if (backend_sampling) {
-                llama_set_sampler(ctx, slot.id, common_sampler_get(slot.smpl.get()));
+                llama_set_sampler(ctx, slot.seq_id(), common_sampler_get(slot.smpl.get()));
             } else {
-                llama_set_sampler(ctx, slot.id, nullptr);
+                llama_set_sampler(ctx, slot.seq_id(), nullptr);
             }
 
             SLT_INF(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
@@ -1629,7 +1648,11 @@ private:
         }
 
         slot.task = std::make_unique<const server_task>(std::move(task));
-        slot.paged_reserved_blocks = paged_task_reserved_blocks(*slot.task);
+        if (params_base.scheduler == "paged") {
+            slot.paged.request_id      = slot.task->id;
+            slot.paged.seq_id          = slot.seq_id();
+            slot.paged.reserved_blocks = paged_task_reserved_blocks(*slot.task);
+        }
 
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
@@ -1903,7 +1926,7 @@ private:
         auto res = std::make_unique<server_task_result_cmpl_final>();
 
         res->id      = slot.task->id;
-        res->id_slot = slot.id;
+        res->id_slot = slot.seq_id();
 
         res->index = slot.task->index;
 
@@ -1974,7 +1997,7 @@ private:
         std::vector<float> embd_res(n_embd_out, 0.0f);
 
         for (int i = 0; i < batch.n_tokens; ++i) {
-            if (!batch.logits[i] || batch.seq_id[i][0] != slot.id) {
+            if (!batch.logits[i] || batch.seq_id[i][0] != slot.seq_id()) {
                 continue;
             }
 
@@ -2014,7 +2037,7 @@ private:
         res->n_tokens = slot.task->n_tokens();
 
         for (int i = 0; i < batch.n_tokens; ++i) {
-            if (!batch.logits[i] || batch.seq_id[i][0] != slot.id) {
+            if (!batch.logits[i] || batch.seq_id[i][0] != slot.seq_id()) {
                 continue;
             }
 
@@ -2063,7 +2086,7 @@ private:
     std::vector<server_slot *> get_free_slots(size_t n_slots_needed, int exclude_id_slot) {
         std::vector<server_slot *> free_slots;
         for (auto & slot : slots) {
-            if (!slot.is_processing() && slot.id != exclude_id_slot) {
+            if (!slot.is_processing() && slot.seq_id() != exclude_id_slot) {
                 free_slots.push_back(&slot);
             }
             if (free_slots.size() >= n_slots_needed) {
@@ -2128,7 +2151,7 @@ private:
         int32_t n_blocks = 0;
         for (const auto & slot : slots) {
             if (slot.is_processing()) {
-                n_blocks += slot.paged_reserved_blocks;
+                n_blocks += slot.paged.reserved_blocks;
             }
         }
         return n_blocks;
@@ -2228,7 +2251,7 @@ private:
             slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
         }
 
-        const auto & cur = slot.prompt.checkpoints.emplace_back(server_get_checkpoint(ctx, slot.id, slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max));
+        const auto & cur = slot.prompt.checkpoints.emplace_back(server_get_checkpoint(ctx, slot.seq_id(), slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max));
 
         SLT_WRN(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
@@ -2287,7 +2310,7 @@ private:
                     if (task.is_parent()) {
                         // try getting free slots for all child tasks
                         size_t n_child_tasks = task.child_tasks.size();
-                        std::vector<server_slot *> child_slots = get_free_slots(n_child_tasks, slot->id);
+                        std::vector<server_slot *> child_slots = get_free_slots(n_child_tasks, slot->seq_id());
                         if (child_slots.size() < n_child_tasks) {
                             SRV_DBG("not enough free slots for child tasks, n_free = %zu, n_children = %zu, defer task, id_task = %d\n", child_slots.size(), n_child_tasks, id_task);
                             queue_tasks.defer(std::move(task));
@@ -2398,7 +2421,7 @@ private:
                     std::string filepath = task.slot_action.filepath;
 
                     const llama_tokens & tokens = slot->prompt.tokens.get_tokens();
-                    const size_t nwrite = llama_state_seq_save_file(ctx, filepath.c_str(), slot->id, tokens.data(), token_count);
+                    const size_t nwrite = llama_state_seq_save_file(ctx, filepath.c_str(), slot->seq_id(), tokens.data(), token_count);
 
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
@@ -2437,7 +2460,7 @@ private:
                     llama_tokens tokens;
                     tokens.resize(slot->n_ctx);
                     size_t token_count = 0;
-                    size_t nread = llama_state_seq_load_file(ctx, filepath.c_str(), slot->id, tokens.data(), tokens.size(), &token_count);
+                    size_t nread = llama_state_seq_load_file(ctx, filepath.c_str(), slot->seq_id(), tokens.data(), tokens.size(), &token_count);
                     if (nread == 0) {
                         slot->prompt.tokens.clear(); // KV may already been invalidated?
                         send_error(task, "Unable to restore slot, no available space in KV cache or invalid slot save file", ERROR_TYPE_INVALID_REQUEST);
@@ -2481,7 +2504,7 @@ private:
                     // Erase token cache
                     const size_t n_erased = slot->prompt.tokens.size();
 
-                    prefix_cache_invalidate(slot->id);
+                    prefix_cache_invalidate(slot->seq_id());
                     slot->prompt_clear(false);
 
                     auto res = std::make_unique<server_task_result_slot_erase>();
@@ -2597,8 +2620,8 @@ private:
 
                 SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
 
-                llama_memory_seq_rm (llama_get_memory(ctx), slot.id, n_keep            , n_keep + n_discard);
-                llama_memory_seq_add(llama_get_memory(ctx), slot.id, n_keep + n_discard, slot.prompt.n_tokens(), -n_discard);
+                llama_memory_seq_rm (llama_get_memory(ctx), slot.seq_id(), n_keep            , n_keep + n_discard);
+                llama_memory_seq_add(llama_get_memory(ctx), slot.seq_id(), n_keep + n_discard, slot.prompt.n_tokens(), -n_discard);
 
                 // add generated tokens to cache
                 // ref: https://github.com/ggml-org/llama.cpp/pull/16818#discussion_r2473269481
@@ -2817,8 +2840,8 @@ private:
 
                                             const int64_t kv_shift = (int64_t) head_p - (int64_t) head_c;
 
-                                            llama_memory_seq_rm (llama_get_memory(ctx), slot.id, head_p, head_c);
-                                            llama_memory_seq_add(llama_get_memory(ctx), slot.id, head_c, head_c + n_match, kv_shift);
+                                            llama_memory_seq_rm (llama_get_memory(ctx), slot.seq_id(), head_p, head_c);
+                                            llama_memory_seq_add(llama_get_memory(ctx), slot.seq_id(), head_c, head_c + n_match, kv_shift);
 
                                             for (size_t i = 0; i < n_match; i++) {
                                                 slot.prompt.tokens.set_token(head_p + i, slot.prompt.tokens[head_c + i]);
@@ -2845,9 +2868,9 @@ private:
                             const auto pos_min_thold = std::max(0, pos_next - n_swa);
 
                             if (n_past > 0 && n_past < slot.prompt.n_tokens()) {
-                                const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), slot.id);
+                                const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), slot.seq_id());
                                 if (pos_min == -1) {
-                                    SLT_ERR(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d\n", n_past, (int) slot.prompt.tokens.size(), slot.id, pos_min);
+                                    SLT_ERR(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d\n", n_past, (int) slot.prompt.tokens.size(), slot.seq_id(), pos_min);
                                     GGML_ABORT("pos_min == -1, but n_past > 0 - should not happen: https://github.com/ggml-org/llama.cpp/pull/13833#discussion_r2116181237");
                                 }
 
@@ -2895,7 +2918,7 @@ private:
                                 }
 
                                 if (pos_min >= pos_min_thold) {
-                                    SLT_WRN(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d, n_swa = %d\n", n_past, (int) slot.prompt.tokens.size(), slot.id, pos_min, n_swa);
+                                    SLT_WRN(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d, n_swa = %d\n", n_past, (int) slot.prompt.tokens.size(), slot.seq_id(), pos_min, n_swa);
 
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
@@ -2914,7 +2937,7 @@ private:
                                     if (!do_reset) {
                                         // restore the context checkpoint
                                         const size_t checkpoint_size = it->data.size();
-                                        const size_t n = llama_state_seq_set_data_ext(ctx, it->data.data(), checkpoint_size, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        const size_t n = llama_state_seq_set_data_ext(ctx, it->data.data(), checkpoint_size, slot.seq_id(), LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
                                         if (n != checkpoint_size) {
                                             SLT_ERR(slot, "failed to restore context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, (float) checkpoint_size / 1024 / 1024);
@@ -2923,7 +2946,7 @@ private:
                                         } else {
                                             // rebuild paged block table — llama_state_seq_set_data_ext writes
                                             // directly to KV cells, bypassing paged_record_cell()
-                                            llama_kv_cache_rebuild_block_table(llama_get_memory(ctx), slot.id);
+                                            llama_kv_cache_rebuild_block_table(llama_get_memory(ctx), slot.seq_id());
                                             pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                             n_past = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
                                             SLT_WRN(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) checkpoint_size / 1024 / 1024);
@@ -2987,7 +3010,7 @@ private:
 
                     SLT_INF(slot, "n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
-                    if (!llama_memory_seq_rm(llama_get_memory(ctx), slot.id, p0, -1)) {
+                    if (!llama_memory_seq_rm(llama_get_memory(ctx), slot.seq_id(), p0, -1)) {
                         SLT_WRN(slot, "failed to truncate tokens with position >= %d - clearing the memory\n", p0);
 
                         slot.prompt_clear(true);
@@ -3029,7 +3052,7 @@ private:
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && input_tokens[slot.prompt.n_tokens()] == LLAMA_TOKEN_NULL) {
                         // process the image
                         size_t n_tokens_out = 0;
-                        int32_t res = input_tokens.process_chunk(ctx, mctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(), slot.id, n_tokens_out);
+                        int32_t res = input_tokens.process_chunk(ctx, mctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(), slot.seq_id(), n_tokens_out);
                         if (res != 0) {
                             SLT_ERR(slot, "failed to process image, res = %d\n", res);
                             send_error(slot, "failed to process image", ERROR_TYPE_SERVER);
@@ -3069,7 +3092,7 @@ private:
                         common_batch_add(batch,
                             cur_tok,
                             slot.prompt.tokens.pos_next(),
-                            { slot.id },
+                            { slot.seq_id() },
                             slot.task->need_embd());
                         prefill_added++;
                         slot.prompt.tokens.push_back(cur_tok);
@@ -3140,8 +3163,8 @@ private:
                         SLT_INF(slot, "prompt processing progress, n_tokens = %d, batch.n_tokens = %d, progress = %f\n", slot.prompt.n_tokens(), batch.n_tokens, (float) slot.prompt.n_tokens() / slot.task->n_tokens());
                     }
 
-                    const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), slot.id);
-                    const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx), slot.id);
+                    const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), slot.seq_id());
+                    const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx), slot.seq_id());
 
                     // no need for empty or small checkpoints
                     do_checkpoint = do_checkpoint && (pos_min >= 0 && slot.prompt.n_tokens() >= 64);
@@ -3268,7 +3291,7 @@ private:
 
                                 // note: it's complicated to keep track of how much of the current batch has been
                                 //       processed before the error occurred, so we simply clear the entire context
-                                prefix_cache_invalidate(slot.id);
+                                prefix_cache_invalidate(slot.seq_id());
                                 slot.prompt_clear(false);
                             }
                         }
@@ -3441,14 +3464,14 @@ private:
                             SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n",
                                     ckpt.pos_min, ckpt.pos_max, ckpt.size());
 
-                            const size_t n = llama_state_seq_set_data_ext(slot.ctx, ckpt.data.data(), ckpt.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            const size_t n = llama_state_seq_set_data_ext(slot.ctx, ckpt.data.data(), ckpt.size(), slot.seq_id(), LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                             if (n != ckpt.size()) {
                                 GGML_ABORT("%s: failed to restore context checkpoint (pos_min=%d, pos_max=%d, size=%zu, get_data_ext->%zu, set_data_ext->%zu",
                                         __func__, ckpt.pos_min, ckpt.pos_max, ckpt.size(), ckpt.size(), n);
                             }
 
-                            llama_kv_cache_rebuild_block_table(llama_get_memory(slot.ctx), slot.id);
-                            llama_memory_seq_rm(llama_get_memory(slot.ctx), slot.id, ckpt.pos_max + 1, -1);
+                            llama_kv_cache_rebuild_block_table(llama_get_memory(slot.ctx), slot.seq_id());
+                            llama_memory_seq_rm(llama_get_memory(slot.ctx), slot.seq_id(), ckpt.pos_max + 1, -1);
 
                             slot.prompt.tokens.keep_first(ckpt.n_tokens);
                             slot.smpl = std::move(smpl_save);
@@ -3482,7 +3505,7 @@ private:
                 slot.sampled = ids.back(); // last accepted token
                 SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
-                llama_memory_seq_rm(llama_get_memory(slot.ctx), slot.id, slot.prompt.tokens.pos_next(), -1);
+                llama_memory_seq_rm(llama_get_memory(slot.ctx), slot.seq_id(), slot.prompt.tokens.pos_next(), -1);
 
                 for (size_t i = 0; i < ids.size(); ++i) {
                     completion_token_output result;

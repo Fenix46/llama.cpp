@@ -245,6 +245,9 @@ Implemented:
   - no fixed `n_parallel` slot pool is created at startup
   - a request handle is created only after admission accepts work
   - non-paged scheduler still preallocates normal slots
+- Paged request metadata is now split from the legacy slot wrapper:
+  - `paged_request_state` tracks `request_id`, `seq_id`, and reserved KV blocks
+  - KV/sampler call sites use `seq_id()` as the bridge toward slotless state
 
 Design:
 
