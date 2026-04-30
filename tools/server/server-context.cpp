@@ -733,7 +733,7 @@ private:
     }
 
     void log_paged_capacity_plan(
-            int32_t n_ctx_slot,
+            int32_t paged_kv_pool_ctx,
             int32_t paged_max_model_len,
             int32_t paged_total_blocks,
             int32_t paged_blocks_per_seq,
@@ -745,8 +745,8 @@ private:
         const int32_t bs = (int32_t) LLAMA_KV_BLOCK_SIZE_DEFAULT;
         const int64_t kv_pool_tokens = (int64_t) paged_total_blocks * bs;
 
-        SRV_INF("[paged-capacity] global KV pool: ctx_size=%d, max_model_len=%d, block_size=%d, total_blocks=%d, kv_pool_tokens=%" PRId64 ", full_ctx_concurrency=%d, n_seq_max=%u\n",
-                n_ctx_slot, paged_max_model_len, bs, paged_total_blocks, kv_pool_tokens, paged_max_full_ctx_concurrency, llama_n_seq_max(ctx));
+        SRV_INF("[paged-capacity] global KV pool: kv_pool_ctx=%d, per_request_ctx=%d, block_size=%d, total_blocks=%d, kv_pool_tokens=%" PRId64 ", full_ctx_concurrency=%d, n_seq_max=%u\n",
+                paged_kv_pool_ctx, paged_max_model_len, bs, paged_total_blocks, kv_pool_tokens, paged_max_full_ctx_concurrency, llama_n_seq_max(ctx));
         SRV_INF("[paged-capacity] per max-context request: blocks=%d, tokens=%d\n",
                 paged_blocks_per_seq, paged_max_model_len);
 
@@ -1087,7 +1087,7 @@ private:
             paged_blocks_per_seq_ = paged_blocks_per_seq;
             paged_max_full_ctx_concurrency_ = paged_max_full_ctx_concurrency;
             paged_total_blocks_ = paged_total_blocks;
-            log_paged_capacity_plan(n_ctx_slot, paged_max_model_len, paged_total_blocks, paged_blocks_per_seq, paged_max_full_ctx_concurrency);
+            log_paged_capacity_plan((int32_t) llama_n_ctx(ctx), paged_max_model_len, paged_total_blocks, paged_blocks_per_seq, paged_max_full_ctx_concurrency);
         }
 
         // setup request handles
@@ -1182,7 +1182,7 @@ private:
             const int32_t free_blocks = llama_kv_cache_n_free_blocks(llama_get_memory(ctx));
 
             if (params_base.scheduler == "paged") {
-                SRV_INF("[paged-scheduler] enabled: block_size=%d, ctx_size=%d, max_model_len=%d, total_blocks=%d, blocks_per_seq=%d, max_full_ctx_concurrency=%d, n_seq_max=%d\n",
+                SRV_INF("[paged-scheduler] enabled: block_size=%d, kv_pool_ctx=%d, per_request_ctx=%d, total_blocks=%d, blocks_per_seq=%d, max_full_ctx_concurrency=%d, n_seq_max=%d\n",
                         bs, llama_n_ctx(ctx), n_ctx_slot, paged_total_blocks, blks_per_full_ctx, paged_max_full_ctx_concurrency, seq_max);
             }
 

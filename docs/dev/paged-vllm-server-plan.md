@@ -14,7 +14,6 @@ The server has an opt-in paged scheduler mode:
   --scheduler paged \
   --paged-admission actual-len \
   --ctx-size 32768 \
-  --max-model-len 8192 \
   --max-num-seqs 32 \
   --max-num-batched-tokens 4096 \
   --kv-block-size 16 \
@@ -25,8 +24,9 @@ The server has an opt-in paged scheduler mode:
 Expected startup log for the command above:
 
 ```text
-[paged-scheduler] enabled: block_size=16, ctx_size=32768, max_model_len=8192,
-total_blocks=2048, blocks_per_seq=512, max_full_ctx_concurrency=4
+server: paged mode treats model ctx as per-request max_model_len=32768; KV pool ctx will be fit from available memory
+[paged-scheduler] enabled: block_size=16, kv_pool_ctx=<fit ctx>, per_request_ctx=32768,
+total_blocks=<fit blocks>, blocks_per_seq=2048, max_full_ctx_concurrency=floor(<fit blocks>/2048)
 ```
 
 Implemented commits:
@@ -41,8 +41,9 @@ Implemented commits:
 
 Important behavior now:
 
-- `--ctx-size` is the total unified KV pool size.
-- `--max-model-len` is the per-request context limit.
+- In paged mode, `--ctx-size` is treated as vLLM-style per-request model context.
+- The unified KV pool context is auto-fit by `--fit` from available device memory before `llama_init_from_model()`.
+- `--max-model-len` remains an explicit per-request context override; if omitted, paged mode derives it from `--ctx-size`.
 - `max_full_ctx_concurrency = floor(total_blocks / ceil(max_model_len / 16))`.
 - `--paged-admission full-ctx` reserves the full per-request context and caps dynamic slot growth to full-context concurrency.
 - `--paged-admission actual-len` reserves blocks from `prompt_tokens + max_tokens`; if generation is unbounded it falls back to full-context reservation.
@@ -303,20 +304,16 @@ Design:
   - actual-length guard: reserve prompt + generation blocks per request
   - runtime estimate: recompute active reserved blocks and free blocks each tick
 - `--parallel` becomes only a compatibility cap in paged mode, not the source of preallocated request slots.
-- KV pool sizing remains tied to `--ctx-size` today because `llama_init_from_model()` allocates context/KV after `n_ctx` is known.
-- Future auto-fit needs a pre-context preflight planner:
-  - load model weights
-  - read device free memory after weights
-  - subtract compute/margin budget
-  - estimate bytes per KV token from model KV geometry and KV type
-  - choose `ctx_size = floor(residual_vram / bytes_per_kv_token)`
-  - initialize context with that computed `ctx_size`
+- KV pool sizing now uses the existing pre-context `--fit` planner:
+  - per-request context is fixed by `--ctx-size`/`--max-model-len`
+  - fit minimum context is raised to the per-request context
+  - llama context `n_ctx` is left unset so fit can grow/shrink the global KV pool from available device memory
 
 Acceptance:
 
 - Paged mode can run without creating fixed `server_slot` objects up front.
 - Requests are admitted by KV block availability, not slot count.
-- `--ctx-size` defines total KV pool tokens; `--max-model-len` defines per-request max context.
+- `--ctx-size` defines per-request max context in paged mode; fitted llama context defines total KV pool tokens.
 - Logs expose enough data to explain why concurrency is capped.
 - No change to non-paged slot scheduler behavior.
 
@@ -329,7 +326,7 @@ Acceptance:
 - Metal path is correctness-first, not optimized.
 - Current server still uses slots internally; slotless paged request state is pending.
 - Paged mode no longer preallocates fixed slots at startup, but it still uses `server_slot` as the temporary per-request handle after admission.
-- Automatic KV pool sizing from residual VRAM is pending; current paged mode reports capacity after context allocation and uses explicit `--ctx-size`.
+- Automatic KV pool sizing currently reuses common `--fit`; dedicated paged KV utilization controls are pending.
 - Paged mask uses block-table logical-page iteration in the portable path; optimized device kernels are still pending.
 
 ## Next Work Queue
@@ -343,10 +340,10 @@ Acceptance:
    - keep cached blocks addressable after request wrapper release
    - let empty completed handles return seq leases immediately
    - reuse cached prefixes through block metadata instead of slot handles
-3. Add pre-context VRAM auto-fit:
-   - estimate residual device memory after model weights
-   - compute KV bytes/token for selected KV types
-   - choose `ctx_size` and full-context concurrency before `llama_init_from_model()`
+3. Add dedicated paged VRAM utilization controls:
+   - expose vLLM-like `gpu_memory_utilization` equivalent
+   - compute target KV pool after model weights and compute buffers
+   - keep common `--fit` fallback for unsupported backends
 4. Optimize copy-on-write:
    - replace portable tensor get/set copy with backend/device block-copy path
 5. Only after correctness: CUDA/H200 paged attention fast path.

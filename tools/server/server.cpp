@@ -108,6 +108,16 @@ int main(int argc, char ** argv) {
         params.dynamic_slots      = true;
         params.kv_block_scheduler = true;
 
+        if (params.max_model_len <= 0 && params.n_ctx > 0) {
+            params.max_model_len = params.n_ctx;
+        }
+        if (params.max_model_len > 0) {
+            LOG_INF("%s: paged mode treats model ctx as per-request max_model_len=%d; KV pool ctx will be fit from available memory\n",
+                    __func__, params.max_model_len);
+            params.fit_params_min_ctx = std::max(params.fit_params_min_ctx, params.max_model_len);
+            params.n_ctx = 0;
+        }
+
         if (params.paged_admission == "actual-len") {
             LOG_INF("%s: enabling paged actual-len admission\n", __func__);
         }
