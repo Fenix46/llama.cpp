@@ -58,6 +58,11 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
         size_swa = size_base;
     }
 
+    if (paged && size_swa < size_base) {
+        LLAMA_LOG_INFO("%s: expanding SWA cache to match KV pool size (%u cells) for paged scheduler\n", __func__, size_base);
+        size_swa = size_base;
+    }
+
     LLAMA_LOG_INFO("%s: creating non-SWA KV cache, size = %u cells\n", __func__, size_base);
 
     kv_base = std::make_unique<llama_kv_cache>(
