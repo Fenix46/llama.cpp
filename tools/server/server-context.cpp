@@ -745,6 +745,15 @@ private:
         const int32_t bs = (int32_t) LLAMA_KV_BLOCK_SIZE_DEFAULT;
         const int64_t kv_pool_tokens = (int64_t) paged_total_blocks * bs;
 
+        // Sanity: allocated KV cells must match the requested pool size.
+        // A mismatch means create_memory() used the wrong size field.
+        if (kv_pool_tokens != paged_kv_pool_ctx) {
+            SRV_WRN("[paged-capacity] *** KV POOL SIZE MISMATCH *** "
+                    "requested kv_pool_ctx=%d but KV cache allocated only %" PRId64 " tokens (%d blocks x %d). "
+                    "Check create_memory() kv_pool_size selection.\n",
+                    paged_kv_pool_ctx, kv_pool_tokens, paged_total_blocks, bs);
+        }
+
         SRV_INF("[paged-capacity] global KV pool: kv_pool_ctx=%d, per_request_ctx=%d, block_size=%d, total_blocks=%d, kv_pool_tokens=%" PRId64 ", full_ctx_concurrency=%d, n_seq_max=%u\n",
                 paged_kv_pool_ctx, paged_max_model_len, bs, paged_total_blocks, kv_pool_tokens, paged_max_full_ctx_concurrency, llama_n_seq_max(ctx));
         SRV_INF("[paged-capacity] per max-context request: blocks=%d, tokens=%d\n",

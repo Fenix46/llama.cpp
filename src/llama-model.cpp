@@ -8424,6 +8424,13 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
     llama_memory_i * res;
 
+    // In paged+unified mode the KV pool spans the full context window (n_ctx),
+    // not just the per-request limit (n_ctx_seq).  n_ctx_seq is still the max
+    // a single sequence may ever occupy; n_ctx is the total cell budget.
+    const uint32_t kv_pool_size = (cparams.paged_kv && cparams.kv_unified)
+                                  ? cparams.n_ctx
+                                  : cparams.n_ctx_seq;
+
     switch (arch) {
         // Models that need specific instantiation should be handled in the
         // switch statement
@@ -8482,7 +8489,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_type_v       */ params.type_v,
                             /* attn_v_trans      */ !cparams.flash_attn,
                             /* attn_swa_full     */ params.swa_full,
-                            /* attn_kv_size      */ cparams.n_ctx_seq,
+                            /* attn_kv_size      */ kv_pool_size,
                             /* attn_n_ubatch     */ cparams.n_ubatch,
                             /* attn_n_pad        */ 1,
                             /* recurrent_type_r  */ GGML_TYPE_F32,
@@ -8500,7 +8507,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_type_k       */ params.type_k,
                             /* attn_type_v       */ params.type_v,
                             /* attn_v_trans      */ !cparams.flash_attn,
-                            /* attn_kv_size      */ cparams.n_ctx_seq,
+                            /* attn_kv_size      */ kv_pool_size,
                             /* attn_n_pad        */ 1,
                             /* attn_n_swa        */ hparams.n_swa,
                             /* attn_swa_type     */ hparams.swa_type,
@@ -8539,7 +8546,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 params.swa_full,
                                 cparams.kv_unified,
                                 cparams.paged_kv,
-                                cparams.n_ctx_seq,
+                                kv_pool_size,
                                 cparams.n_seq_max,
                                 cparams.n_ubatch,
                                 1,
@@ -8556,7 +8563,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 cparams.offload_kqv,
                                 cparams.kv_unified,
                                 cparams.paged_kv,
-                                cparams.n_ctx_seq,
+                                kv_pool_size,
                                 cparams.n_seq_max,
                                 1,
                                 hparams.n_swa,
