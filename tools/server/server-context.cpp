@@ -1551,6 +1551,7 @@ private:
                         ret->seq_id(),   // dst seq_id
                         0,
                         (llama_pos) res.n_cached_tokens);
+                    prefix_cache_->record_reuse(res.n_cached_tokens);
 
                     // prime ret->prompt.tokens with the cached prefix tokens so
                     // get_common_prefix() later returns n_cached_tokens and n_past is set
@@ -2461,6 +2462,20 @@ private:
 
                     res->n_decode_total          = metrics.n_decode_total;
                     res->n_busy_slots_total      = metrics.n_busy_slots_total;
+                    if (prefix_cache_) {
+                        const auto st = prefix_cache_->get_stats();
+                        res->prefix_cache_data = json {
+                            { "entries",       st.entries },
+                            { "slots",         st.slots },
+                            { "lookups",       st.lookups },
+                            { "hits",          st.hits },
+                            { "misses",        st.misses },
+                            { "registrations", st.registrations },
+                            { "invalidations", st.invalidations },
+                            { "reuse_events",  st.reuse_events },
+                            { "reused_tokens", st.reused_tokens },
+                        };
+                    }
 
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
@@ -4047,6 +4062,30 @@ void server_routes::init_routes() {
                     {"value",  (uint64_t) res_task->n_tasks_deferred}
             }}}
         };
+
+        if (!res_task->prefix_cache_data.empty()) {
+            const json & pc = res_task->prefix_cache_data;
+            all_metrics_def["counter"].push_back({
+                    {"name",  "prefix_cache_lookups_total"},
+                    {"help",  "Number of paged prefix cache lookups."},
+                    {"value",  json_value(pc, "lookups", (uint64_t) 0)}
+            });
+            all_metrics_def["counter"].push_back({
+                    {"name",  "prefix_cache_hits_total"},
+                    {"help",  "Number of paged prefix cache lookup hits."},
+                    {"value",  json_value(pc, "hits", (uint64_t) 0)}
+            });
+            all_metrics_def["counter"].push_back({
+                    {"name",  "prefix_cache_reused_tokens_total"},
+                    {"help",  "Number of tokens reused from paged prefix cache."},
+                    {"value",  json_value(pc, "reused_tokens", (uint64_t) 0)}
+            });
+            all_metrics_def["gauge"].push_back({
+                    {"name",  "prefix_cache_entries"},
+                    {"help",  "Number of paged prefix cache entries."},
+                    {"value",  json_value(pc, "entries", (uint64_t) 0)}
+            });
+        }
 
         std::stringstream prometheus;
 

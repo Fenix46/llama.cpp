@@ -47,6 +47,18 @@ public:
         int32_t n_cached_tokens = 0;
     };
 
+    struct stats {
+        uint64_t lookups       = 0;
+        uint64_t hits          = 0;
+        uint64_t misses        = 0;
+        uint64_t registrations = 0;
+        uint64_t invalidations = 0;
+        uint64_t reuse_events  = 0;
+        uint64_t reused_tokens = 0;
+        size_t   entries       = 0;
+        size_t   slots         = 0;
+    };
+
     explicit kv_prefix_cache(uint32_t block_size = LLAMA_KV_BLOCK_SIZE_DEFAULT)
         : bs_(block_size) {}
 
@@ -73,6 +85,7 @@ public:
 
         slot_hashes_[slot_id] = build_hashes(tokens, n_full_pages);
         slot_tokens_[slot_id] = tokens;
+        stats_.registrations++;
 
         LOG_DBG("[kv-prefix-cache] registered slot %d: %u full pages (%u tokens)\n",
                 slot_id, n_full_pages, n_full_pages * bs_);
@@ -93,15 +106,19 @@ public:
         }
         slot_hashes_.erase(it);
         slot_tokens_.erase(slot_id);
+        stats_.invalidations++;
 
         LOG_DBG("[kv-prefix-cache] invalidated slot %d\n", slot_id);
     }
 
     // Find the longest matching block-aligned prefix for `tokens`.
     // Returns donor_slot_id and n_cached_tokens (multiple of block_size).
-    lookup_result lookup(const std::vector<llama_token> & tokens) const {
+    lookup_result lookup(const std::vector<llama_token> & tokens) {
+        stats_.lookups++;
+
         const uint32_t n_full_pages = (uint32_t)tokens.size() / bs_;
         if (n_full_pages == 0) {
+            stats_.misses++;
             return {};
         }
 
@@ -130,13 +147,30 @@ public:
             best.n_cached_tokens = it->second.n_tokens;
         }
 
+        if (best.n_cached_tokens > 0) {
+            stats_.hits++;
+        } else {
+            stats_.misses++;
+        }
+
         return best;
+    }
+
+    void record_reuse(int32_t n_tokens) {
+        stats_.reuse_events++;
+        stats_.reused_tokens += (uint64_t) std::max<int32_t>(0, n_tokens);
     }
 
     // Stats
     size_t n_entries()  const { return page_map_.size(); }
     size_t n_slots()    const { return slot_hashes_.size(); }
     uint32_t block_size() const { return bs_; }
+    stats get_stats() const {
+        stats out = stats_;
+        out.entries = page_map_.size();
+        out.slots   = slot_hashes_.size();
+        return out;
+    }
 
 private:
     struct page_entry {
@@ -180,4 +214,6 @@ private:
 
     // slot_id → exact token sequence (collision verification)
     std::unordered_map<int, std::vector<llama_token>> slot_tokens_;
+
+    stats stats_;
 };

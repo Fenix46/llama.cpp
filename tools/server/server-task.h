@@ -529,6 +529,7 @@ struct server_task_result_metrics : server_task_result {
     // while we can also use std::vector<server_slot> this requires copying the slot object which can be quite messy
     // therefore, we use json to temporarily store the slot.to_json() result
     json slots_data = json::array();
+    json prefix_cache_data = json::object();
 
     virtual json to_json() override;
 };

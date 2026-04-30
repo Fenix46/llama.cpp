@@ -1886,6 +1886,7 @@ json server_task_result_metrics::to_json() {
         { "n_busy_slots_total",              n_busy_slots_total },
 
         { "slots",                           slots_data },
+        { "prefix_cache",                    prefix_cache_data },
     };
 }
 

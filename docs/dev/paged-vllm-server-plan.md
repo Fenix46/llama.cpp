@@ -192,6 +192,8 @@ Implemented:
 - Prefix lookup uses cumulative page hashes and verifies exact stored tokens before reuse.
 - Cross-slot reuse copies matching donor KV pages into the selected slot with `llama_memory_seq_cp()`.
 - Paged block allocator refcounts protect shared blocks from premature free after `seq_cp()`.
+- Prefix-cache stats expose lookups, hits, misses, registrations, invalidations, reuse events, and reused tokens.
+- Prometheus metrics expose prefix-cache lookups, hits, reused tokens, and entry count.
 
 Validated:
 
@@ -202,7 +204,6 @@ Validated:
 
 Remaining:
 
-- Add explicit runtime metric for prefix-cache hits/misses.
 - Validate `cross-slot reuse` from retained server logs in automated/manual scripts.
 - Implement write-side copy-on-write for shared blocks before treating shared pages as fully vLLM-equivalent.
 
@@ -260,6 +261,11 @@ Implemented:
   - stale KV on a reused request handle is cleared before launch
   - cross-request reuse is routed through the paged prefix-cache path
 - `--cache-idle-slots` is disabled in paged mode because it is legacy slot-cache behavior.
+- Prefix-cache observability added:
+  - lookup/hit/miss counters
+  - registration/invalidation counters
+  - reuse event and reused-token counters
+  - Prometheus metrics for lookups, hits, reused tokens, and entry count
 
 Design:
 
@@ -311,20 +317,16 @@ Acceptance:
    - allocate a replacement block
    - copy old KV page into replacement block
    - update only the writing sequence's block-table entry
-2. Add prefix-cache observability:
-   - expose hit/miss counters
-   - include donor slot and cached token count in periodic metrics
-   - preserve server logs in manual test scripts
-3. Add slotless paged request state:
+2. Add slotless paged request state:
    - introduce request-owned lifecycle state separate from `server_slot`
    - lease `seq_id` per active request
    - batch active decode tokens first, then prefill chunks
    - keep non-paged scheduler unchanged
-4. Add pre-context VRAM auto-fit:
+3. Add pre-context VRAM auto-fit:
    - estimate residual device memory after model weights
    - compute KV bytes/token for selected KV types
    - choose `ctx_size` and full-context concurrency before `llama_init_from_model()`
-5. Only after correctness: CUDA/H200 paged attention fast path.
+4. Only after correctness: CUDA/H200 paged attention fast path.
 
 ## Useful Commands
 
