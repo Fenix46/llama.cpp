@@ -251,6 +251,9 @@ Implemented:
 - Paged request-handle allocation is split from legacy dynamic-slot allocation:
   - paged mode creates request handles through `create_paged_request_handle()`
   - non-paged dynamic slots keep the old `create_dynamic_slot()` path
+- External slot operations are disabled in paged mode:
+  - `/slots` returns not-supported for paged scheduler
+  - slot save/restore/erase are not exposed for paged scheduler
 
 Design:
 

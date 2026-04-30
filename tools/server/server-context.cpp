@@ -4045,6 +4045,10 @@ void server_routes::init_routes() {
 
     this->get_slots = [this](const server_http_req & req) {
         auto res = create_response();
+        if (params.scheduler == "paged") {
+            res->error(format_error_response("Slots endpoint is not supported in paged scheduler mode; requests are assigned KV-backed handles dynamically", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
         if (!params.endpoint_slots) {
             res->error(format_error_response("This server does not support slots endpoint. Start it with `--slots`", ERROR_TYPE_NOT_SUPPORTED));
             return res;
@@ -4088,6 +4092,10 @@ void server_routes::init_routes() {
 
     this->post_slots = [this](const server_http_req & req) {
         auto res = create_response();
+        if (params.scheduler == "paged") {
+            res->error(format_error_response("Slot save/restore/erase is not supported in paged scheduler mode", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
         if (params.slot_save_path.empty()) {
             res->error(format_error_response("This server does not support slots action. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
             return res;
@@ -4147,7 +4155,7 @@ void server_routes::init_routes() {
                 {"audio",  meta->has_inp_audio},
             } },
             { "media_marker",                get_media_marker() },
-            { "endpoint_slots",              params.endpoint_slots },
+            { "endpoint_slots",              params.scheduler == "paged" ? false : params.endpoint_slots },
             { "endpoint_props",              params.endpoint_props },
             { "endpoint_metrics",            params.endpoint_metrics },
             { "webui",                       params.webui },
