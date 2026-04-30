@@ -1,3 +1,101 @@
+# llama.cpp paged scheduler fork
+
+This private fork of `llama.cpp` focuses on a production-style paged KV scheduler for
+`llama-server`. It keeps upstream `llama.cpp` compatibility while experimenting with
+request-level paged scheduling, cross-request prefix reuse, long-context capacity
+planning, and Apple Silicon friendly server behavior.
+
+The current branch is built around these server changes:
+
+- Paged request handles are managed directly through `paged_request_state`, without
+  creating legacy slot handles in paged mode.
+- `--scheduler paged` uses a global KV pool and lazily creates request entries.
+- `--kv-prefix-cache` can reuse cached paged prefixes across idle requests.
+- SWA/hybrid checkpoint restore support is wired into paged prefill.
+- `--gpu-memory-utilization` / `--gpu-mem-util` controls how much device memory the
+  paged KV fit logic is allowed to consume.
+
+This fork is intended for local/private experimentation first. It is not presented as
+an upstream replacement.
+
+## Quick Paged Server Start
+
+Build:
+
+```sh
+cmake --build build-arm64-apple-clang-release --target llama-server -j8
+```
+
+Run on Apple Silicon with a local GGUF model:
+
+```sh
+./build-arm64-apple-clang-release/bin/llama-server \
+  -m /path/to/model.gguf \
+  --host 127.0.0.1 \
+  --port 8080 \
+  -ngl 99 \
+  --scheduler paged \
+  --max-model-len 128000 \
+  --gpu-memory-utilization 0.90 \
+  --kv-prefix-cache \
+  --cache-ram 0 \
+  --webui
+```
+
+Check the server:
+
+```sh
+curl http://127.0.0.1:8080/props
+curl http://127.0.0.1:8080/metrics | grep prefix_cache
+```
+
+## Initial Benchmark
+
+Single-run local smoke benchmark, useful as a baseline rather than a formal
+performance claim.
+
+| Item | Value |
+| --- | --- |
+| Machine | MacBook Air, Apple M2 |
+| Backend | Metal |
+| Model | LFM2-2.6B-Q4_0.gguf |
+| Model size | 1.38 GiB |
+| Command shape | `--scheduler paged --max-model-len 128000 --gpu-memory-utilization 0.90 --kv-prefix-cache -ngl 99` |
+| Global KV pool | 389120 tokens |
+| Per-request context | 128000 tokens |
+| Full-context concurrency | 3 requests |
+| KV buffer | 6080 MiB |
+| Prompt eval | 36 tokens in 274.02 ms, 131.38 tok/s |
+| Decode | 952 tokens in 25577.22 ms, 37.22 tok/s |
+| Total | 988 tokens in 25851.24 ms |
+
+The important validation points from this run are:
+
+- `initial_slots=0`, confirming paged mode does not pre-create slot handles.
+- `n_ctx=389120` and `n_ctx_seq=128000`, confirming the global pool expanded while
+  each request kept the configured maximum model length.
+- `full_ctx_concurrency=3`, confirming capacity planning from the fitted KV pool.
+- A chat completion completed cleanly through the paged request path.
+
+## Initial Release Package
+
+The first local release package is intended to ship the macOS arm64 `llama-server`
+binary plus the matching local dynamic libraries from the current build:
+
+```text
+dist/llama-server-paged-v0.1.0-macos-arm64-e700f900a.tar.gz
+```
+
+Models are not bundled. The server expects a local `.gguf` model path at runtime.
+OpenSSL is linked from Homebrew in the current build, so machines without Homebrew
+OpenSSL may need:
+
+```sh
+brew install openssl@3
+```
+
+## Upstream llama.cpp
+
 # llama.cpp
 
 ![llama](https://user-images.githubusercontent.com/1991296/230134379-7181e485-c521-4d23-a0d6-f7b3b61ba524.png)
