@@ -1212,7 +1212,10 @@ private:
         metrics.init();
 
         if (params_base.cache_idle_slots) {
-            if (!params_base.kv_unified) {
+            if (params_base.scheduler == "paged") {
+                SRV_WRN("%s: --cache-idle-slots is slot-based and incompatible with paged scheduler request handles, disabling\n", __func__);
+                params_base.cache_idle_slots = false;
+            } else if (!params_base.kv_unified) {
                 SRV_WRN("%s: --cache-idle-slots requires --kv-unified, disabling\n", __func__);
                 params_base.cache_idle_slots = false;
             } else if (params_base.cache_ram_mib == 0) {

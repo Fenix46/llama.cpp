@@ -259,6 +259,7 @@ Implemented:
   - no LRU prompt-state reuse
   - stale KV on a reused request handle is cleared before launch
   - cross-request reuse is routed through the paged prefix-cache path
+- `--cache-idle-slots` is disabled in paged mode because it is legacy slot-cache behavior.
 
 Design:
 
