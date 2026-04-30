@@ -1711,6 +1711,24 @@ private:
         return res;
     }
 
+    bool try_clear_idle_paged_requests() {
+        if (!params_base.kv_unified) {
+            return false;
+        }
+        for (auto & req : paged_requests) {
+            if (req.is_processing()) {
+                continue;
+            }
+            if (req.prompt.n_tokens() > 0) {
+                SRV_WRN("[paged] purging idle req seq_id=%d with %zu tokens\n", req.seq_id, req.prompt.tokens.size());
+                llama_memory_seq_rm(llama_get_memory(ctx), req.seq_id, -1, -1);
+                req.prompt.tokens.clear();
+                return true;
+            }
+        }
+        return false;
+    }
+
     std::vector<common_adapter_lora_info> construct_lora_list(const std::map<int, float> & config) const {
         std::vector<common_adapter_lora_info> output = params_base.lora_adapters; // copy
         for (size_t i = 0; i < output.size(); ++i) {
@@ -1857,6 +1875,123 @@ private:
         n_empty_consecutive = 0;
 
         SLT_INF(slot, "processing task, is_child = %d\n", slot.task->is_child());
+        return true;
+    }
+
+    // Populate a paged_request_state directly from a task (paged-scheduler primary launch path).
+    // The server_slot handle provides the seq_id and KV slot management; all execution state
+    // lives in the paged_request_state from this point on.
+    bool launch_paged_request(server_slot & slot, server_task && task) {
+        GGML_ASSERT(params_base.scheduler == "paged");
+
+        // lora
+        if (!task.params.lora.empty()) {
+            auto task_loras = construct_lora_list(task.params.lora);
+            if (!are_lora_equal(task_loras, slot.lora)) {
+                if (lora_should_clear_cache(slot.lora, task_loras)) {
+                    slot.prompt.tokens.clear();
+                }
+                slot.lora = task_loras;
+            }
+        } else {
+            slot.lora = params_base.lora_adapters;
+        }
+
+        // alora invocation start
+        size_t alora_invocation_start = task.tokens.size();
+        if (lora_all_alora(slot.lora)) {
+            const auto & enabled_ids = lora_get_enabled_ids(slot.lora);
+            if (enabled_ids.size() != 1) {
+                send_error(task, "Cannot run multiple aLoRAs in a single request", ERROR_TYPE_INVALID_REQUEST);
+                return false;
+            }
+            const auto & lora_ptr = slot.lora[enabled_ids[0]].ptr;
+            const uint64_t      n_inv = llama_adapter_get_alora_n_invocation_tokens(lora_ptr);
+            const llama_token * inv   = llama_adapter_get_alora_invocation_tokens(lora_ptr);
+            int match_idx = (int) n_inv - 1;
+            for (int i = (int) task.tokens.size() - 1; i >= 0; --i) {
+                if (task.tokens[i] == inv[match_idx]) {
+                    if (match_idx == 0) { alora_invocation_start = i; break; }
+                    --match_idx;
+                } else {
+                    match_idx = (int) n_inv - 1;
+                }
+            }
+            if (alora_invocation_start == task.tokens.size()) {
+                slot.lora[enabled_ids[0]].scale = 0.0f;
+            }
+        }
+
+        if (!task.tokens.validate(ctx)) {
+            send_error(task, "Prompt contains invalid tokens", ERROR_TYPE_INVALID_REQUEST);
+            return false;
+        }
+
+        // find or create the paged_request_state for this seq_id
+        paged_request_state * req = nullptr;
+        for (auto & r : paged_requests) {
+            if (r.seq_id == slot.seq_id()) {
+                req = &r;
+                break;
+            }
+        }
+        if (!req) {
+            req = &paged_requests.emplace_back();
+            req->seq_id = slot.seq_id();
+            req->n_ctx  = slot.n_ctx;
+            req->prompt.tokens.has_mtmd = mctx != nullptr;
+        }
+
+        req->ctx              = ctx;
+        req->mctx             = mctx;
+        req->ctx_seq_rm_type  = ctx_seq_rm_type_;
+        req->n_ctx            = slot.n_ctx;
+        req->lora             = slot.lora;
+        req->alora_invocation_start = (int32_t) alora_invocation_start;
+        req->reserved_blocks  = paged_task_reserved_blocks(task);
+        req->callback_on_release = [this](int32_t sid) {
+            paged_seq_leases.mark_cached(sid);
+            // reset the slot handle so it can be reused
+            for (auto & s : slots) {
+                if (s.seq_id() == sid) {
+                    s.state = SLOT_STATE_IDLE;
+                    break;
+                }
+            }
+        };
+
+        // sampler
+        if (task.need_sampling()) {
+            try {
+                req->smpl.reset(common_sampler_init(model, task.params.sampling));
+            } catch (std::exception & e) {
+                send_error(task, std::string("Failed to initialize samplers: ") + e.what(), ERROR_TYPE_INVALID_REQUEST);
+                return false;
+            }
+            llama_set_sampler(ctx, req->seq_id, nullptr); // CPU sampler always for paged
+        } else {
+            req->smpl.reset();
+        }
+
+        req->request_id = task.id;
+        req->parent_id  = task.id_parent;
+        req->phase      = task.is_child() ? PAGED_REQUEST_WAIT_PARENT : PAGED_REQUEST_STARTED;
+
+        req->task = std::make_unique<const server_task>(std::move(task));
+
+        // set slot state so admission/handle tracking still works
+        // (slot.task is intentionally left null — all task data lives in req)
+        slot.state = req->phase == PAGED_REQUEST_WAIT_PARENT
+            ? SLOT_STATE_WAIT_OTHER
+            : SLOT_STATE_STARTED;
+        slot.paged.phase          = req->phase;
+        slot.paged.request_id     = req->request_id;
+        slot.paged.seq_id         = req->seq_id;
+        slot.paged.reserved_blocks = req->reserved_blocks;
+
+        n_empty_consecutive = 0;
+        SRV_INF("[paged] launched request seq_id=%d, task=%d, is_child=%d\n",
+                req->seq_id, req->request_id, req->task->is_child() ? 1 : 0);
         return true;
     }
 
@@ -2450,6 +2585,69 @@ private:
 
     // --- end paged overloads ---
 
+    void send_embedding(const paged_request_state & req, const llama_batch & batch) {
+        auto res = std::make_unique<server_task_result_embd>();
+        res->id        = req.task->id;
+        res->index     = req.task->index;
+        res->n_tokens  = req.task->n_tokens();
+        res->res_type  = req.task->params.res_type;
+
+        const int n_embd_out = llama_model_n_embd_out(model);
+        std::vector<float> embd_res(n_embd_out, 0.0f);
+
+        for (int i = 0; i < batch.n_tokens; ++i) {
+            if (!batch.logits[i] || batch.seq_id[i][0] != req.seq_id) {
+                continue;
+            }
+            const float * embd = nullptr;
+            if (llama_pooling_type(req.ctx) == LLAMA_POOLING_TYPE_NONE) {
+                embd = llama_get_embeddings_ith(ctx, i);
+            } else {
+                embd = llama_get_embeddings_seq(ctx, batch.seq_id[i][0]);
+            }
+            if (embd == nullptr) {
+                PGD_ERR(req, "failed to get embeddings, token=%d, seq_id=%d\n", batch.token[i], batch.seq_id[i][0]);
+                res->embedding.push_back(std::vector<float>(n_embd_out, 0.0f));
+                continue;
+            }
+            if (llama_pooling_type(req.ctx) != LLAMA_POOLING_TYPE_NONE) {
+                common_embd_normalize(embd, embd_res.data(), n_embd_out, req.task->params.embd_normalize);
+                res->embedding.push_back(embd_res);
+                break;
+            }
+            res->embedding.emplace_back(embd, embd + n_embd_out);
+        }
+
+        PGD_DBG(req, "%s", "sending embeddings\n");
+        queue_results.send(std::move(res));
+    }
+
+    void send_rerank(const paged_request_state & req, const llama_batch & batch) {
+        auto res = std::make_unique<server_task_result_rerank>();
+        res->id       = req.task->id;
+        res->index    = req.task->index;
+        res->n_tokens = req.task->n_tokens();
+
+        for (int i = 0; i < batch.n_tokens; ++i) {
+            if (!batch.logits[i] || batch.seq_id[i][0] != req.seq_id) {
+                continue;
+            }
+            const float * embd = llama_get_embeddings_seq(ctx, batch.seq_id[i][0]);
+            if (embd == NULL) {
+                embd = llama_get_embeddings_ith(ctx, i);
+            }
+            if (embd == NULL) {
+                PGD_ERR(req, "failed to get embeddings, token=%d, seq_id=%d\n", batch.token[i], batch.seq_id[i][0]);
+                res->score = -1e6;
+                continue;
+            }
+            res->score = embd[0];
+        }
+
+        PGD_DBG(req, "sending rerank result, score=%f\n", res->score);
+        queue_results.send(std::move(res));
+    }
+
     void send_embedding(const server_slot & slot, const llama_batch & batch) {
         auto res = std::make_unique<server_task_result_embd>();
         res->id        = slot.task->id;
@@ -2618,9 +2816,9 @@ private:
 
     int32_t count_paged_reserved_blocks() const {
         int32_t n_blocks = 0;
-        for (const auto & slot : slots) {
-            if (slot.is_processing()) {
-                n_blocks += slot.paged.reserved_blocks;
+        for (const auto & req : paged_requests) {
+            if (req.is_processing()) {
+                n_blocks += req.reserved_blocks;
             }
         }
         return n_blocks;
@@ -2776,7 +2974,52 @@ private:
                         break;
                     }
 
-                    if (task.is_parent()) {
+                    if (params_base.scheduler == "paged") {
+                        if (task.is_parent()) {
+                            size_t n_child_tasks = task.child_tasks.size();
+                            std::vector<server_slot *> child_slots = get_free_slots(n_child_tasks, slot->seq_id());
+                            if (child_slots.size() < n_child_tasks) {
+                                SRV_DBG("[paged] not enough handles for child tasks, defer id_task=%d\n", id_task);
+                                queue_tasks.defer(std::move(task));
+                                break;
+                            }
+                            int id_parent = task.id;
+                            size_t idx = 0;
+                            bool ok = true;
+                            for (auto * child_slot : child_slots) {
+                                if (!launch_paged_request(*child_slot, std::move(task.child_tasks[idx]))) {
+                                    SRV_ERR("[paged] failed to launch child task idx=%zu\n", idx);
+                                    ok = false;
+                                    break;
+                                }
+                                idx++;
+                            }
+                            if (!ok) {
+                                for (auto & req : paged_requests) {
+                                    if (req.is_processing() && (
+                                            req.request_id == id_parent ||
+                                            req.parent_id  == id_parent)) {
+                                        req.release();
+                                    }
+                                }
+                                break;
+                            }
+                            if (!launch_paged_request(*slot, std::move(task))) {
+                                SRV_ERR("[paged] failed to launch parent task id=%d\n", id_parent);
+                                for (auto & req : paged_requests) {
+                                    if (req.is_processing() && (
+                                            req.request_id == id_parent ||
+                                            req.parent_id  == id_parent)) {
+                                        req.release();
+                                    }
+                                }
+                                break;
+                            }
+                        } else if (!launch_paged_request(*slot, std::move(task))) {
+                            SRV_ERR("[paged] failed to launch task id=%d\n", id_task);
+                            break;
+                        }
+                    } else if (task.is_parent()) {
                         // try getting free slots for all child tasks
                         size_t n_child_tasks = task.child_tasks.size();
                         std::vector<server_slot *> child_slots = get_free_slots(n_child_tasks, slot->seq_id());
@@ -2804,11 +3047,19 @@ private:
                 } break;
             case SERVER_TASK_TYPE_CANCEL:
                 {
-                    // release slot linked with the task id
-                    for (auto & slot : slots) {
-                        if (slot.task && slot.task->id == task.id_target) {
-                            slot.release();
-                            break;
+                    if (params_base.scheduler == "paged") {
+                        for (auto & req : paged_requests) {
+                            if (req.task && req.task->id == task.id_target) {
+                                req.release();
+                                break;
+                            }
+                        }
+                    } else {
+                        for (auto & slot : slots) {
+                            if (slot.task && slot.task->id == task.id_target) {
+                                slot.release();
+                                break;
+                            }
                         }
                     }
                 } break;
@@ -3046,6 +3297,504 @@ private:
     }
 
     void update_slots() {
+        // ----------------------------------------------------------------
+        // Paged-scheduler execution path — runs entirely on paged_requests,
+        // no server_slot involved. Early-returns after handling everything.
+        // ----------------------------------------------------------------
+        if (params_base.scheduler == "paged") {
+            // 1. all-idle check
+            {
+                bool all_idle = true;
+                for (auto & req : paged_requests) {
+                    if (req.is_processing()) {
+                        all_idle = false;
+                        break;
+                    }
+                }
+                if (all_idle) {
+                    SRV_INF("%s", "[paged] all requests are idle\n");
+                    return;
+                }
+            }
+
+            // 2. post NEXT_RESPONSE
+            {
+                SRV_DBG("%s", "[paged] posting NEXT_RESPONSE\n");
+                server_task task(SERVER_TASK_TYPE_NEXT_RESPONSE);
+                task.id = queue_tasks.get_new_id();
+                queue_tasks.post(std::move(task));
+            }
+
+            // 3. build batch
+            common_batch_clear(batch);
+
+            const int32_t n_batch = llama_n_batch(ctx);
+
+            paged_request_state * req_batched = nullptr;
+
+            auto accept_special_token_paged = [&](const paged_request_state & req, llama_token token) {
+                return params_base.special ||
+                    req.task->params.sampling.preserved_tokens.find(token) != req.task->params.sampling.preserved_tokens.end();
+            };
+
+            // 3a. decode tokens from all actively-generating requests
+            for (auto & req : paged_requests) {
+                if (req.phase != PAGED_REQUEST_DECODING) {
+                    continue;
+                }
+                if (!req_batched) {
+                    req_batched = &req;
+                }
+                req.update_batch(batch);
+            }
+
+            const int32_t decode_tokens_in_batch = batch.n_tokens;
+            const int32_t prefill_budget          = std::max(0, n_batch - decode_tokens_in_batch);
+            int32_t       prefill_added           = 0;
+
+            SRV_DBG("[paged] decode_tokens=%d, prefill_budget=%d\n", decode_tokens_in_batch, prefill_budget);
+
+            // 3b. prefill requests that still have prompt tokens left
+            for (auto & req : paged_requests) {
+                if (req.phase != PAGED_REQUEST_STARTED && req.phase != PAGED_REQUEST_PREFILLING) {
+                    continue;
+                }
+                if (req.phase == PAGED_REQUEST_WAIT_PARENT) {
+                    continue;
+                }
+                if (prefill_added >= prefill_budget) {
+                    continue;
+                }
+
+                const auto & input_tokens = req.task->tokens;
+
+                const auto n_tokens_prev = batch.n_tokens;
+
+                if (req.phase == PAGED_REQUEST_STARTED) {
+                    req.t_start_process_prompt = ggml_time_us();
+                    req.t_start_generation     = 0;
+                    req.phase                  = PAGED_REQUEST_PREFILLING;
+
+                    PGD_INF(req, "new prompt, n_ctx=%d, n_keep=%d, task.n_tokens=%d\n",
+                            req.n_ctx, req.task->params.n_keep, req.task->n_tokens());
+
+                    int n_past = 0;
+
+                    if (input_tokens.empty()) {
+                        PGD_WRN(req, "%s", "empty prompt - releasing\n");
+                        req.print_timings();
+                        send_final_response(req);
+                        req.release();
+                        continue;
+                    }
+
+                    if (req.task->need_logits() && !llama_get_memory(ctx)) {
+                        send_error(req, "no memory context for logits computation", ERROR_TYPE_SERVER);
+                        req.release();
+                        continue;
+                    }
+
+                    if (req.task->n_tokens() >= req.n_ctx) {
+                        send_error(req,
+                                   string_format("request (%d tokens) exceeds context size (%d tokens)",
+                                                 req.task->n_tokens(), req.n_ctx),
+                                   ERROR_TYPE_EXCEED_CONTEXT_SIZE);
+                        req.release();
+                        continue;
+                    }
+
+                    if (req.task->params.cache_prompt) {
+                        n_past = req.prompt.tokens.get_common_prefix(input_tokens);
+
+                        if (req.alora_invocation_start > 0) {
+                            n_past = std::min(n_past, req.alora_invocation_start - 1);
+                        }
+                    } else {
+                        n_past = 0;
+                    }
+
+                    // [TAG_PROMPT_LOGITS] need at least 1 token evaluated
+                    if (n_past == req.task->n_tokens() && n_past > 0) {
+                        n_past--;
+                    }
+
+                    req.n_prompt_tokens_cache     = n_past;
+                    req.n_prompt_tokens_processed = 0;
+
+                    req.prompt.tokens.keep_first(n_past);
+
+                    if (req.task->params.stream && req.task->params.return_progress) {
+                        send_partial_response(req, {}, true);
+                    }
+                }
+
+                // truncate any KV tokens beyond n_past
+                const llama_pos p0 = req.prompt.tokens.pos_next();
+                if (!llama_memory_seq_rm(llama_get_memory(ctx), req.seq_id, p0, -1)) {
+                    PGD_WRN(req, "failed to truncate KV at pos %d - clearing\n", p0);
+                    req.prompt_clear(true);
+                    req.n_prompt_tokens_cache = 0;
+                }
+
+                if (batch.n_tokens + req.task->n_tokens() > n_batch) {
+                    continue; // cannot fit whole prompt, try next iter
+                }
+
+                // fill batch with prompt tokens
+                while (req.prompt.n_tokens() < req.task->n_tokens() &&
+                       batch.n_tokens < n_batch &&
+                       prefill_added < prefill_budget) {
+
+                    // handle multimodal chunks
+                    while (req.prompt.n_tokens() < req.task->n_tokens() &&
+                           input_tokens[req.prompt.n_tokens()] == LLAMA_TOKEN_NULL) {
+                        size_t n_tokens_out = 0;
+                        int32_t res = input_tokens.process_chunk(ctx, mctx, req.prompt.n_tokens(),
+                                                                 req.prompt.tokens.pos_next(), req.seq_id, n_tokens_out);
+                        if (res != 0) {
+                            PGD_ERR(req, "failed to process image chunk, res=%d\n", res);
+                            send_error(req, "failed to process image", ERROR_TYPE_SERVER);
+                            req.release();
+                            goto next_req;
+                        }
+                        req.n_prompt_tokens_processed += n_tokens_out;
+                        {
+                            const auto & chunk = input_tokens.find_chunk(req.prompt.n_tokens());
+                            req.prompt.tokens.push_back(chunk.get());
+                        }
+                    }
+
+                    if (req.prompt.n_tokens() >= req.task->n_tokens()) {
+                        break;
+                    }
+
+                    llama_token cur_tok = input_tokens[req.prompt.n_tokens()];
+                    if (cur_tok == LLAMA_TOKEN_NULL) {
+                        break;
+                    }
+
+                    common_batch_add(batch, cur_tok, req.prompt.tokens.pos_next(), { req.seq_id }, req.task->need_embd());
+                    prefill_added++;
+                    req.prompt.tokens.push_back(cur_tok);
+                    req.n_prompt_tokens_processed++;
+                }
+
+                // done with this req for now (image error path jumps here)
+                next_req:;
+
+                const auto n_tokens_cur = batch.n_tokens - n_tokens_prev;
+
+                if (req.prompt.n_tokens() == req.task->n_tokens()) {
+                    req.phase = PAGED_REQUEST_DONE_PREFILL;
+
+                    GGML_ASSERT(batch.n_tokens > 0);
+                    batch.logits[batch.n_tokens - 1] = true;
+
+                    req.n_decoded = 0;
+                    req.i_batch   = batch.n_tokens - 1;
+
+                    req.init_sampler();
+                    PGD_INF(req, "prompt done, n_tokens=%d, batch.n_tokens=%d\n",
+                            req.prompt.n_tokens(), batch.n_tokens);
+                } else {
+                    PGD_INF(req, "prefill progress, n_tokens=%d/%d\n",
+                            req.prompt.n_tokens(), req.task->n_tokens());
+                    (void) n_tokens_cur;
+                }
+
+                if (!req_batched) {
+                    req_batched = &req;
+                }
+
+                if (batch.n_tokens >= n_batch) {
+                    break;
+                }
+            }
+
+            SRV_DBG("[paged] decoding batch, n_tokens=%d\n", batch.n_tokens);
+
+            if (req_batched) {
+                common_set_adapter_lora(ctx, req_batched->lora);
+                llama_set_embeddings(ctx, req_batched->task->need_embd());
+            }
+
+            if (batch.n_tokens == 0) {
+                SRV_WRN("%s", "[paged] no tokens to decode\n");
+                if (++n_empty_consecutive > 3) {
+                    GGML_ABORT("fatal error - please provide logs and repro in %s\n",
+                               "https://github.com/ggml-org/llama.cpp/pull/20277");
+                }
+            } else {
+                n_empty_consecutive = 0;
+            }
+
+            // 4. llama_decode loop
+            int32_t i_next = 0;
+            int32_t cur_n_batch = n_batch;
+
+            for (int32_t i = 0; i < batch.n_tokens; i = i_next) {
+                const int32_t n_tokens = std::min(cur_n_batch, batch.n_tokens - i);
+
+                llama_batch batch_view = {
+                    n_tokens,
+                    batch.token    + i,
+                    nullptr,
+                    batch.pos      + i,
+                    batch.n_seq_id + i,
+                    batch.seq_id   + i,
+                    batch.logits   + i,
+                };
+
+                const int ret = llama_decode(ctx, batch_view);
+                metrics.on_decoded(paged_requests);
+
+                if (kv_sched) {
+                    int32_t n_active = 0;
+                    for (const auto & req : paged_requests) {
+                        if (req.is_processing()) { ++n_active; }
+                    }
+                    kv_sched->on_decoded(
+                        ctx,
+                        n_active,
+                        (int32_t) paged_requests.size(),
+                        count_paged_reserved_blocks(),
+                        metrics.n_prompt_tokens_processed,
+                        (double) metrics.t_prompt_processing,
+                        metrics.n_tokens_predicted,
+                        (double) metrics.t_tokens_generation);
+                }
+
+                if (ret != 0) {
+                    std::string err;
+                    if (cur_n_batch == 1 && ret == 1) {
+                        err = "Context size has been exceeded.";
+                    } else if (ret == -1) {
+                        err = "Invalid input batch.";
+                    } else if (ret < -1) {
+                        err = "Compute error.";
+                    }
+
+                    if (!err.empty()) {
+                        SRV_ERR("[paged] %s i=%d, n_batch=%d, ret=%d\n", err.c_str(), i, cur_n_batch, ret);
+                        for (auto & req : paged_requests) {
+                            if (req.is_processing()) {
+                                send_error(req, err);
+                                req.release();
+                            }
+                        }
+                        break;
+                    }
+
+                    if (!try_clear_idle_paged_requests()) {
+                        cur_n_batch /= 2;
+                    }
+                    SRV_WRN("[paged] KV full, retrying batch size=%d\n", cur_n_batch);
+                    continue;
+                }
+
+                i_next = i + n_tokens;
+                cur_n_batch = n_batch;
+
+                // 4a. handle parent→child KV copy for n_cmpl > 1
+                for (auto & req : paged_requests) {
+                    if (req.phase == PAGED_REQUEST_DONE_PREFILL && req.task->is_parent()) {
+                        std::vector<paged_request_state *> children;
+                        for (auto & other : paged_requests) {
+                            if (other.phase == PAGED_REQUEST_WAIT_PARENT &&
+                                req.task->id == other.task->id_parent) {
+                                children.push_back(&other);
+                            }
+                        }
+                        for (auto * child : children) {
+                            PGD_INF(req, "copying state to child seq_id=%d\n", child->seq_id);
+                            child->copy_state_from(req);
+                            child->phase = PAGED_REQUEST_DONE_PREFILL;
+                        }
+                    }
+                }
+
+                // 4b. send prompt-progress updates and do sampling
+                for (auto & req : paged_requests) {
+                    if (req.phase == PAGED_REQUEST_PREFILLING ||
+                        req.phase == PAGED_REQUEST_DONE_PREFILL) {
+                        if (req.task->params.stream && req.task->params.return_progress) {
+                            send_partial_response(req, {}, true);
+                        }
+                    }
+
+                    if (req.i_batch < (int) i || req.i_batch >= (int) (i + n_tokens)) {
+                        continue;
+                    }
+
+                    if (req.phase == PAGED_REQUEST_DONE_PREFILL) {
+                        if (req.task->type == SERVER_TASK_TYPE_EMBEDDING) {
+                            send_embedding(req, batch_view);
+                            req.release();
+                            req.i_batch = -1;
+                            continue;
+                        }
+                        if (req.task->type == SERVER_TASK_TYPE_RERANK) {
+                            send_rerank(req, batch_view);
+                            req.release();
+                            req.i_batch = -1;
+                            continue;
+                        }
+
+                        GGML_ASSERT(req.task->need_sampling());
+                        req.phase = PAGED_REQUEST_DECODING;
+
+                        if (req.can_speculate()) {
+                            common_speculative_begin(req.spec.spec.get(), req.prompt.tokens.get_text_tokens());
+                        }
+                    } else if (req.phase != PAGED_REQUEST_DECODING) {
+                        continue;
+                    }
+
+                    if (req.can_speculate() && !req.spec.spec_draft.empty()) {
+                        continue; // sampled via speculative path below
+                    }
+
+                    const int tok_idx = req.i_batch - i;
+
+                    llama_token id = common_sampler_sample(req.smpl.get(), req.ctx, tok_idx);
+                    req.i_batch = -1;
+                    common_sampler_accept(req.smpl.get(), id, true);
+
+                    const int64_t t_current = ggml_time_us();
+                    req.n_decoded += 1;
+
+                    if (req.n_decoded == 1) {
+                        req.t_start_generation = t_current;
+                        req.t_prompt_processing = (req.t_start_generation - req.t_start_process_prompt) / 1e3;
+                        metrics.on_prompt_eval(req);
+                    }
+
+                    req.t_token_generation = std::max<int64_t>(1, t_current - req.t_start_generation) / 1e3;
+
+                    completion_token_output result;
+                    result.tok          = id;
+                    result.text_to_send = common_token_to_piece(req.ctx, result.tok,
+                                             accept_special_token_paged(req, result.tok));
+                    result.prob         = 1.0f;
+
+                    if (req.task->params.sampling.n_probs > 0) {
+                        populate_token_probs(req, result, req.task->params.post_sampling_probs,
+                                             params_base.special, tok_idx);
+                    }
+
+                    if (!process_token(result, req)) {
+                        req.print_timings();
+                        send_final_response(req);
+                        metrics.on_prediction(req);
+                        req.release();
+                    }
+                }
+
+                // 4c. speculative decoding accept loop
+                for (auto & req : paged_requests) {
+                    if (req.phase != PAGED_REQUEST_DECODING ||
+                        !req.can_speculate() ||
+                        req.spec.spec_draft.empty()) {
+                        continue;
+                    }
+
+                    const size_t n_draft = req.spec.spec_draft.size();
+                    GGML_ASSERT(n_draft > 0);
+
+                    {
+                        const bool use_ckpt = req.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+
+                        common_sampler_ptr smpl_save;
+                        if (use_ckpt) {
+                            smpl_save.reset(common_sampler_clone(req.smpl.get()));
+                        }
+
+                        GGML_ASSERT(req.spec.spec_i_batch.size() == n_draft + 1);
+                        auto accepted = common_sampler_sample_and_accept_n(
+                            req.smpl.get(), req.ctx, req.spec.spec_i_batch, req.spec.spec_draft);
+                        req.spec.spec_i_batch.clear();
+
+                        PGD_DBG(req, "spec: n_draft=%zu, accepted=%zu\n", req.spec.spec_draft.size(), accepted.size());
+                        GGML_ASSERT(accepted.size() >= 1);
+
+                        if (accepted.size() < req.spec.spec_draft.size() + 1) {
+                            if (use_ckpt) {
+                                req.spec.spec_draft = std::move(accepted);
+
+                                const auto & ckpt = req.spec.spec_ckpt;
+                                PGD_DBG(req, "restoring spec checkpoint (pos_min=%d, pos_max=%d, size=%zu)\n",
+                                        ckpt.pos_min, ckpt.pos_max, ckpt.size());
+
+                                const size_t n = llama_state_seq_set_data_ext(req.ctx, ckpt.data.data(),
+                                                                               ckpt.size(), req.seq_id,
+                                                                               LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                if (n != ckpt.size()) {
+                                    GGML_ABORT("[paged] failed to restore spec checkpoint seq_id=%d", req.seq_id);
+                                }
+
+                                llama_kv_cache_rebuild_block_table(llama_get_memory(req.ctx), req.seq_id);
+                                llama_memory_seq_rm(llama_get_memory(req.ctx), req.seq_id, ckpt.pos_max + 1, -1);
+
+                                req.prompt.tokens.keep_first(ckpt.n_tokens);
+                                req.smpl = std::move(smpl_save);
+                                continue;
+                            }
+                            LOG_DBG("[paged] partial spec acceptance: %zu < %zu\n",
+                                    accepted.size(), req.spec.spec_draft.size());
+                        }
+
+                        common_speculative_accept(req.spec.spec.get(), accepted.size() - 1);
+                        req.spec.spec_draft = std::move(accepted);
+                    }
+
+                    const int64_t t_current = ggml_time_us();
+                    const auto    ids       = std::move(req.spec.spec_draft);
+
+                    req.n_decoded += ids.size();
+                    req.t_token_generation = std::max<int64_t>(1, t_current - req.t_start_generation) / 1e3;
+
+                    req.spec.n_draft_accepted += ids.size() - 1;
+                    req.spec.n_draft_total    += n_draft;
+
+                    req.prompt.tokens.keep_first(req.prompt.n_tokens() - n_draft);
+                    req.prompt.tokens.insert({ids.begin(), ids.end() - 1});
+
+                    req.sampled = ids.back();
+                    PGD_DBG(req, "spec accepted: sampled=%d, ids.size=%zu, n_draft=%zu\n",
+                            req.sampled, ids.size(), n_draft);
+
+                    llama_memory_seq_rm(llama_get_memory(req.ctx), req.seq_id,
+                                        req.prompt.tokens.pos_next(), -1);
+
+                    for (size_t si = 0; si < ids.size(); ++si) {
+                        completion_token_output result;
+                        result.tok          = ids[si];
+                        result.text_to_send = common_token_to_piece(req.ctx, result.tok,
+                                                 accept_special_token_paged(req, result.tok));
+                        result.prob         = 1.0f;
+
+                        if (!process_token(result, req)) {
+                            req.print_timings();
+                            send_final_response(req);
+                            metrics.on_prediction(req);
+                            req.release();
+                            break;
+                        }
+                    }
+
+                    PGD_DBG(req, "spec: accepted %d/%d, new n_tokens=%d\n",
+                            (int) ids.size() - 1, (int) n_draft, req.prompt.n_tokens());
+                }
+            }
+
+            SRV_DBG("%s", "[paged] run completed\n");
+            return; // <-- early return, skip slot-based path below
+        }
+
+        // ----------------------------------------------------------------
+        // Legacy slot-based execution path (non-paged schedulers)
+        // ----------------------------------------------------------------
+
         // check if all slots are idle
         {
             bool all_idle = true;
@@ -3683,14 +4432,6 @@ private:
                     break;
                 }
             }
-        }
-
-        if (is_paged_scheduler) {
-            for (auto & slot : slots) {
-                sync_paged_request_shadow(slot);
-            }
-            SRV_DBG("[paged-scheduler] chunked prefill: decode_tokens=%d, prefill_budget=%d, prefill_added=%d, batch.n_tokens=%d\n",
-                    decode_tokens_in_batch, prefill_budget, prefill_added, batch.n_tokens);
         }
 
         SRV_DBG("decoding batch, n_tokens = %d\n", batch.n_tokens);
