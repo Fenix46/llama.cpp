@@ -281,6 +281,10 @@ Implemented:
   - tracks free, active, and cached seq ids
   - paged request handles lease seq ids instead of using vector index
   - metrics expose lease counts under prefix-cache data
+- Moved KV/sampler seq access behind the paged request bridge:
+  - `server_slot::seq_id()` now prefers paged request state
+  - prompt save/load, KV clear/copy, sampler reset, batch append, and speculative checkpoints use `seq_id()`
+  - stale paged handles clear both the legacy id and paged seq id before leasing again
 
 Design:
 
@@ -332,9 +336,10 @@ Acceptance:
    - batch from `paged_requests`
    - send output from `paged_request_state`
    - leave non-paged scheduler unchanged
-2. Move seq ownership fully out of slot handles:
-   - detach cached prefix pages from handle lifetime
-   - allow completed request handle to release seq id safely
+2. Detach cached prefix pages from request handle lifetime:
+   - keep cached blocks addressable after request wrapper release
+   - let empty completed handles return seq leases immediately
+   - reuse cached prefixes through block metadata instead of slot handles
 3. Add pre-context VRAM auto-fit:
    - estimate residual device memory after model weights
    - compute KV bytes/token for selected KV types

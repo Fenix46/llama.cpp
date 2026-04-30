@@ -87,7 +87,7 @@ struct server_slot {
     // stores the llama seq_id in server_slot::id, but all new KV/sampler code
     // should use seq_id() so the request state can move out of server_slot.
     int seq_id() const {
-        return id;
+        return paged.seq_id >= 0 ? paged.seq_id : id;
     }
 
     llama_context * ctx = nullptr;
@@ -146,7 +146,7 @@ struct server_slot {
     void prompt_save(server_prompt_cache & prompt_cache) const {
         GGML_ASSERT(prompt.data.size() == 0);
 
-        const size_t cur_size = llama_state_seq_get_size_ext(ctx, id, 0);
+        const size_t cur_size = llama_state_seq_get_size_ext(ctx, seq_id(), 0);
 
         SRV_WRN(" - saving prompt with length %d, total state size = %.3f MiB\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0));
@@ -156,11 +156,11 @@ struct server_slot {
             return;
         }
 
-        llama_state_seq_get_data_ext(ctx, cur->data.data(), cur_size, id, 0);
+        llama_state_seq_get_data_ext(ctx, cur->data.data(), cur_size, seq_id(), 0);
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
-        bool res = prompt_cache.load(prompt, tokens, ctx, id);
+        bool res = prompt_cache.load(prompt, tokens, ctx, seq_id());
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
@@ -175,7 +175,7 @@ struct server_slot {
 
         SLT_INF(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
-        llama_memory_seq_rm(llama_get_memory(ctx), id, -1, -1);
+        llama_memory_seq_rm(llama_get_memory(ctx), seq_id(), -1, -1);
         prompt.tokens.clear();
     }
 
@@ -234,7 +234,7 @@ struct server_slot {
         task_prev = std::move(task);
         task.reset();
 
-        llama_set_sampler(ctx, id, nullptr);
+        llama_set_sampler(ctx, seq_id(), nullptr);
 
         // clear alora start
         alora_invocation_start = -1;
@@ -376,7 +376,7 @@ struct server_slot {
                 if (!spec_draft.empty() && ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
                     const auto n_tokens = prompt.tokens.size();
 
-                    spec_ckpt = server_get_checkpoint(ctx, this->id, n_tokens);
+                    spec_ckpt = server_get_checkpoint(ctx, seq_id(), n_tokens);
 
                     SLT_DBG(*this, "created speculative checkpoint (pos_min = %d, pos_max = %d, n_tokens = %zu, size = %.3f MiB)\n",
                             spec_ckpt.pos_min, spec_ckpt.pos_max, n_tokens, (float) spec_ckpt.data.size() / 1024 / 1024);
@@ -390,7 +390,7 @@ struct server_slot {
             // no speculative decoding
             i_batch = batch.n_tokens;
 
-            common_batch_add(batch, sampled, prompt.tokens.pos_next(), { this->id }, true);
+            common_batch_add(batch, sampled, prompt.tokens.pos_next(), { seq_id() }, true);
 
             SLT_DBG(*this, "slot decode token, id=%d, n_ctx = %d, n_tokens = %d, truncated = %d\n",
                     sampled, n_ctx, prompt.n_tokens(), truncated);
@@ -407,9 +407,9 @@ struct server_slot {
 
             auto pos0 = prompt.tokens.pos_next();
 
-            common_batch_add(batch, sampled, pos0++, { this->id }, true);
+            common_batch_add(batch, sampled, pos0++, { seq_id() }, true);
             for (auto token : spec_draft) {
-                common_batch_add(batch, token, pos0++, { this->id }, true);
+                common_batch_add(batch, token, pos0++, { seq_id() }, true);
             }
         }
 
@@ -436,7 +436,7 @@ struct server_slot {
 
             reset();
 
-            callback_on_release(id);
+            callback_on_release(seq_id());
         }
     }
 
@@ -557,8 +557,8 @@ struct server_slot {
     void copy_state_to(server_slot & other) const {
         GGML_ASSERT(state == SLOT_STATE_DONE_PROMPT);
 
-        llama_memory_seq_rm(llama_get_memory(ctx), other.id,     -1, -1);
-        llama_memory_seq_cp(llama_get_memory(ctx), id, other.id, -1, -1);
+        llama_memory_seq_rm(llama_get_memory(ctx), other.seq_id(), -1, -1);
+        llama_memory_seq_cp(llama_get_memory(ctx), seq_id(), other.seq_id(), -1, -1);
 
         other.n_decoded   = n_decoded;
         other.n_remaining = n_remaining;
@@ -814,6 +814,7 @@ private:
         slot.id    = id;
         slot.ctx   = ctx;
         slot.n_ctx = n_ctx_slot;
+        slot.paged.seq_id = id;
 
         slot.ctx_seq_rm_type = ctx_seq_rm_type;
 
@@ -863,6 +864,7 @@ private:
         }
 
         slot.id = seq_id;
+        slot.paged.seq_id = seq_id;
         SLT_INF(slot, "[paged-scheduler] leased seq_id=%d\n", seq_id);
         return true;
     }
@@ -887,6 +889,7 @@ private:
         if (params_base.scheduler == "paged") {
             paged_seq_leases.release_uncached(slot.seq_id());
             slot.id = -1;
+            slot.paged.seq_id = -1;
         }
         prompt_cache->update();
     }
@@ -1589,6 +1592,7 @@ private:
             ret->prompt_clear(false);
             paged_seq_leases.release_uncached(ret->seq_id());
             ret->id = -1;
+            ret->paged.seq_id = -1;
             if (!assign_paged_seq_id(*ret)) {
                 return nullptr;
             }
