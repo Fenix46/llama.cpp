@@ -11,6 +11,7 @@
 #include "build-info.h"
 #include "common.h"
 #include "llama.h"
+#include "llama-ext.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -716,6 +717,61 @@ private:
 
     bool sleeping = false;
 
+    static double bytes_to_mib(size_t bytes) {
+        return (double) bytes / 1024.0 / 1024.0;
+    }
+
+    void log_paged_capacity_plan(
+            int32_t n_ctx_slot,
+            int32_t paged_max_model_len,
+            int32_t paged_total_blocks,
+            int32_t paged_blocks_per_seq,
+            int32_t paged_max_full_ctx_concurrency) const {
+        if (params_base.scheduler != "paged" || ctx == nullptr || model == nullptr) {
+            return;
+        }
+
+        const int32_t bs = (int32_t) LLAMA_KV_BLOCK_SIZE_DEFAULT;
+        const int64_t kv_pool_tokens = (int64_t) paged_total_blocks * bs;
+
+        SRV_INF("[paged-capacity] global KV pool: ctx_size=%d, max_model_len=%d, block_size=%d, total_blocks=%d, kv_pool_tokens=%" PRId64 ", full_ctx_concurrency=%d, n_seq_max=%u\n",
+                n_ctx_slot, paged_max_model_len, bs, paged_total_blocks, kv_pool_tokens, paged_max_full_ctx_concurrency, llama_n_seq_max(ctx));
+        SRV_INF("[paged-capacity] per max-context request: blocks=%d, tokens=%d\n",
+                paged_blocks_per_seq, paged_max_model_len);
+
+        llama_memory_breakdown memory_breakdown = llama_get_memory_breakdown(ctx);
+        llama_memory_breakdown_data accounted;
+        for (const auto & [_, mb] : memory_breakdown) {
+            accounted.model   += mb.model;
+            accounted.context += mb.context;
+            accounted.compute += mb.compute;
+        }
+
+        SRV_INF("[paged-capacity] accounted memory: model=%.2f MiB, context=%.2f MiB, compute=%.2f MiB, total=%.2f MiB\n",
+                bytes_to_mib(accounted.model),
+                bytes_to_mib(accounted.context),
+                bytes_to_mib(accounted.compute),
+                bytes_to_mib(accounted.total()));
+
+        const int32_t n_dev = llama_model_n_devices(model);
+        for (int32_t i = 0; i < n_dev; ++i) {
+            ggml_backend_dev_t dev = llama_model_get_device(model, i);
+            if (dev == nullptr) {
+                continue;
+            }
+
+            size_t free = 0;
+            size_t total = 0;
+            ggml_backend_dev_memory(dev, &free, &total);
+            SRV_INF("[paged-capacity] device %d: %s (%s), free=%.2f MiB, total=%.2f MiB\n",
+                    i,
+                    ggml_backend_dev_name(dev),
+                    ggml_backend_dev_description(dev),
+                    bytes_to_mib(free),
+                    bytes_to_mib(total));
+        }
+    }
+
     void destroy() {
         llama_init.reset();
 
@@ -967,6 +1023,7 @@ private:
             paged_blocks_per_seq_ = paged_blocks_per_seq;
             paged_max_full_ctx_concurrency_ = paged_max_full_ctx_concurrency;
             paged_total_blocks_ = paged_total_blocks;
+            log_paged_capacity_plan(n_ctx_slot, paged_max_model_len, paged_total_blocks, paged_blocks_per_seq, paged_max_full_ctx_concurrency);
         }
 
         // setup slots

@@ -226,6 +226,53 @@ Acceptance:
 - Fallback can be forced for debug.
 - Metal remains functional.
 
+## Milestone 7: Slotless Scheduler and VRAM Capacity Planner
+
+Goal: remove llama.cpp fixed-slot scheduling from paged mode and move toward vLLM-style request scheduling over one global KV pool.
+
+Status: next architecture step. Current code still keeps `server_slot` as the request lifecycle wrapper, while KV allocation already uses paged global blocks.
+
+Implemented:
+
+- Paged startup logs now print the global KV capacity plan:
+  - context size used for the KV pool
+  - max model length per request
+  - block size and total blocks
+  - full-context concurrency at `max_model_len`
+  - accounted model/context/compute memory
+  - backend device free/total memory after model and context allocation
+
+Design:
+
+- Replace `server_slot` in paged mode with a request state:
+  - `request_id`
+  - leased `seq_id`
+  - prompt cursor and decode cursor
+  - sampler state
+  - output queue state
+  - block reservation
+- Admission becomes block-based:
+  - full-context guard: `free_blocks / ceil(max_model_len / block_size)`
+  - actual-length guard: reserve prompt + generation blocks per request
+  - runtime estimate: recompute active reserved blocks and free blocks each tick
+- `--parallel` becomes only a compatibility cap in paged mode, not the source of preallocated request slots.
+- KV pool sizing remains tied to `--ctx-size` today because `llama_init_from_model()` allocates context/KV after `n_ctx` is known.
+- Future auto-fit needs a pre-context preflight planner:
+  - load model weights
+  - read device free memory after weights
+  - subtract compute/margin budget
+  - estimate bytes per KV token from model KV geometry and KV type
+  - choose `ctx_size = floor(residual_vram / bytes_per_kv_token)`
+  - initialize context with that computed `ctx_size`
+
+Acceptance:
+
+- Paged mode can run without creating fixed `server_slot` objects up front.
+- Requests are admitted by KV block availability, not slot count.
+- `--ctx-size` defines total KV pool tokens; `--max-model-len` defines per-request max context.
+- Logs expose enough data to explain why concurrency is capped.
+- No change to non-paged slot scheduler behavior.
+
 ## Known Limitations
 
 - Prefix cache vLLM-style is initial only: cross-slot block-aligned reuse exists, with exact-token verification after hash lookup.
@@ -233,7 +280,8 @@ Acceptance:
 - `actual-len` admission uses reservation accounting, not exact live block pressure.
 - No explicit preemption/eviction policy for overcommitted running requests.
 - Metal path is correctness-first, not optimized.
-- Current server still uses slots internally.
+- Current server still uses slots internally; slotless paged request state is pending.
+- Automatic KV pool sizing from residual VRAM is pending; current paged mode reports capacity after context allocation and uses explicit `--ctx-size`.
 - Paged mask uses block-table logical-page iteration in the portable path; optimized device kernels are still pending.
 
 ## Next Work Queue
@@ -247,7 +295,16 @@ Acceptance:
    - expose hit/miss counters
    - include donor slot and cached token count in periodic metrics
    - preserve server logs in manual test scripts
-3. Only after correctness: CUDA/H200 paged attention fast path.
+3. Add slotless paged request state:
+   - introduce request-owned lifecycle state separate from `server_slot`
+   - lease `seq_id` per active request
+   - batch active decode tokens first, then prefill chunks
+   - keep non-paged scheduler unchanged
+4. Add pre-context VRAM auto-fit:
+   - estimate residual device memory after model weights
+   - compute KV bytes/token for selected KV types
+   - choose `ctx_size` and full-context concurrency before `llama_init_from_model()`
+5. Only after correctness: CUDA/H200 paged attention fast path.
 
 ## Useful Commands
 
