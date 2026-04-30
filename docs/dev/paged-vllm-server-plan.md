@@ -273,6 +273,10 @@ Implemented:
   - copies old K/V page to replacement
   - updates only the writing sequence's block-table entry
   - releases the old shared block ref
+- Introduced `paged-request.h`:
+  - owns slotless request state types for phase, prompt/decode/output/sampler/spec state
+  - adds `paged_requests` container shadowing current slot bridge
+  - syncs request phase during launch, prefill, decode, and release
 
 Design:
 
@@ -319,18 +323,21 @@ Acceptance:
 
 ## Next Work Queue
 
-1. Add slotless paged request state:
-   - introduce request-owned lifecycle state separate from `server_slot`
+1. Move paged execution from slot bridge into `paged_requests`:
+   - launch into `paged_request_state`
+   - batch from `paged_requests`
+   - send output from `paged_request_state`
+   - leave non-paged scheduler unchanged
+2. Add seq id lease pool:
    - lease `seq_id` per active request
-   - batch active decode tokens first, then prefill chunks
-   - keep non-paged scheduler unchanged
-2. Add pre-context VRAM auto-fit:
+   - release `seq_id` on request completion
+3. Add pre-context VRAM auto-fit:
    - estimate residual device memory after model weights
    - compute KV bytes/token for selected KV types
    - choose `ctx_size` and full-context concurrency before `llama_init_from_model()`
-3. Optimize copy-on-write:
+4. Optimize copy-on-write:
    - replace portable tensor get/set copy with backend/device block-copy path
-4. Only after correctness: CUDA/H200 paged attention fast path.
+5. Only after correctness: CUDA/H200 paged attention fast path.
 
 ## Useful Commands
 

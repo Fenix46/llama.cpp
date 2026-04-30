@@ -7,6 +7,7 @@
 #include "server-queue.h"
 #include "kv-block-scheduler.h"
 #include "kv-prefix-cache.h"
+#include "paged-request.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -77,18 +78,6 @@ enum slot_state {
 enum server_state {
     SERVER_STATE_LOADING_MODEL,  // Server is starting up, model not fully loaded yet
     SERVER_STATE_READY,          // Server is ready and model is loaded
-};
-
-struct paged_request_state {
-    int32_t request_id      = -1;
-    int32_t seq_id          = -1;
-    int32_t reserved_blocks = 0;
-
-    void clear() {
-        request_id      = -1;
-        seq_id          = -1;
-        reserved_blocks = 0;
-    }
 };
 
 struct server_slot {
@@ -240,7 +229,7 @@ struct server_slot {
         // clear speculative decoding stats
         n_draft_total = 0;
         n_draft_accepted = 0;
-        paged.clear();
+        paged.clear_runtime();
 
         task_prev = std::move(task);
         task.reset();
@@ -438,6 +427,7 @@ struct server_slot {
             t_token_generation = (ggml_time_us() - t_start_generation) / 1e3;
 
             state = SLOT_STATE_IDLE;
+            paged.phase = PAGED_REQUEST_IDLE;
 
             // do not keep context of the child slots - the parent's context is enough
             if (task->is_child()) {
@@ -702,6 +692,7 @@ private:
 
     // slots / clients
     std::vector<server_slot> slots;
+    std::vector<paged_request_state> paged_requests;
 
     // cached slot init parameters (used for dynamic slot creation)
     int32_t n_ctx_slot_ = 0;
@@ -1068,6 +1059,7 @@ private:
         }
 
         slots.clear();
+        paged_requests.clear();
 
         const auto ctx_seq_rm_type = common_context_can_seq_rm(ctx);
         if (ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
@@ -1095,6 +1087,9 @@ private:
         {
             const int32_t seq_max = (int32_t) llama_n_seq_max(ctx);
             slots.reserve(seq_max > params_base.n_parallel ? seq_max : params_base.n_parallel);
+            if (params_base.scheduler == "paged") {
+                paged_requests.reserve(seq_max);
+            }
         }
 
         // initialize slots
@@ -1381,6 +1376,47 @@ private:
         }
 
         return create_dynamic_slot(task);
+    }
+
+    paged_request_state & ensure_paged_request_shadow(server_slot & slot) {
+        GGML_ASSERT(params_base.scheduler == "paged");
+
+        for (auto & req : paged_requests) {
+            if (req.seq_id == slot.seq_id()) {
+                return req;
+            }
+        }
+
+        auto & req = paged_requests.emplace_back();
+        req.seq_id = slot.seq_id();
+        req.n_ctx  = slot.n_ctx;
+        req.prompt.tokens.has_mtmd = mctx != nullptr;
+        return req;
+    }
+
+    void sync_paged_request_shadow(server_slot & slot) {
+        if (params_base.scheduler != "paged") {
+            return;
+        }
+
+        auto & req = ensure_paged_request_shadow(slot);
+        req.request_id      = slot.paged.request_id;
+        req.parent_id       = slot.task ? slot.task->id_parent : -1;
+        req.seq_id          = slot.seq_id();
+        req.reserved_blocks = slot.paged.reserved_blocks;
+        req.n_ctx           = slot.n_ctx;
+        req.phase           = slot.paged.phase;
+        req.n_decoded       = slot.n_decoded;
+        req.n_remaining     = slot.n_remaining;
+        req.i_batch         = slot.i_batch;
+        req.n_prompt_tokens_cache     = slot.n_prompt_tokens_cache;
+        req.n_prompt_tokens_processed = slot.n_prompt_tokens_processed;
+        req.t_start_process_prompt    = slot.t_start_process_prompt;
+        req.t_start_generation        = slot.t_start_generation;
+        req.t_prompt_processing       = slot.t_prompt_processing;
+        req.t_token_generation        = slot.t_token_generation;
+        req.sampled                   = slot.sampled;
+        req.alora_invocation_start    = slot.alora_invocation_start;
     }
 
     server_slot * get_paged_available_handle(const server_task & task) {
@@ -1723,13 +1759,19 @@ private:
         slot.task = std::make_unique<const server_task>(std::move(task));
         if (params_base.scheduler == "paged") {
             slot.paged.request_id      = slot.task->id;
+            slot.paged.parent_id       = slot.task->id_parent;
             slot.paged.seq_id          = slot.seq_id();
+            slot.paged.n_ctx           = slot.n_ctx;
             slot.paged.reserved_blocks = paged_task_reserved_blocks(*slot.task);
+            slot.paged.phase           = slot.task->is_child()
+                ? PAGED_REQUEST_WAIT_PARENT
+                : PAGED_REQUEST_STARTED;
         }
 
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
             : SLOT_STATE_STARTED;
+        sync_paged_request_shadow(slot);
 
         // reset server kill-switch counter
         n_empty_consecutive = 0;
@@ -2804,6 +2846,7 @@ private:
                         slot.t_start_generation = 0;
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
+                        slot.paged.phase = PAGED_REQUEST_PREFILLING;
 
                         SLT_INF(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                 slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
@@ -3214,6 +3257,7 @@ private:
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
                         slot.state = SLOT_STATE_DONE_PROMPT;
+                        slot.paged.phase = PAGED_REQUEST_DONE_PREFILL;
 
                         GGML_ASSERT(batch.n_tokens > 0);
 
@@ -3281,6 +3325,9 @@ private:
         }
 
         if (is_paged_scheduler) {
+            for (auto & slot : slots) {
+                sync_paged_request_shadow(slot);
+            }
             SRV_DBG("[paged-scheduler] chunked prefill: decode_tokens=%d, prefill_budget=%d, prefill_added=%d, batch.n_tokens=%d\n",
                     decode_tokens_in_batch, prefill_budget, prefill_added, batch.n_tokens);
         }
@@ -3422,6 +3469,7 @@ private:
 
                         slot.copy_state_to(*child);
                         child->state = SLOT_STATE_DONE_PROMPT;
+                        child->paged.phase = PAGED_REQUEST_DONE_PREFILL;
                     }
                 }
             }
@@ -3458,6 +3506,7 @@ private:
 
                     // prompt evaluated for next-token prediction
                     slot.state = SLOT_STATE_GENERATING;
+                    slot.paged.phase = PAGED_REQUEST_DECODING;
 
                     if (slot.can_speculate()) {
                         common_speculative_begin(slot.spec.get(), slot.prompt.tokens.get_text_tokens());

@@ -15,6 +15,7 @@ add_library(${TARGET} STATIC
     server-common.h
     server-context.cpp
     server-context.h
+    paged-request.h
     server-tools.cpp
     server-tools.h
 )
