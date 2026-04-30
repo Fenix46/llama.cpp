@@ -16,6 +16,7 @@
 #include <exception>
 #include <signal.h>
 #include <thread> // for std::thread::hardware_concurrency
+#include <vector>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -71,6 +72,57 @@ static server_http_context::handler_t ex_wrapper(server_http_context::handler_t 
     };
 }
 
+static std::vector<ggml_backend_dev_t> server_get_fit_devices(const common_params & params) {
+    std::vector<ggml_backend_dev_t> devices;
+
+    if (!params.devices.empty()) {
+        for (auto * dev : params.devices) {
+            if (dev == nullptr) {
+                break;
+            }
+            devices.push_back(dev);
+        }
+        return devices;
+    }
+
+    devices.reserve(ggml_backend_dev_count());
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        auto * dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            devices.push_back(dev);
+        }
+    }
+
+    return devices;
+}
+
+static void server_apply_paged_gpu_memory_utilization(common_params & params) {
+    const double reserve_fraction = 1.0 - (double) params.paged_gpu_memory_utilization;
+    const auto devices = server_get_fit_devices(params);
+
+    if (devices.empty()) {
+        LOG_WRN("%s: --gpu-memory-utilization has no GPU/backend device to size against; keeping --fit-target defaults\n", __func__);
+        return;
+    }
+
+    for (size_t i = 0; i < devices.size() && i < params.fit_params_target.size(); ++i) {
+        size_t free = 0;
+        size_t total = 0;
+        ggml_backend_dev_memory(devices[i], &free, &total);
+        if (total == 0) {
+            continue;
+        }
+
+        params.fit_params_target[i] = (size_t) ((double) total * reserve_fraction);
+        LOG_INF("%s: paged gpu_memory_utilization=%.3f device=%s total=%.2f MiB fit_target=%.2f MiB\n",
+                __func__,
+                params.paged_gpu_memory_utilization,
+                ggml_backend_dev_name(devices[i]),
+                total / 1024.0 / 1024.0,
+                params.fit_params_target[i] / 1024.0 / 1024.0);
+    }
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -117,6 +169,7 @@ int main(int argc, char ** argv) {
             params.fit_params_min_ctx = std::max(params.fit_params_min_ctx, params.max_model_len);
             params.n_ctx = 0;
         }
+        server_apply_paged_gpu_memory_utilization(params);
 
         if (params.paged_admission == "actual-len") {
             LOG_INF("%s: enabling paged actual-len admission\n", __func__);

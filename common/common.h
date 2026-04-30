@@ -548,6 +548,7 @@ struct common_params {
     bool paged_kv           = false; // make paged KV block allocator authoritative for new pages
     std::string scheduler   = "slots"; // server scheduler mode: slots, paged
     std::string paged_admission = "full-ctx"; // paged scheduler admission policy
+    float paged_gpu_memory_utilization = 0.90f; // target device memory utilization for paged scheduler fit
     int32_t kv_block_size   = 16; // paged KV block size, currently fixed to 16
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix

@@ -754,6 +754,9 @@ private:
                 paged_kv_pool_ctx, paged_max_model_len, bs, paged_total_blocks, kv_pool_tokens, paged_max_full_ctx_concurrency, llama_n_seq_max(ctx));
         SRV_INF("[paged-capacity] per max-context request: blocks=%d, tokens=%d\n",
                 paged_blocks_per_seq, paged_max_model_len);
+        SRV_INF("[paged-capacity] gpu_memory_utilization=%.3f, fit reserved target per device derives from %.1f%% of total memory\n",
+                params_base.paged_gpu_memory_utilization,
+                (1.0f - params_base.paged_gpu_memory_utilization) * 100.0f);
 
         llama_memory_breakdown memory_breakdown = llama_get_memory_breakdown(ctx);
         llama_memory_breakdown_data accounted;
@@ -779,12 +782,14 @@ private:
             size_t free = 0;
             size_t total = 0;
             ggml_backend_dev_memory(dev, &free, &total);
-            SRV_INF("[paged-capacity] device %d: %s (%s), free=%.2f MiB, total=%.2f MiB\n",
+            const size_t fit_target = i < (int32_t) params_base.fit_params_target.size() ? params_base.fit_params_target[i] : 0;
+            SRV_INF("[paged-capacity] device %d: %s (%s), free=%.2f MiB, total=%.2f MiB, fit_reserved_target=%.2f MiB\n",
                     i,
                     ggml_backend_dev_name(dev),
                     ggml_backend_dev_description(dev),
                     bytes_to_mib(free),
-                    bytes_to_mib(total));
+                    bytes_to_mib(total),
+                    bytes_to_mib(fit_target));
         }
     }
 
@@ -1323,50 +1328,6 @@ private:
         return nullptr;
     }
 
-    server_slot * create_paged_request_handle(const server_task & task) {
-        const int32_t seq_max     = (int32_t) llama_n_seq_max(ctx);
-        const int32_t n_handles   = (int32_t) slots.size();
-        const int32_t blks_needed = paged_task_reserved_blocks(task);
-        const int32_t seq_cap     = params_base.paged_admission != "actual-len"
-            ? std::min(seq_max, paged_max_full_ctx_concurrency_)
-            : seq_max;
-
-        int32_t n_free_blk = llama_kv_cache_n_free_blocks(llama_get_memory(ctx));
-
-        if (n_handles < seq_cap && n_free_blk < blks_needed) {
-            if (try_clear_idle_slots()) {
-                n_free_blk = llama_kv_cache_n_free_blocks(llama_get_memory(ctx));
-                SRV_INF("[paged-scheduler] evicted idle request KV, free_blocks now=%d\n", n_free_blk);
-            }
-        }
-
-        if (n_handles < seq_cap && n_free_blk >= blks_needed) {
-            slots.emplace_back();
-            const int32_t seq_id = params_base.scheduler == "paged" ? paged_seq_leases.lease() : n_handles;
-            if (seq_id < 0) {
-                slots.pop_back();
-                SRV_WRN("%s", "[paged-scheduler] cannot create request handle: no seq_id lease\n");
-                return nullptr;
-            }
-            init_slot(slots.back(), seq_id, n_ctx_slot_, ctx_seq_rm_type_);
-
-            SRV_INF("[paged-scheduler] created request handle seq_id=%d (free_blocks=%d, seq_cap=%d)\n",
-                    seq_id, n_free_blk, seq_cap);
-
-            return &slots.back();
-        }
-
-        if (n_handles >= seq_cap) {
-            SRV_DBG("[paged-scheduler] request handle cap reached: handles=%d, seq_cap=%d, blocks_needed=%d\n",
-                    n_handles, seq_cap, blks_needed);
-        } else {
-            SRV_WRN("[paged-scheduler] KV pool exhausted for new request handle: free_blocks=%d < needed=%d\n",
-                    n_free_blk, blks_needed);
-        }
-
-        return nullptr;
-    }
-
     server_slot * create_dynamic_slot(const server_task &) {
         if (!params_base.dynamic_slots) {
             return nullptr;
@@ -1406,10 +1367,6 @@ private:
     }
 
     server_slot * create_request_handle(const server_task & task) {
-        if (params_base.scheduler == "paged") {
-            return create_paged_request_handle(task);
-        }
-
         return create_dynamic_slot(task);
     }
 
@@ -1422,11 +1379,30 @@ private:
             ? std::min(seq_max, paged_max_full_ctx_concurrency_)
             : seq_max;
 
-        // look for an idle entry already in paged_requests
+        // Reuse an idle request only if its seq_id can be made active again.
+        // Cached entries keep their KV prefix; empty entries lease a fresh seq_id.
         for (auto & req : paged_requests) {
             if (!req.is_processing()) {
-                SRV_INF("[paged] reusing idle request entry seq_id=%d\n", req.seq_id);
-                return &req;
+                if (req.prompt.n_tokens() > 0) {
+                    if (paged_seq_leases.n_active() >= seq_cap) {
+                        continue;
+                    }
+
+                    if (paged_seq_leases.activate_cached(req.seq_id)) {
+                        SRV_INF("[paged] reusing cached request entry seq_id=%d\n", req.seq_id);
+                        return &req;
+                    }
+
+                    if (req.seq_id >= 0) {
+                        prefix_cache_invalidate(req.seq_id);
+                        req.prompt_clear(false);
+                        paged_seq_leases.release_uncached(req.seq_id);
+                        req.seq_id = -1;
+                    } else {
+                        req.prompt.tokens.clear();
+                    }
+                    req.prompt.checkpoints.clear();
+                }
             }
         }
 
@@ -1450,7 +1426,23 @@ private:
             return nullptr;
         }
 
-        // lease a new seq_id
+        for (auto & req : paged_requests) {
+            if (!req.is_processing() && req.prompt.n_tokens() == 0) {
+                const int32_t seq_id = paged_seq_leases.lease();
+                if (seq_id < 0) {
+                    SRV_WRN("%s", "[paged] no free seq_id lease\n");
+                    return nullptr;
+                }
+
+                req.seq_id = seq_id;
+                req.n_ctx  = n_ctx_slot_;
+                req.prompt.tokens.has_mtmd = mctx != nullptr;
+
+                SRV_INF("[paged] reusing empty request entry seq_id=%d\n", seq_id);
+                return &req;
+            }
+        }
+
         const int32_t seq_id = paged_seq_leases.lease();
         if (seq_id < 0) {
             SRV_WRN("%s", "[paged] no free seq_id lease\n");
@@ -1467,33 +1459,13 @@ private:
         return &req;
     }
 
-    server_slot * get_paged_available_handle(const server_task & task) {
-        for (server_slot & slot : slots) {
-            if (!slot.is_processing() && slot.prompt.n_tokens() == 0) {
-                SLT_INF(slot, "%s", "[paged-scheduler] selected empty request handle\n");
-                return &slot;
-            }
-        }
-
-        for (server_slot & slot : slots) {
-            if (!slot.is_processing()) {
-                SLT_INF(slot, "%s", "[paged-scheduler] selected reusable request handle\n");
-                return &slot;
-            }
-        }
-
-        return create_paged_request_handle(task);
-    }
-
     server_slot * get_available_slot(const server_task & task) {
         server_slot * ret = nullptr;
 
         bool update_cache = false;
 
         // find the slot that has at least n% prompt similarity
-        if (params_base.scheduler == "paged") {
-            ret = get_paged_available_handle(task);
-        } else if (ret == nullptr && slot_prompt_similarity != 0.0f) {
+        if (ret == nullptr && slot_prompt_similarity != 0.0f) {
             float sim_best = 0;
 
             for (server_slot & slot : slots) {
@@ -1534,7 +1506,7 @@ private:
         }
 
         // find the slot that has been least recently used
-        if (params_base.scheduler != "paged" && ret == nullptr) {
+        if (ret == nullptr) {
             int64_t t_last = -1;
 
             for (server_slot & slot : slots) {
@@ -1688,12 +1660,107 @@ private:
             }
             if (req.prompt.n_tokens() > 0) {
                 SRV_WRN("[paged] purging idle req seq_id=%d with %zu tokens\n", req.seq_id, req.prompt.tokens.size());
-                llama_memory_seq_rm(llama_get_memory(ctx), req.seq_id, -1, -1);
+                if (req.seq_id >= 0) {
+                    prefix_cache_invalidate(req.seq_id);
+                    llama_memory_seq_rm(llama_get_memory(ctx), req.seq_id, -1, -1);
+                    paged_seq_leases.release_uncached(req.seq_id);
+                    req.seq_id = -1;
+                }
                 req.prompt.tokens.clear();
+                req.prompt.checkpoints.clear();
                 return true;
             }
         }
         return false;
+    }
+
+    paged_request_state * get_paged_request_by_seq_id(int32_t seq_id) {
+        for (auto & req : paged_requests) {
+            if (req.seq_id == seq_id) {
+                return &req;
+            }
+        }
+        return nullptr;
+    }
+
+    void register_paged_prefix_cache_on_release(int32_t seq_id) {
+        paged_request_state * req = get_paged_request_by_seq_id(seq_id);
+        const bool can_cache =
+            seq_id >= 0 &&
+            req != nullptr &&
+            req->task &&
+            req->task->params.cache_prompt &&
+            req->task->type == SERVER_TASK_TYPE_COMPLETION &&
+            !req->prompt.tokens.has_mtmd &&
+            !req->prompt.tokens.empty();
+
+        if (can_cache) {
+            if (prefix_cache_) {
+                prefix_cache_->register_slot(seq_id, req->prompt.tokens.get_tokens());
+            }
+            paged_seq_leases.mark_cached(seq_id);
+        } else {
+            prefix_cache_invalidate(seq_id);
+            if (req != nullptr && seq_id >= 0) {
+                llama_memory_seq_rm(llama_get_memory(ctx), seq_id, -1, -1);
+                req->prompt.tokens.clear();
+                req->prompt.checkpoints.clear();
+            }
+            paged_seq_leases.release_uncached(seq_id);
+            if (req != nullptr) {
+                req->seq_id = -1;
+            }
+        }
+    }
+
+    void try_apply_paged_prefix_cache(paged_request_state & req, const server_task & task) {
+        if (!prefix_cache_ ||
+            task.type != SERVER_TASK_TYPE_COMPLETION ||
+            !task.params.cache_prompt ||
+            task.tokens.has_mtmd) {
+            return;
+        }
+
+        const auto & task_toks = task.tokens.get_tokens();
+        const int32_t cur_common = (int32_t) req.prompt.tokens.get_common_prefix(task.tokens);
+        const uint32_t bs = prefix_cache_->block_size();
+        const int32_t cur_pages = (cur_common / (int32_t) bs) * (int32_t) bs;
+
+        auto res = prefix_cache_->lookup(task_toks);
+        if (res.donor_slot_id < 0 ||
+            res.donor_slot_id == req.seq_id ||
+            res.n_cached_tokens <= cur_pages) {
+            return;
+        }
+
+        paged_request_state * donor = get_paged_request_by_seq_id(res.donor_slot_id);
+        if (donor == nullptr ||
+            donor->is_processing() ||
+            donor->prompt.tokens.has_mtmd ||
+            (int32_t) donor->prompt.tokens.get_tokens().size() < res.n_cached_tokens) {
+            return;
+        }
+
+        SRV_INF("[kv-prefix-cache] paged reuse: donor=%d -> seq=%d, n_cached=%d (cur_common=%d)\n",
+                res.donor_slot_id, req.seq_id, res.n_cached_tokens, cur_pages);
+
+        prefix_cache_invalidate(req.seq_id);
+        llama_memory_seq_rm(llama_get_memory(ctx), req.seq_id, -1, -1);
+        req.prompt.tokens.clear();
+        req.prompt.checkpoints.clear();
+
+        llama_memory_seq_cp(
+            llama_get_memory(ctx),
+            donor->seq_id,
+            req.seq_id,
+            0,
+            (llama_pos) res.n_cached_tokens);
+        prefix_cache_->record_reuse(res.n_cached_tokens);
+
+        const auto & donor_toks = donor->prompt.tokens.get_tokens();
+        for (int32_t i = 0; i < res.n_cached_tokens && i < (int32_t) donor_toks.size(); ++i) {
+            req.prompt.tokens.push_back(donor_toks[i]);
+        }
     }
 
     std::vector<common_adapter_lora_info> construct_lora_list(const std::map<int, float> & config) const {
@@ -1830,8 +1897,7 @@ private:
     }
 
     // Populate a paged_request_state directly from a task (paged-scheduler primary launch path).
-    // The server_slot handle provides the seq_id and KV slot management; all execution state
-    // lives in the paged_request_state from this point on.
+    // The leased seq_id and all request runtime state live in paged_request_state.
     bool launch_paged_request(paged_request_state & req, server_task && task) {
         GGML_ASSERT(params_base.scheduler == "paged");
 
@@ -1840,7 +1906,10 @@ private:
             auto task_loras = construct_lora_list(task.params.lora);
             if (!are_lora_equal(task_loras, req.lora)) {
                 if (lora_should_clear_cache(req.lora, task_loras)) {
+                    prefix_cache_invalidate(req.seq_id);
+                    llama_memory_seq_rm(llama_get_memory(ctx), req.seq_id, -1, -1);
                     req.prompt.tokens.clear();
+                    req.prompt.checkpoints.clear();
                 }
                 req.lora = task_loras;
             }
@@ -1884,8 +1953,10 @@ private:
         req.alora_invocation_start = (int32_t) alora_invocation_start;
         req.reserved_blocks  = paged_task_reserved_blocks(task);
         req.callback_on_release = [this](int32_t sid) {
-            paged_seq_leases.mark_cached(sid);
+            register_paged_prefix_cache_on_release(sid);
         };
+
+        try_apply_paged_prefix_cache(req, task);
 
         // sampler
         if (task.need_sampling()) {
@@ -2842,6 +2913,25 @@ private:
                 cur.pos_max, cur.n_tokens, (float) cur.data.size() / 1024 / 1024);
     }
 
+    void create_checkpoint(paged_request_state & req, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+        while (req.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
+            const auto & cur = req.prompt.checkpoints.front();
+
+            PGD_WRN(req, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                    cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.data.size() / 1024 / 1024);
+
+            req.prompt.checkpoints.erase(req.prompt.checkpoints.begin());
+        }
+
+        const auto & cur = req.prompt.checkpoints.emplace_back(
+            server_get_checkpoint(ctx, req.seq_id, req.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max));
+
+        PGD_WRN(req,
+                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                (int) req.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
+                cur.pos_max, cur.n_tokens, (float) cur.data.size() / 1024 / 1024);
+    }
+
     void process_single_task(server_task && task) {
         switch (task.type) {
             case SERVER_TASK_TYPE_COMPLETION:
@@ -3272,7 +3362,8 @@ private:
             // 3. build batch
             common_batch_clear(batch);
 
-            const int32_t n_batch = llama_n_batch(ctx);
+            const int32_t n_batch  = llama_n_batch(ctx);
+            const int32_t n_ubatch = llama_n_ubatch(ctx);
 
             paged_request_state * req_batched = nullptr;
 
@@ -3357,6 +3448,67 @@ private:
                         n_past = 0;
                     }
 
+                    llama_pos pos_next = req.prompt.tokens.pos_next(n_past);
+                    const auto pos_min_thold = std::max(0, pos_next - n_swa);
+
+                    if (n_past > 0 && n_past < req.prompt.n_tokens()) {
+                        const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), req.seq_id);
+                        if (pos_min == -1) {
+                            PGD_ERR(req, "n_past = %d, prompt.tokens.size() = %d, seq_id = %d, pos_min = %d\n",
+                                    n_past, (int) req.prompt.tokens.size(), req.seq_id, pos_min);
+                            GGML_ABORT("pos_min == -1, but n_past > 0 - should not happen");
+                        }
+
+                        if (pos_min >= pos_min_thold) {
+                            PGD_WRN(req, "n_past = %d, prompt.tokens.size() = %d, seq_id = %d, pos_min = %d, n_swa = %d\n",
+                                    n_past, (int) req.prompt.tokens.size(), req.seq_id, pos_min, n_swa);
+
+                            const auto it = std::find_if(
+                                req.prompt.checkpoints.rbegin(),
+                                req.prompt.checkpoints.rend(),
+                                [&](const auto & cur) {
+                                    return cur.pos_min < pos_min_thold || cur.pos_min == 0;
+                                }
+                            );
+
+                            bool do_reset = it == req.prompt.checkpoints.rend();
+
+                            if (!do_reset) {
+                                const size_t checkpoint_size = it->data.size();
+                                const size_t n = llama_state_seq_set_data_ext(ctx, it->data.data(), checkpoint_size, req.seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+
+                                if (n != checkpoint_size) {
+                                    PGD_ERR(req, "failed to restore context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                                            it->pos_min, it->pos_max, it->n_tokens, (float) checkpoint_size / 1024 / 1024);
+                                    do_reset = true;
+                                } else {
+                                    llama_kv_cache_rebuild_block_table(llama_get_memory(ctx), req.seq_id);
+                                    pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
+                                    n_past = std::min(req.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                    PGD_WRN(req, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n",
+                                            it->pos_min, it->pos_max, it->n_tokens, n_past, (float) checkpoint_size / 1024 / 1024);
+                                }
+                            }
+
+                            if (do_reset) {
+                                PGD_WRN(req, "%s", "forcing full prompt re-processing due to lack of cache data (likely SWA or hybrid/recurrent memory)\n");
+                                pos_next = 0;
+                                n_past = 0;
+                            }
+                        }
+                    }
+
+                    for (auto it = req.prompt.checkpoints.begin(); it != req.prompt.checkpoints.end();) {
+                        const auto & cur = *it;
+                        if (cur.pos_max > pos_next) {
+                            PGD_WRN(req, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n",
+                                    cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.data.size() / 1024 / 1024);
+                            it = req.prompt.checkpoints.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
+
                     // [TAG_PROMPT_LOGITS] need at least 1 token evaluated
                     if (n_past == req.task->n_tokens() && n_past > 0) {
                         n_past--;
@@ -3376,13 +3528,23 @@ private:
                 const llama_pos p0 = req.prompt.tokens.pos_next();
                 if (!llama_memory_seq_rm(llama_get_memory(ctx), req.seq_id, p0, -1)) {
                     PGD_WRN(req, "failed to truncate KV at pos %d - clearing\n", p0);
+                    prefix_cache_invalidate(req.seq_id);
                     req.prompt_clear(true);
+                    req.prompt.checkpoints.clear();
                     req.n_prompt_tokens_cache = 0;
                 }
 
                 if (batch.n_tokens + req.task->n_tokens() > n_batch) {
                     continue; // cannot fit whole prompt, try next iter
                 }
+
+                bool do_checkpoint = params_base.n_ctx_checkpoints > 0;
+                do_checkpoint = do_checkpoint && req.task->type == SERVER_TASK_TYPE_COMPLETION;
+                do_checkpoint = do_checkpoint && (
+                        (req.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) ||
+                        (n_swa > 0));
+
+                bool has_mtmd = false;
 
                 // fill batch with prompt tokens
                 while (req.prompt.n_tokens() < req.task->n_tokens() &&
@@ -3406,6 +3568,7 @@ private:
                             const auto & chunk = input_tokens.find_chunk(req.prompt.n_tokens());
                             req.prompt.tokens.push_back(chunk.get());
                         }
+                        has_mtmd = true;
                     }
 
                     if (req.prompt.n_tokens() >= req.task->n_tokens()) {
@@ -3421,10 +3584,30 @@ private:
                     prefill_added++;
                     req.prompt.tokens.push_back(cur_tok);
                     req.n_prompt_tokens_processed++;
+
+                    if (do_checkpoint) {
+                        const int checkpoint_offsets[] = {4 + n_ubatch, 4};
+
+                        bool should_break = false;
+                        for (int offset : checkpoint_offsets) {
+                            const int n_last = std::min(n_batch, offset);
+                            if (req.task->n_tokens() == req.prompt.n_tokens() + n_last) {
+                                should_break = true;
+                                break;
+                            }
+                        }
+                        if (should_break) {
+                            break;
+                        }
+                    }
                 }
 
                 // done with this req for now (image error path jumps here)
                 next_req:;
+
+                if (!req.is_processing()) {
+                    continue;
+                }
 
                 const auto n_tokens_cur = batch.n_tokens - n_tokens_prev;
 
@@ -3441,9 +3624,40 @@ private:
                     PGD_INF(req, "prompt done, n_tokens=%d, batch.n_tokens=%d\n",
                             req.prompt.n_tokens(), batch.n_tokens);
                 } else {
+                    if (req.task->n_tokens() < req.prompt.n_tokens() + n_ubatch) {
+                        do_checkpoint = do_checkpoint && true;
+                    } else {
+                        do_checkpoint = do_checkpoint && params_base.checkpoint_every_nt > 0;
+
+                        if (do_checkpoint) {
+                            llama_pos last_checkpoint = 0;
+                            if (!req.prompt.checkpoints.empty()) {
+                                last_checkpoint = req.prompt.checkpoints.back().n_tokens;
+                            }
+
+                            do_checkpoint = do_checkpoint && req.prompt.n_tokens() - batch.n_tokens - last_checkpoint >= params_base.checkpoint_every_nt;
+
+                            if (do_checkpoint) {
+                                PGD_INF(req, "%d tokens since last checkpoint at %d, creating new checkpoint during processing at position %d\n",
+                                        params_base.checkpoint_every_nt, last_checkpoint, req.prompt.n_tokens());
+                            }
+                        }
+                    }
+
                     PGD_INF(req, "prefill progress, n_tokens=%d/%d\n",
                             req.prompt.n_tokens(), req.task->n_tokens());
-                    (void) n_tokens_cur;
+                }
+
+                const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), req.seq_id);
+                const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx), req.seq_id);
+
+                do_checkpoint = do_checkpoint && (pos_min >= 0 && req.prompt.n_tokens() >= 64);
+                do_checkpoint = do_checkpoint && !has_mtmd;
+                do_checkpoint = do_checkpoint && (req.prompt.checkpoints.empty() || req.prompt.n_tokens() - n_tokens_cur > req.prompt.checkpoints.back().n_tokens + 64);
+                PGD_DBG(req, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
+
+                if (do_checkpoint) {
+                    create_checkpoint(req, n_tokens_cur, pos_min, pos_max);
                 }
 
                 if (!req_batched) {
@@ -4712,6 +4926,10 @@ private:
     }
 
     int get_slot_n_ctx() {
+        if (params_base.scheduler == "paged" || slots.empty()) {
+            return n_ctx_slot_;
+        }
+
         return slots.back().n_ctx;
     }
 

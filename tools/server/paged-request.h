@@ -441,11 +441,11 @@ struct paged_request_state {
             prompt_clear(false);
         }
 
-        clear_runtime();
-
         if (callback_on_release) {
             callback_on_release(seq_id);
         }
+
+        clear_runtime();
     }
 
     void clear_runtime() {
@@ -520,6 +520,22 @@ struct paged_seq_lease_pool {
         }
         active_seq_ids.erase(seq_id);
         cached_seq_ids.insert(seq_id);
+    }
+
+    bool activate_cached(int32_t seq_id) {
+        if (seq_id < 0) {
+            return false;
+        }
+        if (active_seq_ids.find(seq_id) != active_seq_ids.end()) {
+            return true;
+        }
+        auto it = cached_seq_ids.find(seq_id);
+        if (it == cached_seq_ids.end()) {
+            return false;
+        }
+        cached_seq_ids.erase(it);
+        active_seq_ids.insert(seq_id);
+        return true;
     }
 
     void release_uncached(int32_t seq_id) {

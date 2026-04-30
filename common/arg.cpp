@@ -1350,6 +1350,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_PAGED_ADMISSION").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--gpu-memory-utilization", "--gpu-mem-util"}, "FLOAT",
+        string_format("target device memory utilization for paged scheduler fit (default: %.2f)", params.paged_gpu_memory_utilization),
+        [](common_params & params, const std::string & value) {
+            const float utilization = std::stof(value);
+            if (utilization <= 0.0f || utilization > 1.0f) {
+                throw std::invalid_argument("error: --gpu-memory-utilization must be > 0 and <= 1\n");
+            }
+            params.paged_gpu_memory_utilization = utilization;
+        }
+    ).set_env("LLAMA_ARG_GPU_MEMORY_UTILIZATION").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--kv-block-size"}, "N",
         "paged KV block size in tokens (currently only 16 is supported)",
         [](common_params & params, int value) {
