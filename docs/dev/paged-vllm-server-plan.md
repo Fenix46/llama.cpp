@@ -25,6 +25,8 @@ Expected startup log for the command above:
 
 ```text
 server: paged mode treats model ctx as per-request max_model_len=32768; KV pool ctx will be fit from available memory
+llama_context: n_ctx         = <fit KV pool ctx>
+llama_context: n_ctx_seq     = 32768
 [paged-scheduler] enabled: block_size=16, kv_pool_ctx=<fit ctx>, per_request_ctx=32768,
 total_blocks=<fit blocks>, blocks_per_seq=2048, max_full_ctx_concurrency=floor(<fit blocks>/2048)
 ```
@@ -43,6 +45,7 @@ Important behavior now:
 
 - In paged mode, `--ctx-size` is treated as vLLM-style per-request model context.
 - The unified KV pool context is auto-fit by `--fit` from available device memory before `llama_init_from_model()`.
+- Core context separates global KV pool from per-sequence model context via `llama_context_params::n_ctx_seq`.
 - `--max-model-len` remains an explicit per-request context override; if omitted, paged mode derives it from `--ctx-size`.
 - `max_full_ctx_concurrency = floor(total_blocks / ceil(max_model_len / 16))`.
 - `--paged-admission full-ctx` reserves the full per-request context and caps dynamic slot growth to full-context concurrency.

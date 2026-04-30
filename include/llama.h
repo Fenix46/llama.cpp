@@ -330,6 +330,7 @@ extern "C" {
     //       https://github.com/ggml-org/llama.cpp/pull/7544
     struct llama_context_params {
         uint32_t n_ctx;             // text context, 0 = from model
+        uint32_t n_ctx_seq;         // context for a single sequence, 0 = derived from n_ctx
         uint32_t n_batch;           // logical maximum batch size that can be submitted to llama_decode
         uint32_t n_ubatch;          // physical maximum batch size
         uint32_t n_seq_max;         // max number of sequences (i.e. distinct states for recurrent models)

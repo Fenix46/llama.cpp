@@ -186,7 +186,14 @@ llama_context::llama_context(
     cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
 
     if (cparams.kv_unified) {
-        cparams.n_ctx_seq = cparams.n_ctx;
+        cparams.n_ctx_seq = params.n_ctx_seq == 0 ? cparams.n_ctx : params.n_ctx_seq;
+        cparams.n_ctx_seq = GGML_PAD(cparams.n_ctx_seq, 256);
+        if (cparams.n_ctx_seq == 0) {
+            throw std::runtime_error("n_ctx_seq == 0");
+        }
+        if (cparams.n_ctx_seq > cparams.n_ctx) {
+            throw std::runtime_error(format("n_ctx_seq (%u) must be <= n_ctx (%u)", cparams.n_ctx_seq, cparams.n_ctx));
+        }
     } else {
         cparams.n_ctx_seq = cparams.n_ctx / cparams.n_seq_max;
         cparams.n_ctx_seq = GGML_PAD(cparams.n_ctx_seq, 256);
@@ -2892,6 +2899,7 @@ void llama_context::opt_epoch(
 llama_context_params llama_context_default_params() {
     llama_context_params result = {
         /*.n_ctx                       =*/ 512,
+        /*.n_ctx_seq                   =*/ 0,
         /*.n_batch                     =*/ 2048,
         /*.n_ubatch                    =*/ 512,
         /*.n_seq_max                   =*/ 1,
