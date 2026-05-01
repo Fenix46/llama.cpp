@@ -1985,6 +1985,45 @@ ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama
     return v_idxs;
 }
 
+ggml_tensor * llama_kv_cache::build_input_block_table(ggml_context * ctx) const {
+    if (!paged) {
+        return nullptr;
+    }
+
+    const uint32_t bs         = LLAMA_KV_BLOCK_SIZE_DEFAULT;
+    const uint32_t max_pages  = (get_size() + bs - 1) / bs;
+
+    ggml_tensor * bt = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, max_pages, n_seq_max);
+    ggml_set_input(bt);
+
+    return bt;
+}
+
+void llama_kv_cache::set_input_block_table(ggml_tensor * dst) const {
+    if (!paged || !dst) {
+        return;
+    }
+
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+
+    const uint32_t max_pages = (uint32_t) dst->ne[0];
+    const uint32_t n_seqs    = (uint32_t) dst->ne[1];
+
+    int32_t * data = (int32_t *) dst->data;
+
+    // Initialize all entries to -1 (no block mapped).
+    std::fill(data, data + max_pages * n_seqs, -1);
+
+    // Fill in mapped (seq_id, page) → block_id entries.
+    block_table.for_each_entry([&](llama_seq_id seq_id, uint32_t page, uint32_t blk_id) {
+        if ((uint32_t) seq_id >= n_seqs || page >= max_pages) {
+            return;
+        }
+        data[(uint32_t) seq_id * max_pages + page] = (int32_t) blk_id;
+    });
+}
+
 ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
     ggml_tensor * res = nullptr;
 
@@ -3289,8 +3328,16 @@ ggml_tensor * llama_kv_cache_context::build_input_v_rot(ggml_context * ctx) cons
     return kv->build_input_v_rot(ctx);
 }
 
+ggml_tensor * llama_kv_cache_context::build_input_block_table(ggml_context * ctx) const {
+    return kv->build_input_block_table(ctx);
+}
+
 void llama_kv_cache_context::set_input_k_shift(ggml_tensor * dst) const {
     kv->set_input_k_shift(dst);
+}
+
+void llama_kv_cache_context::set_input_block_table(ggml_tensor * dst) const {
+    kv->set_input_block_table(dst);
 }
 
 void llama_kv_cache_context::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {

@@ -308,6 +308,16 @@ public:
         }
     }
 
+    // Iterate all (seq_id, page, block_id) entries in the table.
+    template<typename Fn>
+    void for_each_entry(Fn && fn) const {
+        for (const auto & kv : table) {
+            const llama_seq_id seq_id = (llama_seq_id)(uint32_t)(kv.first >> 32);
+            const uint32_t     page   = (uint32_t)(kv.first & 0xFFFFFFFFULL);
+            fn(seq_id, page, kv.second);
+        }
+    }
+
     // Remove all entries (called on cache clear).
     void clear() { table.clear(); }
 
