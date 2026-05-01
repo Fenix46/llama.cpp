@@ -6463,6 +6463,141 @@ kernel void kernel_flash_attn_ext(
 #undef FWD_ARGS
 }
 
+// =============================================================================
+// Paged flash attention kernel
+//
+// Correctness-first implementation: one thread per query token.
+// Replaces the KQ mask with a block_table lookup, eliminating O(n_kv) memory.
+// Each thread iterates logical pages for its sequence, reads physical K/V cells
+// using block_id * block_size + intra_offset, and computes online softmax.
+//
+// Inputs (F32 Q, F16 K/V):
+//   buffer 0: constant args  (ggml_metal_kargs_flash_attn_ext_paged)
+//   buffer 1: q              [ne00, ne01, ne02, ne03]  F32
+//   buffer 2: k              [ne10, ne11, ne12, ne13]  F16 (KV slab)
+//   buffer 3: v              [ne20, ne21, ne22, ne23]  F16 (KV slab)
+//   buffer 4: block_table    [max_pages, n_seqs_bt]    I32
+//   buffer 5: seq_ids        [ne01]                    I32 (seq_id per query)
+//   buffer 6: dst            [ne00, ne01, ne02, ne03]  F32
+//
+// Grid: ne01 (one thread per query token) x ne02 (heads) x ne03 (streams)
+// =============================================================================
+kernel void kernel_flash_attn_ext_paged(
+        constant ggml_metal_kargs_flash_attn_ext_paged & args,
+        device const float * q,
+        device const half  * k,
+        device const half  * v,
+        device const int   * block_table,
+        device const int   * seq_ids,
+        device       float * dst,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint3 tpitg [[thread_position_in_threadgroup]],
+        uint3 ntg   [[threads_per_threadgroup]]) {
+
+    // One thread per query token per head.
+    // Grid dispatched as (ne01, ne02, ne03).
+    const int iq0 = tgpig[0]; // query token index
+    const int iq2 = tgpig[1]; // head index
+    const int iq3 = tgpig[2]; // stream index
+
+    if (iq0 >= args.ne01) return;
+
+    const int seq_id = seq_ids[iq0];
+    if (seq_id < 0 || seq_id >= args.n_seqs_bt) return;
+
+    // GQA: map query head to KV head
+    const int ikv2 = iq2 / (args.ne02 / args.ne_12_2);
+    const int ikv3 = iq3 / (args.ne03 / args.ne_12_3);
+
+    // head_dim derived from Q row stride: nb01 = head_dim * sizeof(float)
+    const int head_dim = (int)(args.nb01 / sizeof(float));
+
+    // Pointers to this head's Q row
+    device const float * q_head = q + iq0 * (args.nb01 / sizeof(float))
+                                     + iq2 * (args.nb02 / sizeof(float))
+                                     + iq3 * (args.nb03 / sizeof(float));
+
+    // Online softmax state
+    float M = -INFINITY;
+    float S = 0.0f;
+
+    // Output accumulator (max head_dim supported by existing kernels is 576)
+    float acc[576];
+    for (int d = 0; d < head_dim; ++d) { acc[d] = 0.0f; }
+
+    const int block_size = args.block_size;
+    const int max_pages  = args.max_pages;
+
+    // Iterate logical pages for this sequence
+    for (int page = 0; page < max_pages; ++page) {
+        const int blk_id = block_table[seq_id * max_pages + page];
+        if (blk_id < 0) break; // no more pages for this sequence
+
+        const int first_cell = blk_id * block_size;
+
+        // Iterate cells within this block
+        for (int cell_off = 0; cell_off < block_size; ++cell_off) {
+            const int cell = first_cell + cell_off;
+            if (cell >= args.ne11) break;
+
+            // K pointer for this cell: k[cell * nb11 + ikv2 * nb12 + ikv3 * nb13]
+            device const half * k_cell = k
+                + cell  * (args.nb11 / sizeof(half))
+                + ikv2  * (args.nb12 / sizeof(half))
+                + ikv3  * (args.nb13 / sizeof(half));
+
+            // Compute Q·K dot product
+            float qk = 0.0f;
+            for (int d = 0; d < head_dim; ++d) {
+                qk += q_head[d] * float(k_cell[d * args.ns10]);
+            }
+            qk *= args.scale;
+
+            if (args.logit_softcap != 0.0f) {
+                qk = args.logit_softcap * precise::tanh(qk);
+            }
+
+            // Online softmax update
+            const float new_M = max(M, qk);
+            const float exp_scale = exp(M - new_M);
+            S *= exp_scale;
+            M  = new_M;
+
+            // Rescale accumulator
+            for (int d = 0; d < head_dim; ++d) {
+                acc[d] *= exp_scale;
+            }
+
+            const float exp_qk = exp(qk - M);
+            S += exp_qk;
+
+            // V pointer for this cell: v[cell * nb21 + ikv2 * nb22 + ikv3 * nb23]
+            device const half * v_cell = v
+                + cell  * (args.nb21 / sizeof(half))
+                + ikv2  * (args.nb22 / sizeof(half))
+                + ikv3  * (args.nb23 / sizeof(half));
+
+            // Accumulate exp_qk * V
+            for (int d = 0; d < head_dim; ++d) {
+                acc[d] += exp_qk * float(v_cell[d * args.ns20]);
+            }
+        }
+    }
+
+    // Normalize and write output
+    // dst layout: [head_dim, ne01, ne02, ne03] — same as flash_attn_ext output
+    const float inv_S = (S > 0.0f) ? (1.0f / S) : 0.0f;
+
+    device float * dst_head = dst
+        + iq0 * head_dim
+        + iq2 * (head_dim * args.ne1)
+        + iq3 * (head_dim * args.ne1 * args.ne2);
+
+    for (int d = 0; d < head_dim; ++d) {
+        dst_head[d] = acc[d] * inv_S;
+    }
+}
+
 // TODO: this is quite ugly. in the future these types will be hardcoded in the kernel, but for now keep them as
 //       template to be able to explore different combinations
 //

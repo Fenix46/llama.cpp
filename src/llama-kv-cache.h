@@ -231,6 +231,9 @@ public:
     // Returns nullptr when paged mode is disabled.
     ggml_tensor * build_input_block_table(ggml_context * ctx) const;
 
+    // Paged attention: seq_id per query token, I32 [n_tokens]. nullptr when not paged.
+    ggml_tensor * build_input_seq_ids_q(ggml_context * ctx, const llama_ubatch & ubatch) const;
+
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
 
@@ -238,6 +241,9 @@ public:
 
     // Paged attention: fill block_table tensor from current block_table state.
     void set_input_block_table(ggml_tensor * dst) const;
+
+    // Paged attention: fill seq_ids_q tensor (one seq_id per query token).
+    void set_input_seq_ids_q(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
@@ -444,12 +450,17 @@ public:
     // Paged attention: block table tensor. Returns nullptr when not in paged mode.
     ggml_tensor * build_input_block_table(ggml_context * ctx) const;
 
+    // Paged attention: seq_id per query token. Returns nullptr when not in paged mode.
+    ggml_tensor * build_input_seq_ids_q(ggml_context * ctx, const llama_ubatch & ubatch) const;
+
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_shift   (ggml_tensor * dst) const;
     // Paged attention: fill block_table tensor from current block_table state.
     void set_input_block_table(ggml_tensor * dst) const;
+    // Paged attention: fill seq_ids_q tensor (one seq_id per query token).
+    void set_input_seq_ids_q(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 

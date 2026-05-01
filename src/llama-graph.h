@@ -302,6 +302,7 @@ public:
     ggml_tensor * get_v_idxs()      const { return self_v_idxs; }
     ggml_tensor * get_kq_mask()     const { return self_kq_mask_cnv; }
     ggml_tensor * get_block_table() const { return self_block_table; }
+    ggml_tensor * get_seq_ids_q()   const { return self_seq_ids_q; }
 
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
@@ -311,6 +312,9 @@ public:
 
     // Paged attention: I32 [max_pages_per_seq, n_seq_max]; null when not in paged mode.
     ggml_tensor * self_block_table = nullptr;
+
+    // Paged attention: I32 [n_tokens]; seq_id per query token. null when not in paged mode.
+    ggml_tensor * self_seq_ids_q = nullptr;
 
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
@@ -906,7 +910,8 @@ struct llm_graph_context {
             ggml_tensor * v_mla,       // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                   float   kq_scale,
                     int   il,
-            ggml_tensor * block_table = nullptr) const; // I32 [max_pages, n_seqs]; paged attn only
+            ggml_tensor * block_table  = nullptr,  // I32 [max_pages, n_seqs]; paged attn only
+            ggml_tensor * seq_ids_q    = nullptr) const; // I32 [n_tokens]; seq_id per query token
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

@@ -394,6 +394,43 @@ typedef struct {
     float    logit_softcap;
 } ggml_metal_kargs_flash_attn_ext;
 
+// Paged attention variant: block_table replaces KQ mask.
+// block_table[seq_id * max_pages + logical_page] = physical_block_id  (-1 = no block)
+// physical cell index = block_id * block_size + intra_block_offset
+typedef struct {
+    int32_t  ne01;       // n_queries (tokens in current batch)
+    int32_t  ne02;       // n_heads_q
+    int32_t  ne03;       // n_streams
+    uint64_t nb01;       // Q row stride (bytes)
+    uint64_t nb02;       // Q head stride
+    uint64_t nb03;       // Q stream stride
+    int32_t  ne11;       // n_kv (total cells in KV slab)
+    int32_t  ne_12_2;    // K/V n_heads_kv
+    int32_t  ne_12_3;    // K/V n_streams
+    int32_t  ns10;       // K element stride ratio (nb11/nb10)
+    uint64_t nb11;       // K row stride
+    uint64_t nb12;       // K head stride
+    uint64_t nb13;       // K stream stride
+    int32_t  ns20;       // V element stride ratio
+    uint64_t nb21;       // V row stride
+    uint64_t nb22;       // V head stride
+    uint64_t nb23;       // V stream stride
+    int32_t  ne1;        // output ne[1]
+    int32_t  ne2;        // output ne[2]
+    int32_t  ne3;        // output ne[3]
+    float    scale;
+    float    max_bias;
+    float    m0;
+    float    m1;
+    int32_t  n_head_log2;
+    float    logit_softcap;
+    int32_t  block_size;   // LLAMA_KV_BLOCK_SIZE_DEFAULT = 16
+    int32_t  max_pages;    // max logical pages per sequence
+    int32_t  n_seqs_bt;    // number of sequences in block_table (n_seq_max)
+    // seq_id for each query token: seq_ids[token_idx] = seq_id
+    // passed as a second constant buffer (buffer index 9)
+} ggml_metal_kargs_flash_attn_ext_paged;
+
 typedef struct {
     int32_t  ne01;
     int32_t  ne02;

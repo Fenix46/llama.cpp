@@ -5400,6 +5400,16 @@ void ggml_flash_attn_ext_set_block_table(
     a->src[5] = block_table;
 }
 
+void ggml_flash_attn_ext_set_seq_ids_q(
+        struct ggml_tensor * a,
+        struct ggml_tensor * seq_ids_q) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    if (seq_ids_q) {
+        GGML_ASSERT(seq_ids_q->type == GGML_TYPE_I32);
+    }
+    a->src[6] = seq_ids_q;
+}
+
 // ggml_flash_attn_back
 
 struct ggml_tensor * ggml_flash_attn_back(

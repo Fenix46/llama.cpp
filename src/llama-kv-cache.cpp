@@ -2024,6 +2024,31 @@ void llama_kv_cache::set_input_block_table(ggml_tensor * dst) const {
     });
 }
 
+ggml_tensor * llama_kv_cache::build_input_seq_ids_q(ggml_context * ctx, const llama_ubatch & ubatch) const {
+    if (!paged) {
+        return nullptr;
+    }
+
+    ggml_tensor * t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, ubatch.n_tokens);
+    ggml_set_input(t);
+    return t;
+}
+
+void llama_kv_cache::set_input_seq_ids_q(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    if (!paged || !dst || !ubatch) {
+        return;
+    }
+
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    GGML_ASSERT((int64_t) ubatch->n_tokens == dst->ne[0]);
+
+    int32_t * data = (int32_t *) dst->data;
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        data[i] = (ubatch->n_seq_id[i] > 0) ? (int32_t) ubatch->seq_id[i][0] : 0;
+    }
+}
+
 ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
     ggml_tensor * res = nullptr;
 
@@ -3338,6 +3363,14 @@ void llama_kv_cache_context::set_input_k_shift(ggml_tensor * dst) const {
 
 void llama_kv_cache_context::set_input_block_table(ggml_tensor * dst) const {
     kv->set_input_block_table(dst);
+}
+
+ggml_tensor * llama_kv_cache_context::build_input_seq_ids_q(ggml_context * ctx, const llama_ubatch & ubatch) const {
+    return kv->build_input_seq_ids_q(ctx, ubatch);
+}
+
+void llama_kv_cache_context::set_input_seq_ids_q(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    kv->set_input_seq_ids_q(dst, ubatch);
 }
 
 void llama_kv_cache_context::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {

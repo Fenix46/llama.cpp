@@ -201,6 +201,11 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
         int32_t dv,
         int32_t nwg);
 
+// Paged attention kernel (no mask, uses block_table + seq_ids_q instead)
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_paged(
+        ggml_metal_library_t lib,
+        const struct ggml_tensor * op);
+
 // MTLResidencySet wrapper
 
 typedef void * ggml_metal_rset_t;

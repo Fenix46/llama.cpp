@@ -454,6 +454,10 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
         mctx->set_input_block_table(self_block_table);
     }
 
+    if (self_seq_ids_q) {
+        mctx->set_input_seq_ids_q(self_seq_ids_q, ubatch);
+    }
+
     if (self_k_rot) {
         mctx->set_input_k_rot(self_k_rot);
     }
@@ -1943,7 +1947,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * v_mla,
                float   kq_scale,
                  int   il,
-         ggml_tensor * block_table) const {
+         ggml_tensor * block_table,
+         ggml_tensor * seq_ids_q) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -1983,6 +1988,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         if (block_table) {
             ggml_flash_attn_ext_set_block_table(cur, block_table);
+        }
+
+        if (seq_ids_q) {
+            ggml_flash_attn_ext_set_seq_ids_q(cur, seq_ids_q);
         }
 
         if (v_mla) {
@@ -2166,6 +2175,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_kq_mask_cnv = cparams.flash_attn ? ggml_cast(ctx0, inp->self_kq_mask, GGML_TYPE_F16) : inp->self_kq_mask;
 
         inp->self_block_table = mctx_cur->build_input_block_table(ctx0);
+        inp->self_seq_ids_q   = mctx_cur->build_input_seq_ids_q(ctx0, ubatch);
     }
 
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
@@ -2230,7 +2240,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il, inp->get_block_table());
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il, inp->get_block_table(), inp->get_seq_ids_q());
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {

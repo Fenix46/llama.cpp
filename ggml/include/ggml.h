@@ -2412,6 +2412,12 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * block_table);
 
+    // seq_ids_q must be an I32 tensor of shape [n_tokens], one seq_id per query token.
+    // Used together with block_table for paged attention. Pass NULL to clear.
+    GGML_API void ggml_flash_attn_ext_set_seq_ids_q(
+            struct ggml_tensor * a,
+            struct ggml_tensor * seq_ids_q);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,
