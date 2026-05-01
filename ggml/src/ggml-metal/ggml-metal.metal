@@ -6556,11 +6556,13 @@ kernel void kernel_flash_attn_ext_paged(
 
     const int block_size  = args.block_size;
     const int table_pages = args.max_pages;
-    const int page_count  = min(table_pages, page_limits[iq0]);
+    // page_limits layout: [start, end) per query token (2 ints per token).
+    const int page_start  = max(0, page_limits[iq0 * 2 + 0]);
+    const int page_count  = min(table_pages, page_limits[iq0 * 2 + 1]);
 
     device const int * seq_block_table = block_table + (uint64_t) seq_id * table_pages;
 
-    for (int page = sgitg; page < page_count; page += nsg) {
+    for (int page = page_start + sgitg; page < page_count; page += nsg) {
         const int blk_id = seq_block_table[page];
         if (blk_id < 0) continue;
 

@@ -2039,7 +2039,11 @@ ggml_tensor * llama_kv_cache::build_input_page_limits_q(ggml_context * ctx, cons
         return nullptr;
     }
 
-    ggml_tensor * t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, ubatch.n_tokens);
+    // Layout: [2, n_tokens] -> data[i*2 + 0] = start_page, data[i*2 + 1] = end_page (exclusive).
+    // start_page lets SWA layers skip pages older than (pos - n_swa) without
+    // touching the allocator: the slab is full-ctx in paged mode, but only a
+    // window of pages is causally reachable.
+    ggml_tensor * t = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, ubatch.n_tokens);
     ggml_set_input(t);
     return t;
 }
@@ -2066,16 +2070,29 @@ void llama_kv_cache::set_input_page_limits_q(ggml_tensor * dst, const llama_ubat
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     GGML_ASSERT(dst->type == GGML_TYPE_I32);
-    GGML_ASSERT((int64_t) ubatch->n_tokens == dst->ne[0]);
+    GGML_ASSERT(dst->ne[0] == 2);
+    GGML_ASSERT((int64_t) ubatch->n_tokens == dst->ne[1]);
+
+    const bool swa_active = (swa_type != LLAMA_SWA_TYPE_NONE) && (n_swa > 0);
 
     int32_t * data = (int32_t *) dst->data;
     for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
-        // Per-query upper bound: only logical pages up to and including the page
-        // containing pos[i] can possibly hold causal KV cells for this query.
-        // Future pages (if allocated for later tokens in the same ubatch or for
-        // other sequences sharing the slab) must not be scanned: the mask covers
-        // them with -INF, but iterating still costs O(n_kv) and breaks tok/s.
-        data[i] = (int32_t) (llama_kv_block_table::logical_page(ubatch->pos[i], LLAMA_KV_BLOCK_SIZE_DEFAULT) + 1);
+        const llama_pos p1 = ubatch->pos[i];
+        const int32_t end_page = (int32_t) (llama_kv_block_table::logical_page(p1, LLAMA_KV_BLOCK_SIZE_DEFAULT) + 1);
+
+        int32_t start_page = 0;
+        if (swa_active) {
+            // For LLAMA_SWA_TYPE_STANDARD a cell at pos p0 is masked iff (p1 - p0) >= n_swa,
+            // i.e. only cells with p0 > p1 - n_swa are visible. Convert to logical pages.
+            const llama_pos oldest_visible = p1 - (llama_pos) (n_swa - 1);
+            if (oldest_visible > 0) {
+                start_page = (int32_t) llama_kv_block_table::logical_page(oldest_visible, LLAMA_KV_BLOCK_SIZE_DEFAULT);
+            }
+            if (start_page > end_page) start_page = end_page;
+        }
+
+        data[i*2 + 0] = start_page;
+        data[i*2 + 1] = end_page;
     }
 }
 
@@ -2277,9 +2294,25 @@ static bool set_input_kq_mask_paged_impl(const args_set_input_kq_mask & args, fl
             const uint64_t idst = n_kv*i;
             std::fill(data + idst, data + idst + n_kv, -INFINITY);
 
+            // Reachability window in logical pages. For SWA layers only pages whose
+            // tokens fall within [p1 - n_swa + 1, p1] can produce a non-masked cell;
+            // walking the older pages is wasted work that grows O(pos).
+            const uint32_t bs = LLAMA_KV_BLOCK_SIZE_DEFAULT;
+            uint32_t page_lo = 0;
+            const uint32_t page_hi = (p1 < 0) ? 0u : (uint32_t)(p1 / (llama_pos) bs) + 1u;
+            if (swa && args.n_swa > 0) {
+                const llama_pos oldest = p1 - (llama_pos)(args.n_swa - 1);
+                if (oldest > 0) {
+                    page_lo = (uint32_t)(oldest / (llama_pos) bs);
+                }
+            }
+
             bool found_page = false;
-            args.block_table.for_each_seq_page(seq_id, [&](uint32_t, uint32_t blk_id) {
+            args.block_table.for_each_seq_page(seq_id, [&](uint32_t page, uint32_t blk_id) {
                 if (blk_id == LLAMA_KV_BLOCK_ID_NONE || blk_id >= alloc.n_blocks()) {
+                    return;
+                }
+                if (page < page_lo || page >= page_hi) {
                     return;
                 }
 

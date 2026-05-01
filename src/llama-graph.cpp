@@ -483,7 +483,7 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
     res &= !self_seq_ids_q     || self_seq_ids_q->ne[0]     == params.ubatch.n_tokens;
-    res &= !self_page_limits_q || self_page_limits_q->ne[0] == params.ubatch.n_tokens;
+    res &= !self_page_limits_q || self_page_limits_q->ne[1] == params.ubatch.n_tokens;
 
     return res;
 }
@@ -573,9 +573,9 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
     res &= can_reuse_kq_mask(self_kq_mask_swa, mctx->get_swa(),  params.ubatch, params.cparams);
 
     res &= !self_seq_ids_q         || self_seq_ids_q->ne[0]         == params.ubatch.n_tokens;
-    res &= !self_page_limits_q     || self_page_limits_q->ne[0]     == params.ubatch.n_tokens;
+    res &= !self_page_limits_q     || self_page_limits_q->ne[1]     == params.ubatch.n_tokens;
     res &= !self_seq_ids_q_swa     || self_seq_ids_q_swa->ne[0]     == params.ubatch.n_tokens;
-    res &= !self_page_limits_q_swa || self_page_limits_q_swa->ne[0] == params.ubatch.n_tokens;
+    res &= !self_page_limits_q_swa || self_page_limits_q_swa->ne[1] == params.ubatch.n_tokens;
 
     return res;
 }
@@ -660,7 +660,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
     res &= !inp_attn->self_seq_ids_q     || inp_attn->self_seq_ids_q->ne[0]     == params.ubatch.n_tokens;
-    res &= !inp_attn->self_page_limits_q || inp_attn->self_page_limits_q->ne[0] == params.ubatch.n_tokens;
+    res &= !inp_attn->self_page_limits_q || inp_attn->self_page_limits_q->ne[1] == params.ubatch.n_tokens;
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -725,6 +725,16 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
         attn_ctx->get_base()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
 
         attn_ctx->get_base()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+
+        if (inp_attn->self_block_table && inp_attn->self_block_table->buffer) {
+            attn_ctx->get_base()->set_input_block_table(inp_attn->self_block_table);
+        }
+        if (inp_attn->self_seq_ids_q && inp_attn->self_seq_ids_q->buffer) {
+            attn_ctx->get_base()->set_input_seq_ids_q(inp_attn->self_seq_ids_q, ubatch);
+        }
+        if (inp_attn->self_page_limits_q && inp_attn->self_page_limits_q->buffer) {
+            attn_ctx->get_base()->set_input_page_limits_q(inp_attn->self_page_limits_q, ubatch);
+        }
     }
 
     // swa tensors may not be allocated if there are no SWA attention layers
@@ -733,6 +743,16 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
         attn_ctx->get_swa()->set_input_v_idxs(inp_attn->self_v_idxs_swa, ubatch);
 
         attn_ctx->get_swa()->set_input_kq_mask(inp_attn->self_kq_mask_swa, ubatch, cparams.causal_attn);
+
+        if (inp_attn->self_block_table_swa && inp_attn->self_block_table_swa->buffer) {
+            attn_ctx->get_swa()->set_input_block_table(inp_attn->self_block_table_swa);
+        }
+        if (inp_attn->self_seq_ids_q_swa && inp_attn->self_seq_ids_q_swa->buffer) {
+            attn_ctx->get_swa()->set_input_seq_ids_q(inp_attn->self_seq_ids_q_swa, ubatch);
+        }
+        if (inp_attn->self_page_limits_q_swa && inp_attn->self_page_limits_q_swa->buffer) {
+            attn_ctx->get_swa()->set_input_page_limits_q(inp_attn->self_page_limits_q_swa, ubatch);
+        }
     }
 
     if (inp_attn->self_k_rot) {
@@ -779,6 +799,9 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
       //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
         res &= can_reuse_kq_mask(inp_attn->self_kq_mask, attn_ctx->get_base(), params.ubatch, params.cparams);
+
+        res &= !inp_attn->self_seq_ids_q     || inp_attn->self_seq_ids_q->ne[0]     == params.ubatch.n_tokens;
+        res &= !inp_attn->self_page_limits_q || inp_attn->self_page_limits_q->ne[1] == params.ubatch.n_tokens;
     }
 
     // swa tensors may not be allocated if there are no SWA attention layers
@@ -787,6 +810,9 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
       //res &= inp_attn->self_v_idxs_swa->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
         res &= can_reuse_kq_mask(inp_attn->self_kq_mask_swa, attn_ctx->get_swa(), params.ubatch, params.cparams);
+
+        res &= !inp_attn->self_seq_ids_q_swa     || inp_attn->self_seq_ids_q_swa->ne[0]     == params.ubatch.n_tokens;
+        res &= !inp_attn->self_page_limits_q_swa || inp_attn->self_page_limits_q_swa->ne[1] == params.ubatch.n_tokens;
     }
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
@@ -2754,6 +2780,10 @@ llm_graph_input_mem_hybrid_iswa * llm_graph_context::build_inp_mem_hybrid_iswa()
 
         inp_attn->self_kq_mask = build_attn_inp_kq_mask(ctx0, attn_ctx->get_base(), ubatch, cparams);
         inp_attn->self_kq_mask_cnv = cparams.flash_attn ? ggml_cast(ctx0, inp_attn->self_kq_mask, GGML_TYPE_F16) : inp_attn->self_kq_mask;
+
+        inp_attn->self_block_table     = attn_ctx->get_base()->build_input_block_table(ctx0);
+        inp_attn->self_seq_ids_q       = attn_ctx->get_base()->build_input_seq_ids_q(ctx0, ubatch);
+        inp_attn->self_page_limits_q   = attn_ctx->get_base()->build_input_page_limits_q(ctx0, ubatch);
     }
 
     {
@@ -2762,6 +2792,10 @@ llm_graph_input_mem_hybrid_iswa * llm_graph_context::build_inp_mem_hybrid_iswa()
 
         inp_attn->self_kq_mask_swa = build_attn_inp_kq_mask(ctx0, attn_ctx->get_swa(), ubatch, cparams);
         inp_attn->self_kq_mask_swa_cnv = cparams.flash_attn ? ggml_cast(ctx0, inp_attn->self_kq_mask_swa, GGML_TYPE_F16) : inp_attn->self_kq_mask_swa;
+
+        inp_attn->self_block_table_swa     = attn_ctx->get_swa()->build_input_block_table(ctx0);
+        inp_attn->self_seq_ids_q_swa       = attn_ctx->get_swa()->build_input_seq_ids_q(ctx0, ubatch);
+        inp_attn->self_page_limits_q_swa   = attn_ctx->get_swa()->build_input_page_limits_q(ctx0, ubatch);
     }
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid_iswa>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
