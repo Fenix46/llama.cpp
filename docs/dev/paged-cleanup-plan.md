@@ -225,7 +225,7 @@ Acceptance:
 - `--kv-block-scheduler` reports cumulative CoW blocks, bytes, copy time, and
   fallback copy count for fanout benchmarks.
 
-### E3 — Paged long-prompt chunked prefill
+### E3 — Paged long-prompt chunked prefill ✓ DONE
 
 Files: `tools/server/server-context.cpp`, `common/arg.cpp`
 
@@ -291,7 +291,7 @@ Changes:
 | E0 — CoW planning | Medium | Correctness: reversible prepare | 5 |
 | E1 — native GGML block copy | Medium | Removes host round-trip from CoW | 6 |
 | E2 — Metal/CUDA view copy | High | Performance on Apple Silicon/CUDA | 7 |
-| E3 — paged long-prompt chunked prefill | Medium | Fixes prompt > n_batch aborts | 8 |
+| E3 — paged long-prompt chunked prefill | Medium | Fixes prompt > n_batch aborts | ✓ DONE |
 | F — PagedAttention kernels | High | Attention kernel scalability | after E |
 
 ---

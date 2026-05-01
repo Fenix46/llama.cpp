@@ -3534,10 +3534,6 @@ private:
                     req.n_prompt_tokens_cache = 0;
                 }
 
-                if (batch.n_tokens + req.task->n_tokens() > n_batch) {
-                    continue; // cannot fit whole prompt, try next iter
-                }
-
                 bool do_checkpoint = params_base.n_ctx_checkpoints > 0;
                 do_checkpoint = do_checkpoint && req.task->type == SERVER_TASK_TYPE_COMPLETION;
                 do_checkpoint = do_checkpoint && (
