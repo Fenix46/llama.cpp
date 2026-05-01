@@ -30,6 +30,13 @@ public:
         std::vector<uint32_t> sdst;
     };
 
+    struct paged_cow_stats {
+        uint64_t n_blocks         = 0;
+        uint64_t n_bytes          = 0;
+        uint64_t n_copy_fallbacks = 0;
+        uint64_t t_copy_us        = 0;
+    };
+
     // for each ubatch, create a slot_info that contains information about where the ubatch should be inserted in the
     //   KV cells. for example, cell indices for each token, such that: token[i] -> goes to cells[idxs[i]]
     struct slot_info {
@@ -176,6 +183,7 @@ public:
     // Paged block scheduler metrics accessors (Phase 1, read-only)
     const llama_kv_block_allocator & get_block_alloc(uint32_t strm = 0) const;
     const llama_kv_block_table     & get_block_table() const;
+    const paged_cow_stats          & get_paged_cow_stats() const;
 
     //
     // graph_build API
@@ -305,6 +313,7 @@ private:
     // ---------------------------------------------------------------------------
     std::vector<llama_kv_block_allocator> v_block_alloc; // [n_stream]
     llama_kv_block_table                  block_table;    // (seq_id, page) → block_id
+    paged_cow_stats                       cow_stats;
 
     // Sync helpers — keep block_table consistent with cell mutations.
     // Called only from seq_rm / seq_cp / seq_keep / apply_ubatch / clear.

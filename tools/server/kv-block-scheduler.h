@@ -17,6 +17,7 @@
 //   - cumulative tokens/s  (prompt + decode)
 //   - average prefill time per token  (ms)
 //   - average decode time per token   (ms)
+//   - paged CoW blocks / bytes / fallback copies / copy time
 //
 // Design note: this header avoids including server-context.h to keep the
 // dependency graph simple.  All server_slot-derived values are pre-computed
@@ -53,6 +54,11 @@ struct kv_block_scheduler_snapshot {
     double   tokens_per_sec  = 0.0;
     double   avg_prefill_ms  = 0.0;
     double   avg_decode_ms   = 0.0;
+
+    uint64_t paged_cow_blocks    = 0;
+    uint64_t paged_cow_bytes     = 0;
+    uint64_t paged_cow_fallbacks = 0;
+    uint64_t paged_cow_copy_us   = 0;
 
     int64_t  t_snapshot_us   = 0;
 };
@@ -155,6 +161,11 @@ private:
             s.n_blocks_used  = s.n_blocks_total - s.n_blocks_free;
             s.block_size     = alloc.block_size();
             s.n_pages_mapped = kvc->get_block_table().size();
+            const auto & cow = kvc->get_paged_cow_stats();
+            s.paged_cow_blocks    = cow.n_blocks;
+            s.paged_cow_bytes     = cow.n_bytes;
+            s.paged_cow_fallbacks = cow.n_copy_fallbacks;
+            s.paged_cow_copy_us   = cow.t_copy_us;
             if (s.n_blocks_total > 0) {
                 s.fragmentation = (float) s.n_blocks_free / (float) s.n_blocks_total;
             }
@@ -210,6 +221,7 @@ private:
             "│  pages  : %zu entries in block table\n"
             "│  reserv : %d blocks held by active requests\n"
             "│  frag   : %.1f%%  (free / total blocks)\n"
+            "│  cow    : %llu blocks, %.2f MiB, %.3f ms copy, %llu fallbacks\n"
             "│  slots  : %d active / %d total\n"
             "│  toks/s : %.1f  (prompt+decode)\n"
             "│  prefill: %.3f ms/tok   decode: %.3f ms/tok\n"
@@ -218,6 +230,10 @@ private:
             s.n_pages_mapped,
             s.n_reserved_blocks,
             s.fragmentation * 100.0f,
+            (unsigned long long) s.paged_cow_blocks,
+            (double) s.paged_cow_bytes / 1024.0 / 1024.0,
+            (double) s.paged_cow_copy_us / 1000.0,
+            (unsigned long long) s.paged_cow_fallbacks,
             s.n_active_slots, s.n_total_slots,
             s.tokens_per_sec,
             s.avg_prefill_ms, s.avg_decode_ms);

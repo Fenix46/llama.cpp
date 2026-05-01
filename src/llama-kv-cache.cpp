@@ -17,6 +17,8 @@ static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
 }
 
+extern "C" bool ggml_backend_buffer_copy_tensor(const ggml_tensor * src, ggml_tensor * dst);
+
 // orthonormal Walsh-Hadamard rotation matrix
 // note: res^2 == I
 static void ggml_gen_hadamard(ggml_tensor * tensor) {
@@ -72,13 +74,50 @@ static ggml_tensor * ggml_mul_mat_aux(
     return res;
 }
 
-static void ggml_backend_tensor_copy_view_1d(
+static bool ggml_backend_tensor_copy_fallback_report(const ggml_tensor * src, ggml_tensor * dst) {
+    GGML_ASSERT(src->type == dst->type);
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        GGML_ASSERT(src->ne[i] == dst->ne[i]);
+        GGML_ASSERT(src->nb[i] == dst->nb[i]);
+    }
+
+    if (src == dst) {
+        return false;
+    }
+
+    ggml_backend_buffer_t src_buf = src->view_src ? src->view_src->buffer : src->buffer;
+    ggml_backend_buffer_t dst_buf = dst->view_src ? dst->view_src->buffer : dst->buffer;
+
+    if (ggml_backend_buffer_is_host(src_buf)) {
+        ggml_backend_tensor_set(dst, src->data, 0, ggml_nbytes(src));
+        return false;
+    }
+
+    if (ggml_backend_buffer_is_host(dst_buf)) {
+        ggml_backend_tensor_get(src, dst->data, 0, ggml_nbytes(src));
+        return false;
+    }
+
+    if (ggml_backend_buffer_copy_tensor(src, dst)) {
+        return false;
+    }
+
+    const size_t nbytes = ggml_nbytes(src);
+    std::vector<uint8_t> data(nbytes);
+    ggml_backend_tensor_get(src, data.data(), 0, nbytes);
+    ggml_backend_tensor_set(dst, data.data(), 0, nbytes);
+
+    return true;
+}
+
+static bool ggml_backend_tensor_copy_view_1d(
         ggml_tensor * tensor,
              int64_t   ne0,
               size_t   src_offset,
-              size_t   dst_offset) {
+              size_t   dst_offset,
+            uint64_t & n_bytes) {
     if (ne0 == 0) {
-        return;
+        return false;
     }
 
     ggml_init_params params = {
@@ -92,18 +131,21 @@ static void ggml_backend_tensor_copy_view_1d(
     ggml_tensor * src = ggml_view_1d(ctx.get(), tensor, ne0, src_offset);
     ggml_tensor * dst = ggml_view_1d(ctx.get(), tensor, ne0, dst_offset);
 
-    ggml_backend_tensor_copy(src, dst);
+    n_bytes += ggml_nbytes(src);
+
+    return ggml_backend_tensor_copy_fallback_report(src, dst);
 }
 
-static void ggml_backend_tensor_copy_view_2d(
+static bool ggml_backend_tensor_copy_view_2d(
         ggml_tensor * tensor,
              int64_t   ne0,
              int64_t   ne1,
               size_t   nb1,
               size_t   src_offset,
-              size_t   dst_offset) {
+              size_t   dst_offset,
+            uint64_t & n_bytes) {
     if (ne0 == 0 || ne1 == 0) {
-        return;
+        return false;
     }
 
     ggml_init_params params = {
@@ -117,7 +159,9 @@ static void ggml_backend_tensor_copy_view_2d(
     ggml_tensor * src = ggml_view_2d(ctx.get(), tensor, ne0, ne1, nb1, src_offset);
     ggml_tensor * dst = ggml_view_2d(ctx.get(), tensor, ne0, ne1, nb1, dst_offset);
 
-    ggml_backend_tensor_copy(src, dst);
+    n_bytes += ggml_nbytes(src);
+
+    return ggml_backend_tensor_copy_fallback_report(src, dst);
 }
 
 //
@@ -587,17 +631,22 @@ void llama_kv_cache::paged_copy_block_data(uint32_t strm, uint32_t old_blk_id, u
     const auto & new_blk = alloc.get(new_blk_id);
     const uint32_t n_cells = std::min(old_blk.size, new_blk.size);
 
+    uint64_t n_bytes     = 0;
+    uint64_t n_fallbacks = 0;
+    const int64_t t_start_us = ggml_time_us();
+
     for (const auto & layer : layers) {
         const uint32_t il = layer.il;
 
         if (auto * k = layer.k_stream[strm]) {
-            ggml_backend_tensor_copy_view_2d(
+            n_fallbacks += ggml_backend_tensor_copy_view_2d(
                     k,
                     hparams.n_embd_k_gqa(il),
                     n_cells,
                     k->nb[1],
                     old_blk.first_cell*k->nb[1],
-                    new_blk.first_cell*k->nb[1]);
+                    new_blk.first_cell*k->nb[1],
+                    n_bytes) ? 1 : 0;
         }
 
         auto * v = layer.v_stream[strm];
@@ -607,23 +656,29 @@ void llama_kv_cache::paged_copy_block_data(uint32_t strm, uint32_t old_blk_id, u
 
         const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
         if (!v_trans) {
-            ggml_backend_tensor_copy_view_2d(
+            n_fallbacks += ggml_backend_tensor_copy_view_2d(
                     v,
                     n_embd_v_gqa,
                     n_cells,
                     v->nb[1],
                     old_blk.first_cell*v->nb[1],
-                    new_blk.first_cell*v->nb[1]);
+                    new_blk.first_cell*v->nb[1],
+                    n_bytes) ? 1 : 0;
         } else {
             const size_t v_size_el = ggml_type_size(v->type);
             const uint32_t kv_size = v_cells[strm].size();
             for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
                 const size_t src_offset = (old_blk.first_cell + j * kv_size) * v_size_el;
                 const size_t dst_offset = (new_blk.first_cell + j * kv_size) * v_size_el;
-                ggml_backend_tensor_copy_view_1d(v, n_cells, src_offset, dst_offset);
+                n_fallbacks += ggml_backend_tensor_copy_view_1d(v, n_cells, src_offset, dst_offset, n_bytes) ? 1 : 0;
             }
         }
     }
+
+    cow_stats.n_blocks++;
+    cow_stats.n_bytes          += n_bytes;
+    cow_stats.n_copy_fallbacks += n_fallbacks;
+    cow_stats.t_copy_us        += ggml_time_us() - t_start_us;
 }
 
 bool llama_kv_cache::paged_cow_block(uint32_t strm, llama_seq_id seq_id, uint32_t page, uint32_t old_blk_id, uint32_t new_blk_id, bool copy_data) {
@@ -1735,6 +1790,10 @@ const llama_kv_block_allocator & llama_kv_cache::get_block_alloc(uint32_t strm) 
 
 const llama_kv_block_table & llama_kv_cache::get_block_table() const {
     return block_table;
+}
+
+const llama_kv_cache::paged_cow_stats & llama_kv_cache::get_paged_cow_stats() const {
+    return cow_stats;
 }
 
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {

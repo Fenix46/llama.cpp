@@ -17,7 +17,7 @@ leasing a seq_id from `paged_seq_leases` without touching `slots`.
 Known remaining issues:
 - Paged prefill does not reuse KV prefix (n_past always 0 or simple match, no KV shift)
 - Paged prefill does not create/restore SWA checkpoints (crash risk on SWA models)
-- Copy-on-write uses backend-native tensor-copy views (Phase E); benchmark counters are still pending
+- Copy-on-write uses backend-native tensor-copy views and exposes block/byte/time/fallback counters in the KV block scheduler report
 - Paged prefill does not do KV shift / cache-reuse (n_past always 0 or simple prefix)
 - Paged prefill does not create/restore SWA checkpoints (crash risk on SWA models)
 - KV dashboard `slots: N` reads from `slots`, not `paged_requests`
@@ -222,6 +222,8 @@ Changes:
 Acceptance:
 - `test-paged-kv-cow` passes with both Flash Attention disabled and enabled.
 - `test-state-restore-fragmented` remains green.
+- `--kv-block-scheduler` reports cumulative CoW blocks, bytes, copy time, and
+  fallback copy count for fanout benchmarks.
 
 ## Phase F — True page-table-aware attention, after E
 
