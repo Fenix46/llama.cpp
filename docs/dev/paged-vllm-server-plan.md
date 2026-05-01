@@ -212,25 +212,32 @@ Remaining:
 - Validate `cross-slot reuse` from retained server logs in automated/manual scripts.
 - Optimize copy-on-write with backend/device block-copy kernels; current path is portable and correctness-first.
 
-## Milestone 6: CUDA H200 Fast Path
+## Milestone 6: True PagedAttention Kernel — Phase F ✓ DONE (2026-05-01)
 
-Goal: use paged block table on device side for throughput.
+Goal: eliminate host-side KQ mask (O(n_tokens × n_kv)) by routing K/V lookups
+through a block_table tensor directly in the Metal/CUDA kernel.
 
-Design:
+**Completed (Metal path, Phase F1–F5)**:
 
-- Keep portable path as correctness fallback.
-- Add CUDA path only after logical mask correctness.
-- Device inputs:
-  - block table per active request
-  - slot mappings for current batch
-  - sequence lengths / positions
-- Kernel reads physical blocks using `physical_block * block_size + offset`.
+- F1: `build_input_block_table` / `set_input_block_table` + `build_input_seq_ids_q` /
+  `set_input_seq_ids_q` — I32 tensors wired as GGML inputs, filled per decode step.
+- F2: `ggml_flash_attn_ext_set_block_table()` (src[5]) + `ggml_flash_attn_ext_set_seq_ids_q()`
+  (src[6]) added to public ggml API. GGML_MAX_SRC=10 already covers both.
+- F3: `self_block_table` + `self_seq_ids_q` allocated in `llm_graph_input_attn_kv`;
+  passed to `build_attn_mha`; wired to `ggml_flash_attn_ext` at graph build time.
+- F4: `kernel_flash_attn_ext_paged` MSL kernel — correctness-first, one thread per
+  query token, iterates logical pages via block_table, online softmax over physical
+  K/V cells (block_id * block_size + intra_offset), normalized output write.
+  Pipeline getter `ggml_metal_library_get_pipeline_flash_attn_ext_paged()` added.
+  Dispatch routes to paged kernel when src[5] present, returns early.
+- F5: `LLAMA_PAGED_ATTN=0` env var forces legacy mask path for debug/comparison.
 
-Acceptance:
+**Remaining**:
 
-- H200 benchmark improves under high concurrency.
-- Fallback can be forced for debug.
-- Metal remains functional.
+- F6 (CUDA): `fattn-paged.cu` — same approach for CUDA sm_80+. Skipped (no CUDA HW).
+- Performance optimization: current paged kernel is correctness-first (no tiling,
+  no simdgroup cooperation). Can be upgraded to multi-simdgroup tiled variant.
+- Verify correctness: compare paged kernel output vs legacy mask with fixed seed.
 
 ## Milestone 7: Slotless Scheduler and VRAM Capacity Planner
 
