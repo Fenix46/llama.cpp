@@ -187,7 +187,7 @@ static void ggml_cuda_flash_attn_ext_paged_f16_case(ggml_backend_cuda_context & 
         scale,
         Q->ne[1], Q->ne[2], Q->ne[3],
         Q->nb[1], Q->nb[2], Q->nb[3],
-        K->ne[1], K->ne[2], K->ne[3],
+        K->ne[0], K->ne[1], K->ne[2], K->ne[3],
         K->nb[1], K->nb[2], K->nb[3],
         V->nb[1], V->nb[2], V->nb[3],
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 1, mask ? mask->ne[3] : 1,
