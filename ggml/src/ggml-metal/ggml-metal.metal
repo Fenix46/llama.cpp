@@ -6637,16 +6637,18 @@ kernel void kernel_flash_attn_ext_paged(
         }
 
         float final_S = 0.0f;
-        for (int s = 0; s < nsg; ++s) {
-            if (shm_M[s] > -INFINITY) {
-                final_S += shm_S[s] * exp(shm_M[s] - final_M);
+        if (final_M > -INFINITY) {
+            for (int s = 0; s < nsg; ++s) {
+                if (shm_M[s] > -INFINITY) {
+                    final_S += shm_S[s] * exp(shm_M[s] - final_M);
+                }
             }
         }
 
         if (args.has_sinks) {
             const float sink = sinks[iq2];
             const float new_M = max(final_M, sink);
-            const float exp_scale = exp(final_M - new_M);
+            const float exp_scale = (final_M > -INFINITY) ? exp(final_M - new_M) : 0.0f;
             final_S = final_S * exp_scale + exp(sink - new_M);
             final_M = new_M;
         }
@@ -6656,11 +6658,13 @@ kernel void kernel_flash_attn_ext_paged(
             final_acc[i] = 0.0f;
         }
 
-        for (int s = 0; s < nsg; ++s) {
-            if (shm_M[s] > -INFINITY) {
-                const float s_scale = exp(shm_M[s] - final_M);
-                for (int i = 0; i < 20; ++i) {
-                    final_acc[i] += shm_acc[s * (32 * 20) + lane * 20 + i] * s_scale;
+        if (final_M > -INFINITY) {
+            for (int s = 0; s < nsg; ++s) {
+                if (shm_M[s] > -INFINITY) {
+                    const float s_scale = exp(shm_M[s] - final_M);
+                    for (int i = 0; i < 20; ++i) {
+                        final_acc[i] += shm_acc[s * (32 * 20) + lane * 20 + i] * s_scale;
+                    }
                 }
             }
         }

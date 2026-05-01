@@ -5410,6 +5410,16 @@ void ggml_flash_attn_ext_set_seq_ids_q(
     a->src[6] = seq_ids_q;
 }
 
+void ggml_flash_attn_ext_set_page_limits_q(
+        struct ggml_tensor * a,
+        struct ggml_tensor * page_limits_q) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    if (page_limits_q) {
+        GGML_ASSERT(page_limits_q->type == GGML_TYPE_I32);
+    }
+    a->src[7] = page_limits_q;
+}
+
 // ggml_flash_attn_back
 
 struct ggml_tensor * ggml_flash_attn_back(

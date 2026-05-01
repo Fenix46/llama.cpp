@@ -234,6 +234,9 @@ public:
     // Paged attention: seq_id per query token, I32 [n_tokens]. nullptr when not paged.
     ggml_tensor * build_input_seq_ids_q(ggml_context * ctx, const llama_ubatch & ubatch) const;
 
+    // Paged attention: exclusive logical page limit per query token, I32 [n_tokens].
+    ggml_tensor * build_input_page_limits_q(ggml_context * ctx, const llama_ubatch & ubatch) const;
+
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
 
@@ -244,6 +247,9 @@ public:
 
     // Paged attention: fill seq_ids_q tensor (one seq_id per query token).
     void set_input_seq_ids_q(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+
+    // Paged attention: fill page_limits_q tensor.
+    void set_input_page_limits_q(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
@@ -453,6 +459,9 @@ public:
     // Paged attention: seq_id per query token. Returns nullptr when not in paged mode.
     ggml_tensor * build_input_seq_ids_q(ggml_context * ctx, const llama_ubatch & ubatch) const;
 
+    // Paged attention: exclusive logical page limit per query token. Returns nullptr when not in paged mode.
+    ggml_tensor * build_input_page_limits_q(ggml_context * ctx, const llama_ubatch & ubatch) const;
+
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
@@ -461,6 +470,9 @@ public:
     void set_input_block_table(ggml_tensor * dst) const;
     // Paged attention: fill seq_ids_q tensor (one seq_id per query token).
     void set_input_seq_ids_q(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+
+    // Paged attention: fill page_limits_q tensor.
+    void set_input_page_limits_q(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 

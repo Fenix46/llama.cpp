@@ -22,11 +22,12 @@
 //   - block refcounts protect shared pages created by sequence copies; the
 //     write-side path performs copy-on-write before mutating shared pages.
 //
-// Intended Phase 2 integration points (for reference, not implemented here):
+// Integration points:
 //   - find_slot()          : replace ring-buffer scan with block_table lookup
 //   - apply_ubatch()       : allocate blocks, fill block_table entries
 //   - set_input_k_idxs()   : cell index = block.first_cell + intra_block_offset
 //   - set_input_kq_mask()  : iterate blocks rather than 0..n_kv
+//   - Metal FA             : gather K/V pages through block_table
 //   - seq_rm()             : free blocks when all cells in block become empty
 // =============================================================================
 
@@ -226,9 +227,8 @@ private:
 // For a sequence of length L with block size B:
 //   logical page p covers tokens [p*B, min((p+1)*B, L)).
 //
-// In Phase 1 this table is populated but not read by the decode path.
-// It exists to validate the mapping logic and will be wired into find_slot()
-// in Phase 2.
+// The Metal paged-attention path reads this table to gather K/V pages; other
+// decode paths may still use the flat cell indices as a fallback.
 //
 // Key type: packed uint64_t = (seq_id << 32) | logical_page.
 // This avoids std::pair hashing and keeps lookup cache-friendly.

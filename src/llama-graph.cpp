@@ -450,12 +450,16 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
 
     mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
 
-    if (self_block_table) {
+    if (self_block_table && self_block_table->buffer) {
         mctx->set_input_block_table(self_block_table);
     }
 
-    if (self_seq_ids_q) {
+    if (self_seq_ids_q && self_seq_ids_q->buffer) {
         mctx->set_input_seq_ids_q(self_seq_ids_q, ubatch);
+    }
+
+    if (self_page_limits_q && self_page_limits_q->buffer) {
+        mctx->set_input_page_limits_q(self_page_limits_q, ubatch);
     }
 
     if (self_k_rot) {
@@ -478,6 +482,8 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+    res &= !self_seq_ids_q     || self_seq_ids_q->ne[0]     == params.ubatch.n_tokens;
+    res &= !self_page_limits_q || self_page_limits_q->ne[0] == params.ubatch.n_tokens;
 
     return res;
 }
@@ -508,10 +514,30 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
 
     mctx->get_base()->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
 
+    if (self_block_table && self_block_table->buffer) {
+        mctx->get_base()->set_input_block_table(self_block_table);
+    }
+    if (self_seq_ids_q && self_seq_ids_q->buffer) {
+        mctx->get_base()->set_input_seq_ids_q(self_seq_ids_q, ubatch);
+    }
+    if (self_page_limits_q && self_page_limits_q->buffer) {
+        mctx->get_base()->set_input_page_limits_q(self_page_limits_q, ubatch);
+    }
+
     mctx->get_swa()->set_input_k_idxs(self_k_idxs_swa, ubatch);
     mctx->get_swa()->set_input_v_idxs(self_v_idxs_swa, ubatch);
 
     mctx->get_swa()->set_input_kq_mask(self_kq_mask_swa, ubatch, cparams.causal_attn);
+
+    if (self_block_table_swa && self_block_table_swa->buffer) {
+        mctx->get_swa()->set_input_block_table(self_block_table_swa);
+    }
+    if (self_seq_ids_q_swa && self_seq_ids_q_swa->buffer) {
+        mctx->get_swa()->set_input_seq_ids_q(self_seq_ids_q_swa, ubatch);
+    }
+    if (self_page_limits_q_swa && self_page_limits_q_swa->buffer) {
+        mctx->get_swa()->set_input_page_limits_q(self_page_limits_q_swa, ubatch);
+    }
 
     if (self_k_rot) {
         mctx->get_base()->set_input_k_rot(self_k_rot);
@@ -545,6 +571,11 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
 
     res &= can_reuse_kq_mask(self_kq_mask,     mctx->get_base(), params.ubatch, params.cparams);
     res &= can_reuse_kq_mask(self_kq_mask_swa, mctx->get_swa(),  params.ubatch, params.cparams);
+
+    res &= !self_seq_ids_q         || self_seq_ids_q->ne[0]         == params.ubatch.n_tokens;
+    res &= !self_page_limits_q     || self_page_limits_q->ne[0]     == params.ubatch.n_tokens;
+    res &= !self_seq_ids_q_swa     || self_seq_ids_q_swa->ne[0]     == params.ubatch.n_tokens;
+    res &= !self_page_limits_q_swa || self_page_limits_q_swa->ne[0] == params.ubatch.n_tokens;
 
     return res;
 }
@@ -584,6 +615,18 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
 
     mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
 
+    if (inp_attn->self_block_table && inp_attn->self_block_table->buffer) {
+        mctx->get_attn()->set_input_block_table(inp_attn->self_block_table);
+    }
+
+    if (inp_attn->self_seq_ids_q && inp_attn->self_seq_ids_q->buffer) {
+        mctx->get_attn()->set_input_seq_ids_q(inp_attn->self_seq_ids_q, ubatch);
+    }
+
+    if (inp_attn->self_page_limits_q && inp_attn->self_page_limits_q->buffer) {
+        mctx->get_attn()->set_input_page_limits_q(inp_attn->self_page_limits_q, ubatch);
+    }
+
     if (inp_attn->self_k_rot) {
         mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
     }
@@ -616,6 +659,8 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
   //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+    res &= !inp_attn->self_seq_ids_q     || inp_attn->self_seq_ids_q->ne[0]     == params.ubatch.n_tokens;
+    res &= !inp_attn->self_page_limits_q || inp_attn->self_page_limits_q->ne[0] == params.ubatch.n_tokens;
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -1948,7 +1993,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                float   kq_scale,
                  int   il,
          ggml_tensor * block_table,
-         ggml_tensor * seq_ids_q) const {
+         ggml_tensor * seq_ids_q,
+         ggml_tensor * page_limits_q) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -1992,6 +2038,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         if (seq_ids_q) {
             ggml_flash_attn_ext_set_seq_ids_q(cur, seq_ids_q);
+        }
+
+        if (page_limits_q) {
+            ggml_flash_attn_ext_set_page_limits_q(cur, page_limits_q);
         }
 
         if (v_mla) {
@@ -2176,6 +2226,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 
         inp->self_block_table = mctx_cur->build_input_block_table(ctx0);
         inp->self_seq_ids_q   = mctx_cur->build_input_seq_ids_q(ctx0, ubatch);
+        inp->self_page_limits_q = mctx_cur->build_input_page_limits_q(ctx0, ubatch);
     }
 
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
@@ -2240,7 +2291,8 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il, inp->get_block_table(), inp->get_seq_ids_q());
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il,
+            inp->get_block_table(), inp->get_seq_ids_q(), inp->get_page_limits_q());
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {
@@ -2415,11 +2467,16 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto & kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
 
+    ggml_tensor * block_table   = is_swa ? inp->get_block_table_swa()   : inp->get_block_table();
+    ggml_tensor * seq_ids_q     = is_swa ? inp->get_seq_ids_q_swa()     : inp->get_seq_ids_q();
+    ggml_tensor * page_limits_q = is_swa ? inp->get_page_limits_q_swa() : inp->get_page_limits_q();
+
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il,
+            block_table, seq_ids_q, page_limits_q);
     cb(cur, "kqv_out", il);
 
     if (v_rot) {
@@ -2511,6 +2568,10 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
 
         inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur->get_base(), ubatch, cparams);
         inp->self_kq_mask_cnv = cparams.flash_attn ? ggml_cast(ctx0, inp->self_kq_mask, GGML_TYPE_F16) : inp->self_kq_mask;
+
+        inp->self_block_table     = mctx_cur->get_base()->build_input_block_table(ctx0);
+        inp->self_seq_ids_q       = mctx_cur->get_base()->build_input_seq_ids_q(ctx0, ubatch);
+        inp->self_page_limits_q   = mctx_cur->get_base()->build_input_page_limits_q(ctx0, ubatch);
     }
 
     {
@@ -2521,6 +2582,10 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
 
         inp->self_kq_mask_swa = build_attn_inp_kq_mask(ctx0, mctx_cur->get_swa(), ubatch, cparams);
         inp->self_kq_mask_swa_cnv = cparams.flash_attn ? ggml_cast(ctx0, inp->self_kq_mask_swa, GGML_TYPE_F16) : inp->self_kq_mask_swa;
+
+        inp->self_block_table_swa     = mctx_cur->get_swa()->build_input_block_table(ctx0);
+        inp->self_seq_ids_q_swa       = mctx_cur->get_swa()->build_input_seq_ids_q(ctx0, ubatch);
+        inp->self_page_limits_q_swa   = mctx_cur->get_swa()->build_input_page_limits_q(ctx0, ubatch);
     }
 
     inp->self_k_rot = mctx_cur->get_base()->build_input_k_rot(ctx0);

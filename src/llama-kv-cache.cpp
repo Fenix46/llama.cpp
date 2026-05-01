@@ -2034,6 +2034,16 @@ ggml_tensor * llama_kv_cache::build_input_seq_ids_q(ggml_context * ctx, const ll
     return t;
 }
 
+ggml_tensor * llama_kv_cache::build_input_page_limits_q(ggml_context * ctx, const llama_ubatch & ubatch) const {
+    if (!paged) {
+        return nullptr;
+    }
+
+    ggml_tensor * t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, ubatch.n_tokens);
+    ggml_set_input(t);
+    return t;
+}
+
 void llama_kv_cache::set_input_seq_ids_q(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     if (!paged || !dst || !ubatch) {
         return;
@@ -2046,6 +2056,26 @@ void llama_kv_cache::set_input_seq_ids_q(ggml_tensor * dst, const llama_ubatch *
     int32_t * data = (int32_t *) dst->data;
     for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
         data[i] = (ubatch->n_seq_id[i] > 0) ? (int32_t) ubatch->seq_id[i][0] : 0;
+    }
+}
+
+void llama_kv_cache::set_input_page_limits_q(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    if (!paged || !dst || !ubatch) {
+        return;
+    }
+
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    GGML_ASSERT((int64_t) ubatch->n_tokens == dst->ne[0]);
+
+    int32_t * data = (int32_t *) dst->data;
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        // Per-query upper bound: only logical pages up to and including the page
+        // containing pos[i] can possibly hold causal KV cells for this query.
+        // Future pages (if allocated for later tokens in the same ubatch or for
+        // other sequences sharing the slab) must not be scanned: the mask covers
+        // them with -INF, but iterating still costs O(n_kv) and breaks tok/s.
+        data[i] = (int32_t) (llama_kv_block_table::logical_page(ubatch->pos[i], LLAMA_KV_BLOCK_SIZE_DEFAULT) + 1);
     }
 }
 
@@ -3371,6 +3401,14 @@ ggml_tensor * llama_kv_cache_context::build_input_seq_ids_q(ggml_context * ctx, 
 
 void llama_kv_cache_context::set_input_seq_ids_q(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     kv->set_input_seq_ids_q(dst, ubatch);
+}
+
+ggml_tensor * llama_kv_cache_context::build_input_page_limits_q(ggml_context * ctx, const llama_ubatch & ubatch) const {
+    return kv->build_input_page_limits_q(ctx, ubatch);
+}
+
+void llama_kv_cache_context::set_input_page_limits_q(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    kv->set_input_page_limits_q(dst, ubatch);
 }
 
 void llama_kv_cache_context::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {

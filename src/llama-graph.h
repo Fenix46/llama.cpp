@@ -303,6 +303,7 @@ public:
     ggml_tensor * get_kq_mask()     const { return self_kq_mask_cnv; }
     ggml_tensor * get_block_table() const { return self_block_table; }
     ggml_tensor * get_seq_ids_q()   const { return self_seq_ids_q; }
+    ggml_tensor * get_page_limits_q() const { return self_page_limits_q; }
 
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
@@ -315,6 +316,9 @@ public:
 
     // Paged attention: I32 [n_tokens]; seq_id per query token. null when not in paged mode.
     ggml_tensor * self_seq_ids_q = nullptr;
+
+    // Paged attention: I32 [n_tokens]; exclusive logical page limit per query token.
+    ggml_tensor * self_page_limits_q = nullptr;
 
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
@@ -386,6 +390,13 @@ public:
     ggml_tensor * get_kq_mask()     const { return self_kq_mask_cnv; }
     ggml_tensor * get_kq_mask_swa() const { return self_kq_mask_swa_cnv; }
 
+    ggml_tensor * get_block_table()         const { return self_block_table; }
+    ggml_tensor * get_seq_ids_q()           const { return self_seq_ids_q; }
+    ggml_tensor * get_page_limits_q()       const { return self_page_limits_q; }
+    ggml_tensor * get_block_table_swa()     const { return self_block_table_swa; }
+    ggml_tensor * get_seq_ids_q_swa()       const { return self_seq_ids_q_swa; }
+    ggml_tensor * get_page_limits_q_swa()   const { return self_page_limits_q_swa; }
+
     ggml_tensor * self_k_idxs     = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs     = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
     ggml_tensor * self_k_idxs_swa = nullptr; // I64 [n_batch]
@@ -395,6 +406,14 @@ public:
     ggml_tensor * self_kq_mask_cnv     = nullptr; //     [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_swa     = nullptr; // F32 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_swa_cnv = nullptr; //     [n_kv, n_batch/n_stream, 1, n_stream]
+
+    // Paged attention tensors per ISWA cache half (base + swa).
+    ggml_tensor * self_block_table       = nullptr;
+    ggml_tensor * self_seq_ids_q         = nullptr;
+    ggml_tensor * self_page_limits_q     = nullptr;
+    ggml_tensor * self_block_table_swa   = nullptr;
+    ggml_tensor * self_seq_ids_q_swa     = nullptr;
+    ggml_tensor * self_page_limits_q_swa = nullptr;
 
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;
@@ -911,7 +930,8 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il,
             ggml_tensor * block_table  = nullptr,  // I32 [max_pages, n_seqs]; paged attn only
-            ggml_tensor * seq_ids_q    = nullptr) const; // I32 [n_tokens]; seq_id per query token
+            ggml_tensor * seq_ids_q    = nullptr,  // I32 [n_tokens]; seq_id per query token
+            ggml_tensor * page_limits_q = nullptr) const; // I32 [n_tokens]; exclusive logical page limit
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

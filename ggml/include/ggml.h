@@ -2418,6 +2418,12 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * seq_ids_q);
 
+    // page_limits_q must be an I32 tensor of shape [n_tokens], one exclusive
+    // logical page limit per query token. Used with block_table for paged attention.
+    GGML_API void ggml_flash_attn_ext_set_page_limits_q(
+            struct ggml_tensor * a,
+            struct ggml_tensor * page_limits_q);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,
