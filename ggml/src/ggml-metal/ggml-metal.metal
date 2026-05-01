@@ -6867,6 +6867,212 @@ constant int32_t FC_flash_attn_ext_vec_ns20 [[function_constant(FC_FLASH_ATTN_EX
 constant int32_t FC_flash_attn_ext_vec_nsg  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 22)]];
 constant int32_t FC_flash_attn_ext_vec_nwg  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 23)]];
 
+kernel void kernel_flash_attn_ext_paged_vec_f16_dk64_dv64(
+        constant ggml_metal_kargs_flash_attn_ext_paged_vec & args,
+        device const float * q,
+        device const half  * k,
+        device const half  * v,
+        device const int   * block_table,
+        device const int   * seq_ids,
+        device const half  * mask,
+        device const int   * page_limits,
+        device       char  * dst,
+        threadgroup float  * shm [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr int DK = 64;
+    constexpr int DV = 64;
+    constexpr int C  = 32;
+
+#define NWG (FC_flash_attn_ext_vec_nwg)
+#define NSG (FC_flash_attn_ext_vec_nsg)
+
+    const int iwg  = tgpig[2] % NWG;
+    const int iq3  = tgpig[2] / NWG;
+    const int iq2  = tgpig[1];
+    const int iq1  = tgpig[0];
+    const int lane = tiisg;
+
+    if (iq1 >= args.ne01) {
+        return;
+    }
+
+    const int seq_id = seq_ids[iq1];
+    if (seq_id < 0 || seq_id >= args.n_seqs_bt) {
+        return;
+    }
+
+    threadgroup float * sq    = shm;
+    threadgroup float * shm_M = sq + DK;
+    threadgroup float * shm_S = shm_M + NSG;
+    threadgroup float * shm_O = shm_S + NSG;
+
+    device const float * q_head = q + (uint64_t) iq1 * (args.nb01 / sizeof(float))
+                                    + (uint64_t) iq2 * (args.nb02 / sizeof(float))
+                                    + (uint64_t) iq3 * (args.nb03 / sizeof(float));
+
+    if (sgitg == 0) {
+        for (int d = lane; d < DK; d += 32) {
+            sq[d] = q_head[d];
+        }
+    }
+
+    float O0 = 0.0f;
+    float O1 = 0.0f;
+    float M  = -FLT_MAX/2;
+    float S  = 0.0f;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int ikv2 = iq2 / (args.ne02 / args.ne_12_2);
+    const int ikv3 = iq3 / (args.ne03 / args.ne_12_3);
+
+    const uint64_t k_head_off = (uint64_t) ikv2 * (args.nb12 / sizeof(half)) + (uint64_t) ikv3 * (args.nb13 / sizeof(half));
+    const uint64_t v_head_off = (uint64_t) ikv2 * (args.nb22 / sizeof(half)) + (uint64_t) ikv3 * (args.nb23 / sizeof(half));
+
+    device const half * mask_row = (device const half *) ((device const char *) mask
+        + (uint64_t) iq1               * args.nb31
+        + (uint64_t) (iq2 % args.ne32) * args.nb32
+        + (uint64_t) (iq3 % args.ne33) * args.nb33);
+
+    const int page_begin = max(0, page_limits[iq1 * 2 + 0]);
+    const int page_end   = min(args.max_pages, page_limits[iq1 * 2 + 1]);
+    const int n_pages    = max(0, page_end - page_begin);
+    const int n_cells    = n_pages * args.block_size;
+
+    device const int * seq_block_table = block_table + (uint64_t) seq_id * args.max_pages;
+
+    for (int ic0 = iwg * NSG + sgitg; ; ic0 += NWG * NSG) {
+        const int rel_base = ic0 * C;
+        const int rel_cell = rel_base + lane;
+        if (rel_base >= n_cells) {
+            break;
+        }
+
+        float score = -MAXHALF;
+
+        if (rel_cell < n_cells) {
+            const int logical_cell = page_begin * args.block_size + rel_cell;
+            const int page         = logical_cell / args.block_size;
+            const int intra        = logical_cell - page * args.block_size;
+            const int blk_id       = seq_block_table[page];
+
+            if (blk_id >= 0) {
+                const uint64_t cell = (uint64_t) blk_id * args.block_size + intra;
+                if (cell < (uint64_t) args.ne11) {
+                    const float mask_val = float(mask_row[cell]);
+                    if (mask_val > -MAXHALF/2) {
+                        device const half * k_cell = k + cell * (args.nb11 / sizeof(half)) + k_head_off;
+
+                        float qk = 0.0f;
+                        for (int d = 0; d < DK; ++d) {
+                            qk += sq[d] * float(k_cell[d]);
+                        }
+
+                        score = fma(qk, args.scale, mask_val);
+                    }
+                }
+            }
+        }
+
+        const float cM = simd_max(score);
+        if (cM <= -MAXHALF/2) {
+            continue;
+        }
+
+        const float M_new = max(M, cM);
+        const float ms = exp(M - M_new);
+        const float ps = exp(score - M_new);
+
+        O0 *= ms;
+        O1 *= ms;
+        S = S * ms + simd_sum(ps);
+        M = M_new;
+
+        for (int c = 0; c < C; ++c) {
+            const float w = simd_shuffle(ps, c);
+            if (w == 0.0f) {
+                continue;
+            }
+
+            const int rel_cell_c     = rel_base + c;
+            if (rel_cell_c >= n_cells) {
+                continue;
+            }
+
+            const int logical_cell_c = page_begin * args.block_size + rel_cell_c;
+            const int page_c         = logical_cell_c / args.block_size;
+            const int intra_c        = logical_cell_c - page_c * args.block_size;
+            const int blk_id_c       = page_c < page_end ? seq_block_table[page_c] : -1;
+
+            if (blk_id_c < 0) {
+                continue;
+            }
+
+            const uint64_t cell_c = (uint64_t) blk_id_c * args.block_size + intra_c;
+            if (cell_c >= (uint64_t) args.ne11) {
+                continue;
+            }
+
+            device const half * v_cell = v + cell_c * (args.nb21 / sizeof(half)) + v_head_off;
+            O0 += w * float(v_cell[lane]);
+            O1 += w * float(v_cell[lane + 32]);
+        }
+    }
+
+    if (lane == 0) {
+        shm_M[sgitg] = M;
+        shm_S[sgitg] = S;
+    }
+    shm_O[sgitg * DV + lane]      = O0;
+    shm_O[sgitg * DV + lane + 32] = O1;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sgitg == 0) {
+        float final_M = -FLT_MAX/2;
+        for (int s = 0; s < NSG; ++s) {
+            final_M = max(final_M, shm_M[s]);
+        }
+
+        float final_S = 0.0f;
+        for (int s = 0; s < NSG; ++s) {
+            final_S += shm_S[s] * exp(shm_M[s] - final_M);
+        }
+
+        const int64_t nrows = args.ne3 * args.ne2 * args.ne1;
+        const int64_t rid   = (int64_t) iq3 * args.ne2 * args.ne1 + iq2 + (int64_t) iq1 * args.ne1;
+
+        device float4 * dst4 = (device float4 *) dst;
+        device float  * dst1 = (device float  *) dst + nrows * DV * NWG;
+
+        const float norm = NWG == 1 && final_S > 0.0f ? 1.0f / final_S : 1.0f;
+
+        for (int i = lane; i < DV/4; i += 32) {
+            float4 out = 0.0f;
+
+            for (int s = 0; s < NSG; ++s) {
+                const float ws = exp(shm_M[s] - final_M);
+                out[0] += shm_O[s * DV + 4 * i + 0] * ws;
+                out[1] += shm_O[s * DV + 4 * i + 1] * ws;
+                out[2] += shm_O[s * DV + 4 * i + 2] * ws;
+                out[3] += shm_O[s * DV + 4 * i + 3] * ws;
+            }
+
+            dst4[rid * (DV/4) * NWG + NWG * i + iwg] = out * norm;
+        }
+
+        if (NWG > 1 && lane == 0) {
+            dst1[rid * (2 * NWG) + 2 * iwg + 0] = final_S;
+            dst1[rid * (2 * NWG) + 2 * iwg + 1] = final_M;
+        }
+    }
+
+#undef NWG
+#undef NSG
+}
+
 template<
     typename q4_t,  // query types in shared memory
     typename k4_t,  // key types in shared memory

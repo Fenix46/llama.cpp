@@ -1506,6 +1506,35 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_p
     GGML_UNUSED(op);
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_paged_vec(
+        ggml_metal_library_t lib,
+        const ggml_tensor * op,
+        int32_t nsg,
+        int32_t nwg) {
+    assert(op->op == GGML_OP_FLASH_ATTN_EXT);
+
+    char name[256];
+    snprintf(name, 256, "kernel_flash_attn_ext_paged_vec_f16_dk64_dv64_nsg=%d_nwg=%d", nsg, nwg);
+
+    static const char * base = "kernel_flash_attn_ext_paged_vec_f16_dk64_dv64";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+
+        ggml_metal_cv_set_int32(cv, nsg, FC_FLASH_ATTN_EXT_VEC + 22);
+        ggml_metal_cv_set_int32(cv, nwg, FC_FLASH_ATTN_EXT_VEC + 23);
+
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+        ggml_metal_cv_free(cv);
+    }
+
+    return res;
+
+    GGML_UNUSED(op);
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_bin(ggml_metal_library_t lib, const ggml_tensor * op, int32_t n_fuse) {
     char base[256];
     char name[256];

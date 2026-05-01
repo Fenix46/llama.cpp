@@ -206,6 +206,12 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
         ggml_metal_library_t lib,
         const struct ggml_tensor * op);
 
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_paged_vec(
+        ggml_metal_library_t lib,
+        const struct ggml_tensor * op,
+        int32_t nsg,
+        int32_t nwg);
+
 // MTLResidencySet wrapper
 
 typedef void * ggml_metal_rset_t;

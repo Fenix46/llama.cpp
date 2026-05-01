@@ -2727,6 +2727,85 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         const int32_t max_pages    = (int32_t) op->src[5]->ne[0];
         const int32_t n_seqs_bt    = (int32_t) op->src[5]->ne[1];
 
+        const bool use_paged_vec = ggml_metal_op_flash_attn_ext_use_vec(op) &&
+                                   has_mask && !has_sinks && !has_bias && !has_scap &&
+                                   ne00 == 64 && ne20 == 64;
+
+        if (use_paged_vec) {
+            const int32_t nsg = 4;
+            const int32_t nwg = 32;
+
+            ggml_metal_kargs_flash_attn_ext_paged_vec args_paged_vec = {
+                /*.ne01          =*/ ne01,
+                /*.ne02          =*/ ne02,
+                /*.ne03          =*/ ne03,
+                /*.nb01          =*/ nb01,
+                /*.nb02          =*/ nb02,
+                /*.nb03          =*/ nb03,
+                /*.ne11          =*/ ne11,
+                /*.ne_12_2       =*/ ne12,
+                /*.ne_12_3       =*/ ne13,
+                /*.nb11          =*/ nb11,
+                /*.nb12          =*/ nb12,
+                /*.nb13          =*/ nb13,
+                /*.nb21          =*/ nb21,
+                /*.nb22          =*/ nb22,
+                /*.nb23          =*/ nb23,
+                /*.ne31          =*/ ne31,
+                /*.ne32          =*/ ne32,
+                /*.ne33          =*/ ne33,
+                /*.nb31          =*/ nb31,
+                /*.nb32          =*/ nb32,
+                /*.nb33          =*/ nb33,
+                /*.ne1           =*/ ne1,
+                /*.ne2           =*/ ne2,
+                /*.ne3           =*/ ne3,
+                /*.scale         =*/ scale,
+                /*.block_size    =*/ block_size,
+                /*.max_pages     =*/ max_pages,
+                /*.n_seqs_bt     =*/ n_seqs_bt,
+            };
+
+            auto pipeline_paged_vec = ggml_metal_library_get_pipeline_flash_attn_ext_paged_vec(lib, op, nsg, nwg);
+
+            GGML_ASSERT(nsg*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline_paged_vec));
+            GGML_ASSERT(ggml_metal_op_flash_attn_ext_extra_tmp(op) != 0);
+
+            ggml_metal_encoder_set_pipeline(enc, pipeline_paged_vec);
+            ggml_metal_encoder_set_bytes  (enc, &args_paged_vec, sizeof(args_paged_vec), 0);
+            ggml_metal_encoder_set_buffer (enc, bid_src0, 1); // Q
+            ggml_metal_encoder_set_buffer (enc, bid_src1, 2); // K slab
+            ggml_metal_encoder_set_buffer (enc, bid_src2, 3); // V slab
+            ggml_metal_encoder_set_buffer (enc, bid_src5, 4); // block_table
+            ggml_metal_encoder_set_buffer (enc, bid_src6, 5); // seq_ids_q
+            ggml_metal_encoder_set_buffer (enc, bid_src3, 6); // KQ mask
+            ggml_metal_encoder_set_buffer (enc, bid_src7, 7); // page_limits_q
+            ggml_metal_encoder_set_buffer (enc, bid_tmp,  8); // partial output
+
+            const size_t smem = (64 + 2*nsg + 64*nsg) * sizeof(float);
+            GGML_ASSERT(smem <= props_dev->max_theadgroup_memory_size);
+
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
+            ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03*nwg, 32, nsg, 1);
+
+            ggml_metal_op_concurrency_reset(ctx);
+
+            ggml_metal_kargs_flash_attn_ext_vec_reduce args_reduce = {
+                /*.nrows =*/ ne1*ne2*ne3,
+            };
+
+            auto pipeline_reduce = ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(lib, op, ne20, nwg);
+
+            ggml_metal_encoder_set_pipeline(enc, pipeline_reduce);
+            ggml_metal_encoder_set_bytes  (enc, &args_reduce, sizeof(args_reduce), 0);
+            ggml_metal_encoder_set_buffer (enc, bid_tmp, 1);
+            ggml_metal_encoder_set_buffer (enc, bid_dst, 2);
+
+            ggml_metal_encoder_dispatch_threadgroups(enc, ne1*ne2*ne3, 1, 1, 32*nwg, 1, 1);
+
+            return 1;
+        }
+
         ggml_metal_kargs_flash_attn_ext_paged args_paged = {
             /*.ne00          =*/ ne00,
             /*.ne01          =*/ ne01,
