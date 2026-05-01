@@ -19,7 +19,7 @@ static __global__ void flash_attn_ext_paged_f16(
         const float scale,
         const int32_t ne01, const int32_t ne02, const int32_t ne03,
         const int64_t nb01, const int64_t nb02, const int64_t nb03,
-        const int32_t ne11, const int32_t ne12, const int32_t ne13,
+        const int32_t ne10, const int32_t ne11, const int32_t ne12, const int32_t ne13,
         const int64_t nb11, const int64_t nb12, const int64_t nb13,
         const int64_t nb21, const int64_t nb22, const int64_t nb23,
         const int32_t ne31, const int32_t ne32, const int32_t ne33,
@@ -62,9 +62,10 @@ static __global__ void flash_attn_ext_paged_f16(
     }
     __syncthreads();
 
-    const int gqa_ratio = ne02 / ne12;
+    const int n_heads_kv = ne10 / D;
+    const int gqa_ratio = ne02 / n_heads_kv;
     const int ikv2 = iq2 / gqa_ratio;
-    const int ikv3 = iq3 / (ne03 / ne13);
+    const int ikv3 = iq3 / (ne03 / ne12);
 
     const int page_begin = max(0, page_limits[iq0 * 2 + 0]);
     const int page_end   = min(max_pages, page_limits[iq0 * 2 + 1]);
@@ -84,7 +85,7 @@ static __global__ void flash_attn_ext_paged_f16(
             continue;
         }
 
-        const int64_t first_cell = (int64_t) blk_id * block_size;
+        const int64_t first_cell = (int64_t) blk_id * (int64_t) block_size;
 
         for (int cell_off = 0; cell_off < block_size; ++cell_off) {
             const int64_t cell = first_cell + cell_off;
@@ -103,9 +104,9 @@ static __global__ void flash_attn_ext_paged_f16(
             }
 
             const half * K_cell = (const half *) ((const char *) K
-                + cell           * nb11
-                + (int64_t) ikv2 * nb12
-                + (int64_t) ikv3 * nb13);
+                + (int64_t) cell * nb11
+                + (int64_t) ikv2 * D * sizeof(half)
+                + (int64_t) ikv3 * nb12);
 
             if (tid < D) {
                 qk_part = q_sh[tid] * __half2float(K_cell[tid]);
@@ -135,9 +136,9 @@ static __global__ void flash_attn_ext_paged_f16(
 
             if (tid < D) {
                 const half * V_cell = (const half *) ((const char *) V
-                    + cell           * nb21
-                    + (int64_t) ikv2 * nb22
-                    + (int64_t) ikv3 * nb23);
+                    + (int64_t) cell * nb21
+                    + (int64_t) ikv2 * D * sizeof(half)
+                    + (int64_t) ikv3 * nb22);
                 acc = acc * red[0] + red[1] * __half2float(V_cell[tid]);
             }
             __syncthreads();
@@ -145,7 +146,7 @@ static __global__ void flash_attn_ext_paged_f16(
     }
 
     if (tid < D) {
-        const int64_t row = ((int64_t) iq3 * ne2 * ne1) + (int64_t) iq0 * ne1 + iq2;
+        const int64_t row = ((int64_t) iq3 * ne2 * ne1) + (int64_t) iq2 * ne1 + iq0;
         dst[row * D + tid] = S_sh > 0.0f ? acc / S_sh : 0.0f;
     }
 #else
@@ -170,7 +171,7 @@ static void ggml_cuda_flash_attn_ext_paged_f16_case(ggml_backend_cuda_context & 
     float scale = 1.0f;
     memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
 
-    constexpr int nthreads = 128;
+    constexpr int nthreads = 256;
     const dim3 blocks_num((uint32_t) Q->ne[1], (uint32_t) Q->ne[2], (uint32_t) Q->ne[3]);
     const dim3 block_dim(nthreads, 1, 1);
 
@@ -222,7 +223,7 @@ static bool ggml_cuda_flash_attn_ext_paged_supported(const ggml_tensor * dst) {
            V->type == GGML_TYPE_F16 &&
            dst->type == GGML_TYPE_F32 &&
            mask && mask->type == GGML_TYPE_F16 &&
-           (Q->ne[0] == 64 || Q->ne[0] == 128) &&
+           (Q->ne[0] == 64 || Q->ne[0] == 128 || Q->ne[0] == 256) &&
            K->ne[0] == Q->ne[0] &&
            V->ne[0] == Q->ne[0] &&
            K->ne[2] > 0 &&
@@ -236,9 +237,9 @@ static bool ggml_cuda_flash_attn_ext_paged_supported(const ggml_tensor * dst) {
            block_tbl->ne[0] > 0 &&
            block_tbl->ne[1] > 0 &&
            seq_ids && seq_ids->type == GGML_TYPE_I32 &&
-           seq_ids->ne[0] >= Q->ne[1] &&
+           ggml_nelements(seq_ids) >= Q->ne[1] &&
            page_lims && page_lims->type == GGML_TYPE_I32 &&
-           page_lims->ne[0] >= 2 * Q->ne[1] &&
+           ggml_nelements(page_lims) >= 2 * Q->ne[1] &&
            sinks == nullptr &&
            max_bias == 0.0f &&
            logit_softcap == 0.0f;
@@ -251,6 +252,9 @@ static void ggml_cuda_flash_attn_ext_paged(ggml_backend_cuda_context & ctx, ggml
             break;
         case 128:
             ggml_cuda_flash_attn_ext_paged_f16_case<128>(ctx, dst);
+            break;
+        case 256:
+            ggml_cuda_flash_attn_ext_paged_f16_case<256>(ctx, dst);
             break;
         default:
             GGML_ABORT("fatal error");
