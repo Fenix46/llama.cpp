@@ -225,6 +225,41 @@ Acceptance:
 - `--kv-block-scheduler` reports cumulative CoW blocks, bytes, copy time, and
   fallback copy count for fanout benchmarks.
 
+### E3 — Paged long-prompt chunked prefill
+
+Files: `tools/server/server-context.cpp`, `common/arg.cpp`
+
+Problem:
+- In paged scheduler mode a prompt larger than `n_batch` can leave the request
+  active while adding zero tokens to the batch.
+- Example observed on H200: `task.n_tokens=14055`, default `n_batch=2048`,
+  `--max-model-len 65536`. The paged branch skipped the request because the
+  whole prompt did not fit, emitted repeated `[paged] no tokens to decode`, and
+  hit the empty-batch abort.
+
+Changes:
+- Remove the paged-only whole-prompt fit gate:
+  `batch.n_tokens + req.task->n_tokens() > n_batch`.
+- Always allow prompt prefill to advance in chunks up to the remaining
+  `prefill_budget`, just like the slot path does.
+- Keep decode tokens prioritized before prefill tokens.
+- When no tokens can be batched for an active paged request, return a useful
+  request/server error instead of reaching the generic empty-batch abort.
+- Improve `--max-num-batched-tokens auto` for paged mode. Do not blindly set
+  `n_batch` equal to `max_model_len` or `ctx`: that can create huge compute
+  buffers for 64k-262k contexts. Prefer a bounded heuristic based on available
+  device memory and `max_model_len`, with logs explaining the chosen value.
+
+Acceptance:
+- A paged request with prompt length `> n_batch` progresses across multiple
+  prefill iterations and reaches `prompt done`.
+- Reproduce with a 14k-token prompt, `--max-model-len 65536`, default or small
+  `--max-num-batched-tokens`, and verify no empty-batch abort.
+- Re-test with `--paged-admission actual-len`, `--kv-prefix-cache`, and
+  `--kv-block-scheduler` enabled on CUDA/H200.
+- Verify that increasing `--max-num-batched-tokens` still improves prefill
+  throughput without changing correctness.
+
 ## Phase F — True page-table-aware attention, after E
 
 **Goal**: add an experimental PagedAttention path only after CoW is stable.
@@ -256,6 +291,7 @@ Changes:
 | E0 — CoW planning | Medium | Correctness: reversible prepare | 5 |
 | E1 — native GGML block copy | Medium | Removes host round-trip from CoW | 6 |
 | E2 — Metal/CUDA view copy | High | Performance on Apple Silicon/CUDA | 7 |
+| E3 — paged long-prompt chunked prefill | Medium | Fixes prompt > n_batch aborts | 8 |
 | F — PagedAttention kernels | High | Attention kernel scalability | after E |
 
 ---
