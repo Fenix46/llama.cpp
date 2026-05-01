@@ -149,7 +149,8 @@ static __global__ void flash_attn_ext_paged_f16(
     }
 
     if (tid < D) {
-        const int64_t row = ((int64_t) iq3 * ne2 * ne1) + (int64_t) iq2 * ne1 + iq0;
+        // dst layout matches Metal paged kernel: row = iq3*ne2*ne1 + iq0*ne1 + iq2
+        const int64_t row = ((int64_t) iq3 * ne2 * ne1) + (int64_t) iq0 * ne1 + iq2;
         dst[row * D + tid] = S_sh > 0.0f ? acc / S_sh : 0.0f;
     }
 #else
