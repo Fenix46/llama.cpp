@@ -2704,22 +2704,31 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 
     // Paged attention: if block_table (src[5]) is set and LLAMA_PAGED_ATTN != "0",
     // dispatch paged kernel and return early. Set LLAMA_PAGED_ATTN=0 to force legacy path.
+    // The paged kernel currently handles contiguous F16 KV cache with V head
+    // dim <= 576; other layouts/types use the typed legacy kernels.
     static const bool paged_attn_enabled = []() {
         const char * env = getenv("LLAMA_PAGED_ATTN");
         return env == nullptr || env[0] != '0';
     }();
-    const bool has_block_table = (op->src[5] != nullptr) && paged_attn_enabled;
+    const bool paged_kv_contiguous = nb10 == ggml_type_size(GGML_TYPE_F16) && nb20 == ggml_type_size(GGML_TYPE_F16);
+    const bool paged_v_dim_ok      = ne20 <= 18*32; // one 32-lane simdgroup, 18 accumulator slots per lane
+    const bool has_block_table     = op->src[5] != nullptr && paged_attn_enabled &&
+                                     op->src[1]->type == GGML_TYPE_F16 &&
+                                     paged_kv_contiguous && paged_v_dim_ok;
     if (has_block_table) {
         GGML_ASSERT(op->src[6] != nullptr && "seq_ids_q (src[6]) required with block_table (src[5])");
+        GGML_ASSERT(op->src[7] != nullptr && "page_limits_q (src[7]) required with block_table (src[5])");
 
         ggml_metal_buffer_id bid_src5 = ggml_metal_get_buffer_id(op->src[5]); // block_table
         ggml_metal_buffer_id bid_src6 = ggml_metal_get_buffer_id(op->src[6]); // seq_ids_q
+        ggml_metal_buffer_id bid_src7 = ggml_metal_get_buffer_id(op->src[7]); // page_limits_q
 
         const int32_t block_size   = 16; // LLAMA_KV_BLOCK_SIZE_DEFAULT
         const int32_t max_pages    = (int32_t) op->src[5]->ne[0];
         const int32_t n_seqs_bt    = (int32_t) op->src[5]->ne[1];
 
         ggml_metal_kargs_flash_attn_ext_paged args_paged = {
+            /*.ne00          =*/ ne00,
             /*.ne01          =*/ ne01,
             /*.ne02          =*/ ne02,
             /*.ne03          =*/ ne03,
@@ -2729,14 +2738,19 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             /*.ne11          =*/ ne11,
             /*.ne_12_2       =*/ ne12,
             /*.ne_12_3       =*/ ne13,
-            /*.ns10          =*/ int32_t(nb11/nb10),
             /*.nb11          =*/ nb11,
             /*.nb12          =*/ nb12,
             /*.nb13          =*/ nb13,
-            /*.ns20          =*/ int32_t(nb21/nb20),
+            /*.ne20          =*/ ne20,
             /*.nb21          =*/ nb21,
             /*.nb22          =*/ nb22,
             /*.nb23          =*/ nb23,
+            /*.ne31          =*/ ne31,
+            /*.ne32          =*/ ne32,
+            /*.ne33          =*/ ne33,
+            /*.nb31          =*/ nb31,
+            /*.nb32          =*/ nb32,
+            /*.nb33          =*/ nb33,
             /*.ne1           =*/ ne1,
             /*.ne2           =*/ ne2,
             /*.ne3           =*/ ne3,
@@ -2749,6 +2763,8 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             /*.block_size    =*/ block_size,
             /*.max_pages     =*/ max_pages,
             /*.n_seqs_bt     =*/ n_seqs_bt,
+            /*.has_mask      =*/ has_mask ? 1 : 0,
+            /*.has_sinks     =*/ has_sinks ? 1 : 0,
         };
 
         auto pipeline_paged = ggml_metal_library_get_pipeline_flash_attn_ext_paged(lib, op);
@@ -2760,10 +2776,16 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer (enc, bid_src2, 3); // V slab
         ggml_metal_encoder_set_buffer (enc, bid_src5, 4); // block_table
         ggml_metal_encoder_set_buffer (enc, bid_src6, 5); // seq_ids_q
-        ggml_metal_encoder_set_buffer (enc, bid_dst,  6); // output
+        ggml_metal_encoder_set_buffer (enc, bid_src3, 6); // KQ mask
+        ggml_metal_encoder_set_buffer (enc, bid_src7, 7); // page_limits_q
+        ggml_metal_encoder_set_buffer (enc, bid_src4, 8); // sinks
+        ggml_metal_encoder_set_buffer (enc, bid_dst,  9); // output
 
-        // One thread per query token; grid = (ne01, ne02, ne03)
-        ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, 1, 1, 1);
+        // Eight simdgroups per query token/head/stream to parallelize KV cache scan.
+        const int32_t nsg_paged = 8;
+        const size_t  shm_paged = (2 + 32 * 20) * nsg_paged * sizeof(float);
+        ggml_metal_encoder_set_threadgroup_memory_size(enc, shm_paged, 0);
+        ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, 32, nsg_paged, 1);
 
         return 1;
     }
