@@ -62,10 +62,10 @@ static __global__ void flash_attn_ext_paged_f16(
     }
     __syncthreads();
 
-    const int n_heads_kv = ne10 / D;
-    const int gqa_ratio = ne02 / n_heads_kv;
-    const int ikv2 = iq2 / gqa_ratio;
-    const int ikv3 = iq3 / (ne03 / ne12);
+    const int gqa_ratio_2 = ne02 / ne12;
+    const int gqa_ratio_3 = ne03 / ne13;
+    const int ikv2 = iq2 / gqa_ratio_2;
+    const int ikv3 = iq3 / gqa_ratio_3;
 
     const int page_begin = max(0, page_limits[iq0 * 2 + 0]);
     const int page_end   = min(max_pages, page_limits[iq0 * 2 + 1]);
@@ -76,6 +76,9 @@ static __global__ void flash_attn_ext_paged_f16(
         + (int64_t) iq0            * nb31
         + (int64_t) (iq2 % ne32)   * nb32
         + (int64_t) (iq3 % ne33)   * nb33) : nullptr;
+
+    const int64_t k_head_off = (int64_t) ikv2 * nb12 + (int64_t) ikv3 * nb13;
+    const int64_t v_head_off = (int64_t) ikv2 * nb22 + (int64_t) ikv3 * nb23;
 
     float acc = 0.0f;
 
@@ -93,7 +96,6 @@ static __global__ void flash_attn_ext_paged_f16(
                 break;
             }
 
-            float qk_part = 0.0f;
             float mask_val = 0.0f;
 
             if (mask_row) {
@@ -105,12 +107,9 @@ static __global__ void flash_attn_ext_paged_f16(
 
             const half * K_cell = (const half *) ((const char *) K
                 + (int64_t) cell * nb11
-                + (int64_t) ikv2 * D * sizeof(half)
-                + (int64_t) ikv3 * nb12);
+                + k_head_off);
 
-            if (tid < D) {
-                qk_part = q_sh[tid] * __half2float(K_cell[tid]);
-            }
+            const float qk_part = (tid < D) ? q_sh[tid] * __half2float(K_cell[tid]) : 0.0f;
 
             red[tid] = qk_part;
             __syncthreads();
@@ -122,8 +121,10 @@ static __global__ void flash_attn_ext_paged_f16(
                 __syncthreads();
             }
 
+            const float qk_sum = red[0];
+
             if (tid == 0) {
-                const float qk = red[0] * scale + mask_val;
+                const float qk = qk_sum * scale + mask_val;
                 const float M_new = max(M_sh, qk);
                 const float exp_scale = expf(M_sh - M_new);
                 const float exp_qk    = expf(qk   - M_new);
@@ -134,12 +135,14 @@ static __global__ void flash_attn_ext_paged_f16(
             }
             __syncthreads();
 
+            const float exp_scale = red[0];
+            const float exp_qk    = red[1];
+
             if (tid < D) {
                 const half * V_cell = (const half *) ((const char *) V
                     + (int64_t) cell * nb21
-                    + (int64_t) ikv2 * D * sizeof(half)
-                    + (int64_t) ikv3 * nb22);
-                acc = acc * red[0] + red[1] * __half2float(V_cell[tid]);
+                    + v_head_off);
+                acc = acc * exp_scale + exp_qk * __half2float(V_cell[tid]);
             }
             __syncthreads();
         }
@@ -151,7 +154,7 @@ static __global__ void flash_attn_ext_paged_f16(
     }
 #else
     GGML_UNUSED_VARS(Q, K, V, mask, block_table, seq_ids, page_limits, dst, scale,
-        ne01, ne02, ne03, nb01, nb02, nb03, ne11, ne12, ne13, nb11, nb12, nb13,
+        ne01, ne02, ne03, nb01, nb02, nb03, ne10, ne11, ne12, ne13, nb11, nb12, nb13,
         nb21, nb22, nb23, ne31, ne32, ne33, nb31, nb32, nb33, ne1, ne2,
         block_size, max_pages, n_seqs_bt);
     NO_DEVICE_CODE;
