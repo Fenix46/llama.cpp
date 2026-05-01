@@ -6,6 +6,257 @@
 #include "fattn-wmma-f16.cuh"
 #include "fattn.cuh"
 
+template <int D, int nthreads>
+static __global__ void flash_attn_ext_paged_f16(
+        const float * __restrict__ Q,
+        const half  * __restrict__ K,
+        const half  * __restrict__ V,
+        const half  * __restrict__ mask,
+        const int   * __restrict__ block_table,
+        const int   * __restrict__ seq_ids,
+        const int   * __restrict__ page_limits,
+              float * __restrict__ dst,
+        const float scale,
+        const int32_t ne01, const int32_t ne02, const int32_t ne03,
+        const int64_t nb01, const int64_t nb02, const int64_t nb03,
+        const int32_t ne11, const int32_t ne12, const int32_t ne13,
+        const int64_t nb11, const int64_t nb12, const int64_t nb13,
+        const int64_t nb21, const int64_t nb22, const int64_t nb23,
+        const int32_t ne31, const int32_t ne32, const int32_t ne33,
+        const int64_t nb31, const int64_t nb32, const int64_t nb33,
+        const int32_t ne1,  const int32_t ne2,
+        const int32_t block_size,
+        const int32_t max_pages,
+        const int32_t n_seqs_bt) {
+#if defined(FLASH_ATTN_AVAILABLE)
+    const int iq0 = blockIdx.x;
+    const int iq2 = blockIdx.y;
+    const int iq3 = blockIdx.z;
+    const int tid = threadIdx.x;
+
+    if (iq0 >= ne01) {
+        return;
+    }
+
+    const int seq_id = seq_ids[iq0];
+    if (seq_id < 0 || seq_id >= n_seqs_bt) {
+        return;
+    }
+
+    __shared__ float q_sh[D];
+    __shared__ float red[nthreads];
+    __shared__ float M_sh;
+    __shared__ float S_sh;
+
+    const float * Q_head = (const float *) ((const char *) Q
+        + (int64_t) iq0 * nb01
+        + (int64_t) iq2 * nb02
+        + (int64_t) iq3 * nb03);
+
+    if (tid < D) {
+        q_sh[tid] = Q_head[tid];
+    }
+    if (tid == 0) {
+        M_sh = -FLT_MAX/2.0f;
+        S_sh = 0.0f;
+    }
+    __syncthreads();
+
+    const int gqa_ratio = ne02 / ne12;
+    const int ikv2 = iq2 / gqa_ratio;
+    const int ikv3 = iq3 / (ne03 / ne13);
+
+    const int page_begin = max(0, page_limits[iq0 * 2 + 0]);
+    const int page_end   = min(max_pages, page_limits[iq0 * 2 + 1]);
+
+    const int * seq_block_table = block_table + (int64_t) seq_id * max_pages;
+
+    const half * mask_row = mask ? (const half *) ((const char *) mask
+        + (int64_t) iq0            * nb31
+        + (int64_t) (iq2 % ne32)   * nb32
+        + (int64_t) (iq3 % ne33)   * nb33) : nullptr;
+
+    float acc = 0.0f;
+
+    for (int page = page_begin; page < page_end; ++page) {
+        const int blk_id = seq_block_table[page];
+        if (blk_id < 0) {
+            continue;
+        }
+
+        const int64_t first_cell = (int64_t) blk_id * block_size;
+
+        for (int cell_off = 0; cell_off < block_size; ++cell_off) {
+            const int64_t cell = first_cell + cell_off;
+            if (cell >= ne11) {
+                break;
+            }
+
+            float qk_part = 0.0f;
+            float mask_val = 0.0f;
+
+            if (mask_row) {
+                mask_val = __half2float(mask_row[cell]);
+                if (mask_val <= -65504.0f/2.0f) {
+                    continue;
+                }
+            }
+
+            const half * K_cell = (const half *) ((const char *) K
+                + cell           * nb11
+                + (int64_t) ikv2 * nb12
+                + (int64_t) ikv3 * nb13);
+
+            if (tid < D) {
+                qk_part = q_sh[tid] * __half2float(K_cell[tid]);
+            }
+
+            red[tid] = qk_part;
+            __syncthreads();
+
+            for (int stride = nthreads/2; stride > 0; stride >>= 1) {
+                if (tid < stride) {
+                    red[tid] += red[tid + stride];
+                }
+                __syncthreads();
+            }
+
+            if (tid == 0) {
+                const float qk = red[0] * scale + mask_val;
+                const float M_new = max(M_sh, qk);
+                const float exp_scale = expf(M_sh - M_new);
+                const float exp_qk    = expf(qk   - M_new);
+                S_sh = S_sh * exp_scale + exp_qk;
+                M_sh = M_new;
+                red[0] = exp_scale;
+                red[1] = exp_qk;
+            }
+            __syncthreads();
+
+            if (tid < D) {
+                const half * V_cell = (const half *) ((const char *) V
+                    + cell           * nb21
+                    + (int64_t) ikv2 * nb22
+                    + (int64_t) ikv3 * nb23);
+                acc = acc * red[0] + red[1] * __half2float(V_cell[tid]);
+            }
+            __syncthreads();
+        }
+    }
+
+    if (tid < D) {
+        const int64_t row = ((int64_t) iq3 * ne2 * ne1) + (int64_t) iq0 * ne1 + iq2;
+        dst[row * D + tid] = S_sh > 0.0f ? acc / S_sh : 0.0f;
+    }
+#else
+    GGML_UNUSED_VARS(Q, K, V, mask, block_table, seq_ids, page_limits, dst, scale,
+        ne01, ne02, ne03, nb01, nb02, nb03, ne11, ne12, ne13, nb11, nb12, nb13,
+        nb21, nb22, nb23, ne31, ne32, ne33, nb31, nb32, nb33, ne1, ne2,
+        block_size, max_pages, n_seqs_bt);
+    NO_DEVICE_CODE;
+#endif // FLASH_ATTN_AVAILABLE
+}
+
+template <int D>
+static void ggml_cuda_flash_attn_ext_paged_f16_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * Q          = dst->src[0];
+    const ggml_tensor * K          = dst->src[1];
+    const ggml_tensor * V          = dst->src[2];
+    const ggml_tensor * mask       = dst->src[3];
+    const ggml_tensor * block_tbl  = dst->src[5];
+    const ggml_tensor * seq_ids    = dst->src[6];
+    const ggml_tensor * page_lims  = dst->src[7];
+
+    float scale = 1.0f;
+    memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+
+    constexpr int nthreads = 128;
+    const dim3 blocks_num((uint32_t) Q->ne[1], (uint32_t) Q->ne[2], (uint32_t) Q->ne[3]);
+    const dim3 block_dim(nthreads, 1, 1);
+
+    flash_attn_ext_paged_f16<D, nthreads><<<blocks_num, block_dim, 0, ctx.stream()>>>(
+        (const float *) Q->data,
+        (const half  *) K->data,
+        (const half  *) V->data,
+        mask ? (const half *) mask->data : nullptr,
+        (const int *) block_tbl->data,
+        (const int *) seq_ids->data,
+        (const int *) page_lims->data,
+        (float *) dst->data,
+        scale,
+        Q->ne[1], Q->ne[2], Q->ne[3],
+        Q->nb[1], Q->nb[2], Q->nb[3],
+        K->ne[1], K->ne[2], K->ne[3],
+        K->nb[1], K->nb[2], K->nb[3],
+        V->nb[1], V->nb[2], V->nb[3],
+        mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 1, mask ? mask->ne[3] : 1,
+        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
+        dst->ne[1], dst->ne[2],
+        16,
+        block_tbl->ne[0],
+        block_tbl->ne[1]);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+static bool ggml_cuda_flash_attn_ext_paged_supported(const ggml_tensor * dst) {
+    const ggml_tensor * Q         = dst->src[0];
+    const ggml_tensor * K         = dst->src[1];
+    const ggml_tensor * V         = dst->src[2];
+    const ggml_tensor * mask      = dst->src[3];
+    const ggml_tensor * sinks     = dst->src[4];
+    const ggml_tensor * block_tbl = dst->src[5];
+    const ggml_tensor * seq_ids   = dst->src[6];
+    const ggml_tensor * page_lims = dst->src[7];
+
+    if (!block_tbl) {
+        return false;
+    }
+
+    float max_bias = 0.0f;
+    float logit_softcap = 0.0f;
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+
+    return Q->type == GGML_TYPE_F32 &&
+           K->type == GGML_TYPE_F16 &&
+           V->type == GGML_TYPE_F16 &&
+           dst->type == GGML_TYPE_F32 &&
+           mask && mask->type == GGML_TYPE_F16 &&
+           (Q->ne[0] == 64 || Q->ne[0] == 128) &&
+           K->ne[0] == Q->ne[0] &&
+           V->ne[0] == Q->ne[0] &&
+           K->ne[2] > 0 &&
+           K->ne[3] > 0 &&
+           Q->ne[2] % K->ne[2] == 0 &&
+           Q->ne[3] % K->ne[3] == 0 &&
+           mask->ne[0] >= K->ne[1] &&
+           K->nb[0] == (int64_t) ggml_element_size(K) &&
+           V->nb[0] == (int64_t) ggml_element_size(V) &&
+           block_tbl->type == GGML_TYPE_I32 &&
+           block_tbl->ne[0] > 0 &&
+           block_tbl->ne[1] > 0 &&
+           seq_ids && seq_ids->type == GGML_TYPE_I32 &&
+           seq_ids->ne[0] >= Q->ne[1] &&
+           page_lims && page_lims->type == GGML_TYPE_I32 &&
+           page_lims->ne[0] >= 2 * Q->ne[1] &&
+           sinks == nullptr &&
+           max_bias == 0.0f &&
+           logit_softcap == 0.0f;
+}
+
+static void ggml_cuda_flash_attn_ext_paged(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    switch (dst->src[0]->ne[0]) {
+        case 64:
+            ggml_cuda_flash_attn_ext_paged_f16_case<64>(ctx, dst);
+            break;
+        case 128:
+            ggml_cuda_flash_attn_ext_paged_f16_case<128>(ctx, dst);
+            break;
+        default:
+            GGML_ABORT("fatal error");
+    }
+}
+
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -314,6 +565,7 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
 // Best FlashAttention kernel for a specific GPU:
 enum best_fattn_kernel {
     BEST_FATTN_KERNEL_NONE     =   0,
+    BEST_FATTN_KERNEL_PAGED    =  50,
     BEST_FATTN_KERNEL_TILE     = 200,
     BEST_FATTN_KERNEL_VEC      = 100,
     BEST_FATTN_KERNEL_WMMA_F16 = 300,
@@ -331,6 +583,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const ggml_tensor * K     = dst->src[1];
     const ggml_tensor * V     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
+
+    if (dst->src[5] != nullptr) {
+        return ggml_cuda_flash_attn_ext_paged_supported(dst) ? BEST_FATTN_KERNEL_PAGED : BEST_FATTN_KERNEL_NONE;
+    }
 
     const int gqa_ratio = Q->ne[2] / K->ne[2];
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
@@ -534,6 +790,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
+        case BEST_FATTN_KERNEL_PAGED:
+            ggml_cuda_flash_attn_ext_paged(ctx, dst);
+            break;
         case BEST_FATTN_KERNEL_TILE:
             ggml_cuda_flash_attn_ext_tile(ctx, dst);
             break;

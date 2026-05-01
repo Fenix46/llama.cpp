@@ -82,9 +82,12 @@ validated against a representative model.
 
 ## CUDA / H200 Work
 
-- [ ] Identify current CUDA `FLASH_ATTN_EXT` dispatch points for paged tensors.
+- [x] Identify current CUDA `FLASH_ATTN_EXT` dispatch points for paged tensors.
 - [ ] Add CUDA paged attention gather path using `block_table` and
       `page_limits_q`.
+  - Initial conservative path exists in `ggml/src/ggml-cuda/fattn.cu` for
+    masked F32 Q + F16 K/V, `dk/dv` 64 and 128. It must be CUDA-built and
+    validated on H200 before this item is marked complete.
 - [ ] Implement CUDA decode fast path for single-token generation.
 - [ ] Implement CUDA tiled/prefill path for paged KV.
 - [ ] Validate on H200 with at least:
