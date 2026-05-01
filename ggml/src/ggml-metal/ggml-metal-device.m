@@ -7,6 +7,7 @@
 #include <Metal/Metal.h>
 
 #include <stdatomic.h>
+#include <string.h>
 
 #ifndef TARGET_OS_VISION
 #define TARGET_OS_VISION 0
@@ -1735,6 +1736,67 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
         [cmd_buf commit];
         [cmd_buf waitUntilCompleted];
     }
+}
+
+bool ggml_metal_buffer_cpy_tensor(ggml_metal_buffer_t buf_src, ggml_metal_buffer_t buf_dst, const struct ggml_tensor * src, struct ggml_tensor * dst) {
+    GGML_ASSERT(buf_src);
+    GGML_ASSERT(buf_dst);
+    GGML_ASSERT(src);
+    GGML_ASSERT(dst);
+    GGML_ASSERT(ggml_nbytes(src) == ggml_nbytes(dst));
+
+    const size_t size = ggml_nbytes(src);
+    if (size == 0) {
+        return true;
+    }
+
+    if (src->data == dst->data) {
+        return true;
+    }
+
+    if (buf_src->is_shared && buf_dst->is_shared) {
+        const char * src_begin = (const char *) src->data;
+        const char * src_end   = src_begin + size;
+        const char * dst_begin = (const char *) dst->data;
+        const char * dst_end   = dst_begin + size;
+
+        if (src_begin < dst_end && dst_begin < src_end) {
+            memmove(dst->data, src->data, size);
+            return true;
+        }
+    }
+
+    if (buf_src->dev != buf_dst->dev) {
+        return false;
+    }
+
+    @autoreleasepool {
+        struct ggml_metal_buffer_id bid_src = ggml_metal_buffer_get_id(buf_src, src);
+        struct ggml_metal_buffer_id bid_dst = ggml_metal_buffer_get_id(buf_dst, dst);
+
+        if (bid_src.metal == nil || bid_dst.metal == nil) {
+            return false;
+        }
+
+        id<MTLCommandBuffer> cmd_buf = [buf_dst->dev->mtl_queue commandBufferWithUnretainedReferences];
+
+        {
+            id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+
+            [encoder copyFromBuffer:bid_src.metal
+                       sourceOffset:bid_src.offs
+                           toBuffer:bid_dst.metal
+                  destinationOffset:bid_dst.offs
+                               size:size];
+
+            [encoder endEncoding];
+        }
+
+        [cmd_buf commit];
+        [cmd_buf waitUntilCompleted];
+    }
+
+    return true;
 }
 
 void ggml_metal_buffer_clear(ggml_metal_buffer_t buf, uint8_t value) {

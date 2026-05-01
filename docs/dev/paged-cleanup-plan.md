@@ -17,7 +17,7 @@ leasing a seq_id from `paged_seq_leases` without touching `slots`.
 Known remaining issues:
 - Paged prefill does not reuse KV prefix (n_past always 0 or simple match, no KV shift)
 - Paged prefill does not create/restore SWA checkpoints (crash risk on SWA models)
-- Copy-on-write uses portable tensor get/set (slow for large blocks)
+- Copy-on-write uses backend-native tensor-copy views (Phase E); benchmark counters are still pending
 - Paged prefill does not do KV shift / cache-reuse (n_past always 0 or simple prefix)
 - Paged prefill does not create/restore SWA checkpoints (crash risk on SWA models)
 - KV dashboard `slots: N` reads from `slots`, not `paged_requests`
@@ -165,27 +165,78 @@ Changes:
 
 ---
 
-## Phase E — Copy-on-write optimization (Metal)
+## Phase E — Paged KV CoW stabilization and backend-native copy
 
-**Goal**: replace portable tensor get/set copy with Metal blit encoder for CoW.
+**Goal**: make paged KV copy-on-write correct first, then remove the host
+round-trip from block copies. This phase does not introduce true PagedAttention.
 
-### E1 — Metal block-copy path
+### E0 — Side-effect-free CoW planning
 
-Files: `ggml/src/ggml-metal.m` (or new `ggml-metal-paged.m`)
-
-Changes:
-- Add `ggml_metal_cpy_kv_block(ctx, src_seq, dst_seq, block_idx, block_size, n_layers)`
-- Uses `MTLBlitCommandEncoder copyFromBuffer:...toBuffer:...` directly
-- Called from `llama_kv_cache_paged_cow()` when Metal backend detected
-- Fallback: existing portable path
-
-### E2 — CUDA block-copy kernel
-
-Files: `ggml/src/ggml-cuda/paged-cpy.cu` (new file)
+Files: `src/llama-kv-cache.h`, `src/llama-kv-cache.cpp`
 
 Changes:
-- `ggml_cuda_cpy_kv_block(...)` using `cudaMemcpyAsync` with device-side block pointers
-- Low priority — Metal/Apple Silicon is primary target
+- Extend `llama_kv_cache::slot_info` with a commit-time CoW plan:
+  stream, seq_id, logical page, old block, new block.
+- Keep `find_slot()` side-effect-free for CoW: it may choose block ids, but it
+  must not copy K/V tensor data.
+- Let `prepare()` apply only reversible metadata simulation, then restore all
+  touched cells, block allocators, and block table state.
+- Execute real K/V block copies from `llama_kv_cache_context::apply()` through
+  `apply_ubatch(..., copy_cow_data=true)`.
+
+Acceptance:
+- `prepare()` can fail or rollback without leaving copied KV data behind.
+- A shared prefix copied with `seq_cp()` can diverge inside a partially filled
+  page without corrupting either sequence.
+
+### E1 — Backend-native block copy through GGML views
+
+Files: `src/llama-kv-cache.cpp`, `ggml/src/ggml-backend.cpp`
+
+Changes:
+- Replace `ggml_backend_tensor_get/set` in paged CoW with
+  `ggml_backend_tensor_copy()` over temporary GGML views.
+- Copy K and non-transposed V as contiguous 2D block views.
+- Copy transposed V as one contiguous token span per V row/head.
+- Keep the existing generic `ggml_backend_tensor_copy()` fallback path for
+  backends without native device-to-device copy support.
+- Make `ggml_backend_tensor_copy()` resolve `view_src` buffers correctly.
+
+### E2 — Metal and CUDA view-copy support
+
+Files:
+- `ggml/src/ggml-metal/ggml-metal.cpp`
+- `ggml/src/ggml-metal/ggml-metal-device.{h,m}`
+- `ggml/src/ggml-cuda/ggml-cuda.cu`
+
+Changes:
+- Metal: implement buffer-level `cpy_tensor` with `MTLBlitCommandEncoder`,
+  including tensor views. Use CPU `memmove` only for real overlapping shared
+  ranges.
+- Metal async: resolve `view_src` buffers before testing whether tensors belong
+  to Metal.
+- CUDA: resolve `view_src` buffers in blocking `cpy_tensor`; async already uses
+  the correct view-aware buffer path.
+- CPU remains the correctness reference via host memory copy.
+
+Acceptance:
+- `test-paged-kv-cow` passes with both Flash Attention disabled and enabled.
+- `test-state-restore-fragmented` remains green.
+
+## Phase F — True page-table-aware attention, after E
+
+**Goal**: add an experimental PagedAttention path only after CoW is stable.
+
+Files: TBD, centered around `GGML_OP_FLASH_ATTN_EXT` backend kernels and graph
+input construction.
+
+Changes:
+- Add compact per-sequence block tables as kernel input: logical length, block
+  size, token positions, and physical KV block ids.
+- Preserve fallback to the current physical slab + host KQ mask path.
+- Backend priority: Metal first, CUDA second. No Vulkan/OpenCL work in this
+  phase.
+- No public `llama.h` API changes.
 
 ---
 
@@ -200,8 +251,10 @@ Changes:
 | B2 — prefix cache lookup | Medium | Performance (cache hits) | 2 |
 | C1-C2 — SWA checkpoints | Medium | Correctness for SWA models | 3 |
 | D1-D2 — gpu-mem-util | Medium | UX / capacity planning | 4 |
-| E1 — Metal CoW | High | Performance on Apple Silicon | 5 |
-| E2 — CUDA CoW | High | Performance on CUDA | 6 |
+| E0 — CoW planning | Medium | Correctness: reversible prepare | 5 |
+| E1 — native GGML block copy | Medium | Removes host round-trip from CoW | 6 |
+| E2 — Metal/CUDA view copy | High | Performance on Apple Silicon/CUDA | 7 |
+| F — PagedAttention kernels | High | Attention kernel scalability | after E |
 
 ---
 

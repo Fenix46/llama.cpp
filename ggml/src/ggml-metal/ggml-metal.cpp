@@ -17,6 +17,28 @@
 // note: can be overridden with GGML_METAL_DEVICES env to simulate virtual devices
 static int g_devices = 1;
 
+static bool ggml_backend_buffer_is_metal(ggml_backend_buffer_t buffer);
+
+static bool ggml_backend_metal_buffer_cpy_tensor_common(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
+    ggml_backend_buffer_t src_buf = src->view_src ? src->view_src->buffer : src->buffer;
+    ggml_backend_buffer_t dst_buf = dst->view_src ? dst->view_src->buffer : dst->buffer;
+
+    if (!src_buf || !dst_buf) {
+        return false;
+    }
+
+    if (!ggml_backend_buffer_is_metal(src_buf) || !ggml_backend_buffer_is_metal(dst_buf)) {
+        return false;
+    }
+
+    ggml_metal_buffer_t ctx_src = (ggml_metal_buffer_t) src_buf->context;
+    ggml_metal_buffer_t ctx_dst = (ggml_metal_buffer_t) dst_buf->context;
+
+    GGML_ASSERT(ctx_dst == (ggml_metal_buffer_t) buffer->context);
+
+    return ggml_metal_buffer_cpy_tensor(ctx_src, ctx_dst, src, dst);
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // backend interface
 ////////////////////////////////////////////////////////////////////////////////
@@ -68,11 +90,7 @@ static bool ggml_backend_metal_buffer_shared_cpy_tensor(ggml_backend_buffer_t bu
 
     GGML_ASSERT(ggml_metal_buffer_is_shared(ctx));
 
-    GGML_UNUSED(buffer);
-    GGML_UNUSED(src);
-    GGML_UNUSED(dst);
-
-    return false;
+    return ggml_backend_metal_buffer_cpy_tensor_common(buffer, src, dst);
 }
 
 static void ggml_backend_metal_buffer_shared_clear(ggml_backend_buffer_t buffer, uint8_t value) {
@@ -144,11 +162,7 @@ static bool ggml_backend_metal_buffer_private_cpy_tensor(ggml_backend_buffer_t b
 
     GGML_ASSERT(!ggml_metal_buffer_is_shared(ctx));
 
-    GGML_UNUSED(buffer);
-    GGML_UNUSED(src);
-    GGML_UNUSED(dst);
-
-    return false;
+    return ggml_backend_metal_buffer_cpy_tensor_common(buffer, src, dst);
 }
 
 static void ggml_backend_metal_buffer_private_clear(ggml_backend_buffer_t buffer, uint8_t value) {
@@ -512,15 +526,19 @@ static bool ggml_backend_metal_cpy_tensor_async(ggml_backend_t backend_src, ggml
         return false;
     }
 
-    if (!ggml_backend_buffer_is_metal(src->buffer) || !ggml_backend_buffer_is_metal(dst->buffer)) {
+    ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
+    ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
+
+    if (!buf_src || !buf_dst) {
+        return false;
+    }
+
+    if (!ggml_backend_buffer_is_metal(buf_src) || !ggml_backend_buffer_is_metal(buf_dst)) {
         return false;
     }
 
     ggml_metal_t ctx_src = (ggml_metal_t)backend_src->context;
     ggml_metal_t ctx_dst = (ggml_metal_t)backend_dst->context;
-
-    //ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
-    //ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
 
     //ggml_metal_buffer_t buf_ctx_src = (ggml_metal_buffer_t)buf_src->context;
     //ggml_metal_buffer_t buf_ctx_dst = (ggml_metal_buffer_t)buf_dst->context;

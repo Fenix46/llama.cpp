@@ -20,7 +20,7 @@
 //   - llama_kv_block_table maps (seq_id, logical_page_index) to a physical
 //     block_id.
 //   - block refcounts protect shared pages created by sequence copies; the
-//     write-side copy-on-write path is still pending.
+//     write-side path performs copy-on-write before mutating shared pages.
 //
 // Intended Phase 2 integration points (for reference, not implemented here):
 //   - find_slot()          : replace ring-buffer scan with block_table lookup

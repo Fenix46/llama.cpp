@@ -72,6 +72,54 @@ static ggml_tensor * ggml_mul_mat_aux(
     return res;
 }
 
+static void ggml_backend_tensor_copy_view_1d(
+        ggml_tensor * tensor,
+             int64_t   ne0,
+              size_t   src_offset,
+              size_t   dst_offset) {
+    if (ne0 == 0) {
+        return;
+    }
+
+    ggml_init_params params = {
+        /* .mem_size   = */ 2*ggml_tensor_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+
+    ggml_context_ptr ctx { ggml_init(params) };
+
+    ggml_tensor * src = ggml_view_1d(ctx.get(), tensor, ne0, src_offset);
+    ggml_tensor * dst = ggml_view_1d(ctx.get(), tensor, ne0, dst_offset);
+
+    ggml_backend_tensor_copy(src, dst);
+}
+
+static void ggml_backend_tensor_copy_view_2d(
+        ggml_tensor * tensor,
+             int64_t   ne0,
+             int64_t   ne1,
+              size_t   nb1,
+              size_t   src_offset,
+              size_t   dst_offset) {
+    if (ne0 == 0 || ne1 == 0) {
+        return;
+    }
+
+    ggml_init_params params = {
+        /* .mem_size   = */ 2*ggml_tensor_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+
+    ggml_context_ptr ctx { ggml_init(params) };
+
+    ggml_tensor * src = ggml_view_2d(ctx.get(), tensor, ne0, ne1, nb1, src_offset);
+    ggml_tensor * dst = ggml_view_2d(ctx.get(), tensor, ne0, ne1, nb1, dst_offset);
+
+    ggml_backend_tensor_copy(src, dst);
+}
+
 //
 // llama_kv_cache
 //
@@ -543,10 +591,13 @@ void llama_kv_cache::paged_copy_block_data(uint32_t strm, uint32_t old_blk_id, u
         const uint32_t il = layer.il;
 
         if (auto * k = layer.k_stream[strm]) {
-            const size_t k_size_row = ggml_row_size(k->type, hparams.n_embd_k_gqa(il));
-            std::vector<uint8_t> buf(n_cells * k_size_row);
-            ggml_backend_tensor_get(k, buf.data(), old_blk.first_cell * k_size_row, buf.size());
-            ggml_backend_tensor_set(k, buf.data(), new_blk.first_cell * k_size_row, buf.size());
+            ggml_backend_tensor_copy_view_2d(
+                    k,
+                    hparams.n_embd_k_gqa(il),
+                    n_cells,
+                    k->nb[1],
+                    old_blk.first_cell*k->nb[1],
+                    new_blk.first_cell*k->nb[1]);
         }
 
         auto * v = layer.v_stream[strm];
@@ -556,25 +607,26 @@ void llama_kv_cache::paged_copy_block_data(uint32_t strm, uint32_t old_blk_id, u
 
         const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
         if (!v_trans) {
-            const size_t v_size_row = ggml_row_size(v->type, n_embd_v_gqa);
-            std::vector<uint8_t> buf(n_cells * v_size_row);
-            ggml_backend_tensor_get(v, buf.data(), old_blk.first_cell * v_size_row, buf.size());
-            ggml_backend_tensor_set(v, buf.data(), new_blk.first_cell * v_size_row, buf.size());
+            ggml_backend_tensor_copy_view_2d(
+                    v,
+                    n_embd_v_gqa,
+                    n_cells,
+                    v->nb[1],
+                    old_blk.first_cell*v->nb[1],
+                    new_blk.first_cell*v->nb[1]);
         } else {
             const size_t v_size_el = ggml_type_size(v->type);
-            std::vector<uint8_t> buf(n_cells * v_size_el);
             const uint32_t kv_size = v_cells[strm].size();
             for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
                 const size_t src_offset = (old_blk.first_cell + j * kv_size) * v_size_el;
                 const size_t dst_offset = (new_blk.first_cell + j * kv_size) * v_size_el;
-                ggml_backend_tensor_get(v, buf.data(), src_offset, buf.size());
-                ggml_backend_tensor_set(v, buf.data(), dst_offset, buf.size());
+                ggml_backend_tensor_copy_view_1d(v, n_cells, src_offset, dst_offset);
             }
         }
     }
 }
 
-bool llama_kv_cache::paged_cow_block(uint32_t strm, llama_seq_id seq_id, uint32_t page, uint32_t old_blk_id, uint32_t new_blk_id) {
+bool llama_kv_cache::paged_cow_block(uint32_t strm, llama_seq_id seq_id, uint32_t page, uint32_t old_blk_id, uint32_t new_blk_id, bool copy_data) {
     if (strm >= v_block_alloc.size()) {
         return false;
     }
@@ -589,7 +641,11 @@ bool llama_kv_cache::paged_cow_block(uint32_t strm, llama_seq_id seq_id, uint32_
     const uint32_t n_cells = std::min(old_blk.size, new_blk.size);
     auto & cells = v_cells[strm];
 
-    paged_copy_block_data(strm, old_blk_id, new_blk_id);
+    alloc.alloc_specific(new_blk_id);
+
+    if (copy_data) {
+        paged_copy_block_data(strm, old_blk_id, new_blk_id);
+    }
 
     for (uint32_t i = 0; i < n_cells; ++i) {
         const uint32_t old_cell = old_blk.cell(i);
@@ -1050,6 +1106,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
         std::vector<uint32_t> v_heads_old; // old positions of the heads, before placing the ubatch
 
+        std::vector<std::vector<uint32_t>> idxs; // cells copied in v_cells
         std::vector<llama_kv_cells> v_cells; // copy of the old cells, before placing the ubatch
 
         std::vector<llama_kv_block_allocator> v_block_alloc;
@@ -1074,19 +1131,40 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
         // store the old state of the cells in the recovery stack
         {
-            state_t state = { sinfo_new, v_heads, {}, v_block_alloc, block_table };
+            state_t state = { sinfo_new, v_heads, {}, {}, v_block_alloc, block_table };
 
             for (uint32_t s = 0; s < sinfo_new.n_stream(); ++s) {
                 auto & cells = v_cells[sinfo_new.strm[s]];
 
-                state.v_cells.push_back(cells.cp(sinfo_new.idxs[s]));
+                std::vector<uint32_t> idxs = sinfo_new.idxs[s];
+
+                for (const auto & cow : sinfo_new.cows) {
+                    if (cow.strm != (uint32_t) sinfo_new.strm[s]) {
+                        continue;
+                    }
+
+                    const auto & alloc = v_block_alloc[cow.strm];
+
+                    for (const uint32_t blk_id : { cow.old_blk_id, cow.new_blk_id }) {
+                        const auto & blk = alloc.get(blk_id);
+                        for (uint32_t i = 0; i < blk.size; ++i) {
+                            idxs.push_back(blk.cell(i));
+                        }
+                    }
+                }
+
+                std::sort(idxs.begin(), idxs.end());
+                idxs.erase(std::unique(idxs.begin(), idxs.end()), idxs.end());
+
+                state.idxs.push_back(idxs);
+                state.v_cells.push_back(cells.cp(idxs));
             }
 
             states.push_back(std::move(state));
         }
 
         // now emplace the ubatch
-        apply_ubatch(sinfo_new, ubatch);
+        apply_ubatch(sinfo_new, ubatch, false);
     }
 
     GGML_ASSERT(!states.empty() || !success);
@@ -1099,8 +1177,8 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
             auto & cells = v_cells[sinfo.strm[s]];
             auto & head  = v_heads[sinfo.strm[s]];
 
-            cells.set(sinfo.idxs[s], it->v_cells[s]);
-            head = it->v_heads_old[s];
+            cells.set(it->idxs[s], it->v_cells[s]);
+            head = it->v_heads_old[sinfo.strm[s]];
         }
 
         v_block_alloc = it->v_block_alloc;
@@ -1273,6 +1351,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
         /*.s1   =*/ 0,
         /*.strm =*/ { },
         /*.idxs =*/ { },
+        /*.cows =*/ { },
     };
 
     res.resize(n_seqs);
@@ -1347,16 +1426,14 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                     if (it != cow_pages.end()) {
                         blk_id = it->second;
                     } else {
-                        const uint32_t new_blk_id = alloc.alloc();
+                        const uint32_t new_blk_id = alloc.peek_free(n_planned);
                         if (new_blk_id == LLAMA_KV_BLOCK_ID_NONE) {
                             return { };
                         }
-                        if (!paged_cow_block(strm, token_seq_id, page, blk_id, new_blk_id)) {
-                            alloc.free(new_blk_id);
-                            return { };
-                        }
                         cow_pages[key] = new_blk_id;
+                        res.cows.push_back({ strm, token_seq_id, page, blk_id, new_blk_id });
                         blk_id = new_blk_id;
+                        ++n_planned;
                     }
                 }
 
@@ -1366,7 +1443,6 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                 }
 
                 if (!cells.is_empty(cell_idx) && !cells.seq_has(cell_idx, token_seq_id)) {
-                    // Copy-on-write for shared blocks is not implemented yet.
                     return { };
                 }
 
@@ -1517,7 +1593,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
     return res;
 }
 
-void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
+void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, bool copy_cow_data) {
     // keep track of the max sequence position that we would overwrite with this ubatch
     // for non-SWA cache, this would be always empty
     llama_seq_id seq_pos_max_rm[LLAMA_MAX_SEQ];
@@ -1526,6 +1602,17 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
     }
 
     assert(ubatch.n_tokens == sinfo.n_stream()*sinfo.size());
+
+    for (const auto & cow : sinfo.cows) {
+        const bool ok = paged_cow_block(
+                cow.strm,
+                cow.seq_id,
+                cow.page,
+                cow.old_blk_id,
+                cow.new_blk_id,
+                copy_cow_data);
+        GGML_ASSERT(ok);
+    }
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         for (uint32_t ii = 0; ii < sinfo.size(); ++ii) {

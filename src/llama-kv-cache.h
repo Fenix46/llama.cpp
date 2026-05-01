@@ -36,12 +36,21 @@ public:
         // data for ggml_set_rows
         using idx_vec_t = std::vector<uint32_t>;
 
+        struct cow_plan {
+            uint32_t     strm;
+            llama_seq_id seq_id;
+            uint32_t     page;
+            uint32_t     old_blk_id;
+            uint32_t     new_blk_id;
+        };
+
         // number of streams: ns = s1 - s0 + 1
         uint32_t s0;
         uint32_t s1;
 
         std::vector<llama_seq_id> strm; // [ns]
         std::vector<idx_vec_t>    idxs; // [ns]
+        std::vector<cow_plan>     cows;
 
         uint32_t head() const {
             GGML_ASSERT(idxs.size() == 1);
@@ -72,6 +81,7 @@ public:
 
         void clear() {
             idxs.clear();
+            cows.clear();
         }
 
         // check if indices are contiguous starting from head()
@@ -197,7 +207,7 @@ public:
     slot_info find_slot(const llama_ubatch & ubatch, bool cont);
 
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
-    void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
+    void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, bool copy_cow_data = true);
 
     //
     // input API
@@ -305,7 +315,7 @@ private:
     // Record that cell `cell_idx` in stream `strm` now belongs to seq_id/pos.
     void paged_record_cell(uint32_t strm, uint32_t cell_idx,
                            llama_seq_id seq_id, llama_pos pos);
-    bool paged_cow_block(uint32_t strm, llama_seq_id seq_id, uint32_t page, uint32_t old_blk_id, uint32_t new_blk_id);
+    bool paged_cow_block(uint32_t strm, llama_seq_id seq_id, uint32_t page, uint32_t old_blk_id, uint32_t new_blk_id, bool copy_data);
     void paged_copy_block_data(uint32_t strm, uint32_t old_blk_id, uint32_t new_blk_id);
 
     std::vector<kv_layer> layers;
