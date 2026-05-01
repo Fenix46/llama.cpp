@@ -2702,8 +2702,13 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     ggml_metal_buffer_id bid_tmp = bid_blk;
     bid_tmp.offs += ggml_metal_op_flash_attn_ext_extra_blk(op);
 
-    // Paged attention: if block_table (src[5]) is set, dispatch paged kernel and return early.
-    const bool has_block_table = (op->src[5] != nullptr);
+    // Paged attention: if block_table (src[5]) is set and LLAMA_PAGED_ATTN != "0",
+    // dispatch paged kernel and return early. Set LLAMA_PAGED_ATTN=0 to force legacy path.
+    static const bool paged_attn_enabled = []() {
+        const char * env = getenv("LLAMA_PAGED_ATTN");
+        return env == nullptr || env[0] != '0';
+    }();
+    const bool has_block_table = (op->src[5] != nullptr) && paged_attn_enabled;
     if (has_block_table) {
         GGML_ASSERT(op->src[6] != nullptr && "seq_ids_q (src[6]) required with block_table (src[5])");
 
