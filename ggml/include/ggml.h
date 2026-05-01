@@ -2405,6 +2405,13 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
+    // Attach a paged-attention block table as src[5].
+    // block_table must be an I32 tensor of shape [max_pages_per_seq, n_seq_max].
+    // Pass NULL to clear (fall back to mask-based attention).
+    GGML_API void ggml_flash_attn_ext_set_block_table(
+            struct ggml_tensor * a,
+            struct ggml_tensor * block_table);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,
