@@ -365,7 +365,10 @@ llama_kv_cache::llama_kv_cache(
 
         LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
 
-        ggml_backend_buffer_clear(buf, 0);
+        // Skip zero-fill in paged mode: cells are written before read (see clear() below).
+        if (!paged) {
+            ggml_backend_buffer_clear(buf, 0);
+        }
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 
@@ -431,7 +434,14 @@ void llama_kv_cache::clear(bool data) {
         v_heads[s] = 0;
     }
 
-    if (data) {
+    // In paged mode we skip the physical buffer zero-fill: cells are always
+    // written before they are read (Flash Attention writes K/V during prefill),
+    // and the kq_mask hard-masks cells that are not logically occupied so stale
+    // bytes in unallocated blocks are never architecturally visible.  Zeroing a
+    // potentially very large (multi-GB) pool is both expensive and, in some
+    // configurations, triggers CUDA illegal-memory-access when the pool was
+    // allocated close to the device memory limit.
+    if (data && !paged) {
         for (auto & [_, buf] : ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
         }
