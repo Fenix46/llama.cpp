@@ -332,6 +332,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const ggml_tensor * V     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * block_table = dst->src[5];
+    const int cc = ggml_cuda_info().devices[device].cc;
 
     static const bool paged_attn_enabled = []() {
         const char * env = getenv("LLAMA_PAGED_ATTN");
@@ -404,8 +405,6 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             }
         }
     }
-
-    const int cc = ggml_cuda_info().devices[device].cc;
 
     switch (K->ne[0]) {
         case  40:
