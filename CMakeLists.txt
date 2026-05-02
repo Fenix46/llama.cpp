@@ -116,6 +116,10 @@ option(LLAMA_TESTS_INSTALL  "llama: install tests"        ON)
 option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" ON)
 option(LLAMA_LLGUIDANCE "llama-common: include LLGuidance library for structured output in common utils" OFF)
 
+# Paged KV cache block size (tokens per block, must be a positive power of two).
+# Affects both the llama library and the ggml-cuda backend — rebuild both when changing.
+set(LLAMA_KV_BLOCK_SIZE "16" CACHE STRING "llama: paged KV cache block size in tokens (power of two)")
+
 
 # Required for relocatable CMake package
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/build-info.cmake)
@@ -128,6 +132,9 @@ if (NOT DEFINED LLAMA_BUILD_COMMIT)
     set(LLAMA_BUILD_COMMIT        ${BUILD_COMMIT})
 endif()
 set(LLAMA_INSTALL_VERSION 0.0.${LLAMA_BUILD_NUMBER})
+
+# Propagate KV block size to all targets (llama + ggml-cuda + Metal).
+add_compile_definitions(LLAMA_KV_BLOCK_SIZE=${LLAMA_KV_BLOCK_SIZE})
 
 # override ggml options
 set(GGML_ALL_WARNINGS   ${LLAMA_ALL_WARNINGS})

@@ -322,6 +322,21 @@ static __device__ __forceinline__ int paged_resolve_cell_mma(
     return blk_id*block_size + intra;
 }
 
+// Returns true when all pages map to consecutive physical blocks starting at block_table[0].
+// In that case physical cell = (block_table[0] * block_size) + logical_cell, identical to
+// the contiguous (non-paged) layout, so load_tile can be used directly.
+static __device__ __forceinline__ bool check_pages_contiguous(
+        const int * __restrict__ block_table_local,
+        int page_count) {
+    if (page_count <= 0) return true;
+    const int base = block_table_local[0];
+    if (base < 0) return false;
+    for (int p = 1; p < page_count; ++p) {
+        if (block_table_local[p] != base + p) return false;
+    }
+    return true;
+}
+
 // Paged variant of flash_attn_ext_f16_load_tile. Same shared-memory layout,
 // but every row of the tile is gathered through block_table.
 //   logical = k_VKQ_0 + i
@@ -604,6 +619,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         const int * __restrict__ block_table_local,
         const int page_count,
         const int block_size,
+        const bool bt_contig,
+        const int  bt_base_block,
         half2        * const __restrict__ tile_Q,
         half2        * const __restrict__ tile_K,
         half2        * const __restrict__ tile_V,
@@ -648,12 +665,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         constexpr bool use_cp_async = true;
         cp_async_wait_all();
         __syncthreads();
-        if (block_table_local) {
+        if (block_table_local && !bt_contig) {
             flash_attn_ext_f16_load_tile_paged<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check>
                 (V_h2, tile_V, nbatch_V2, stride_V, k_VKQ_sup, block_table_local, k_VKQ_0, page_count, block_size, 0);
         } else {
+            const int64_t phys_base_V = block_table_local ? (int64_t) bt_base_block * block_size : 0;
             flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check>
-                (V_h2 + int64_t(k_VKQ_0)*stride_V, tile_V, nbatch_V2, stride_V, k_VKQ_sup);
+                (V_h2 + (phys_base_V + k_VKQ_0)*stride_V, tile_V, nbatch_V2, stride_V, k_VKQ_sup);
         }
     } else {
         constexpr bool use_cp_async = nstages == 1;
@@ -672,12 +690,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
         if constexpr (nstages <= 1) {
             constexpr bool use_cp_async = nstages == 1;
-            if (block_table_local) {
+            if (block_table_local && !bt_contig) {
                 flash_attn_ext_f16_load_tile_paged<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
                     (K_h2, tile_K, k0_diff, stride_K, k_VKQ_sup, block_table_local, k_VKQ_0, page_count, block_size, k0_start);
             } else {
+                const int64_t phys_base_K = block_table_local ? (int64_t) bt_base_block * block_size : 0;
                 flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
-                    (K_h2 + int64_t(k_VKQ_0)*stride_K + k0_start, tile_K, k0_diff, stride_K, k_VKQ_sup);
+                    (K_h2 + (phys_base_K + k_VKQ_0)*stride_K + k0_start, tile_K, k0_diff, stride_K, k_VKQ_sup);
             }
             if (use_cp_async) {
                 cp_async_wait_all();
@@ -989,12 +1008,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check>
                     (mask_h + k_VKQ_0 + nbatch_fa, tile_mask, stride_mask, k_VKQ_sup, jt*ncols1, ne01);
             }
-            if (block_table_local) {
+            if (block_table_local && !bt_contig) {
                 flash_attn_ext_f16_load_tile_paged<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
                     (K_h2, tile_K, nbatch_K2, stride_K, k_VKQ_sup, block_table_local, k_VKQ_0 + nbatch_fa, page_count, block_size, 0);
             } else {
+                const int64_t phys_base_K2 = block_table_local ? (int64_t) bt_base_block * block_size : 0;
                 flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
-                    (K_h2 + int64_t(k_VKQ_0 + nbatch_fa)*stride_K, tile_K, nbatch_K2, stride_K, k_VKQ_sup);
+                    (K_h2 + (phys_base_K2 + k_VKQ_0 + nbatch_fa)*stride_K, tile_K, nbatch_K2, stride_K, k_VKQ_sup);
             }
         }
     }
@@ -1010,12 +1030,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         if constexpr (nstages <= 1) {
             if (!V_is_K_view || i0_stop > 2*nbatch_K2) {
                 constexpr bool use_cp_async = nstages == 1;
-                if (block_table_local) {
+                if (block_table_local && !bt_contig) {
                     flash_attn_ext_f16_load_tile_paged<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check>
                         (V_h2, tile_V, i0_diff/2, stride_V, k_VKQ_sup, block_table_local, k_VKQ_0, page_count, block_size, i0_start/2);
                 } else {
+                    const int64_t phys_base_V2 = block_table_local ? (int64_t) bt_base_block * block_size : 0;
                     flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check>
-                        (V_h2 + int64_t(k_VKQ_0)*stride_V + i0_start/2, tile_V, i0_diff/2, stride_V, k_VKQ_sup);
+                        (V_h2 + (phys_base_V2 + k_VKQ_0)*stride_V + i0_start/2, tile_V, i0_diff/2, stride_V, k_VKQ_sup);
                 }
                 if (use_cp_async) {
                     cp_async_wait_all();
@@ -1142,6 +1163,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         const int * __restrict__ block_table_local,
         const int page_count,
         const int block_size,
+        const bool bt_contig,
+        const int  bt_base_block,
         const int jt,
         const int zt_gqa,
         const int kb0_start,
@@ -1271,12 +1294,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check>
                 (mask_h + kb0*nbatch_fa, tile_mask, stride_mask, k_VKQ_sup, jt*ncols1, ne01);
         }
-        if (block_table_local) {
+        if (block_table_local && !bt_contig) {
             flash_attn_ext_f16_load_tile_paged<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
                 (K_h2, tile_K, nbatch_K2, stride_K, k_VKQ_sup, block_table_local, kb0*nbatch_fa, page_count, block_size, 0);
         } else {
+            const int64_t phys_base_K0 = block_table_local ? (int64_t) bt_base_block * block_size : 0;
             flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
-                (K_h2 + int64_t(kb0)*nbatch_fa*stride_K, tile_K, nbatch_K2, stride_K, k_VKQ_sup);
+                (K_h2 + (phys_base_K0 + (int64_t) kb0*nbatch_fa)*stride_K, tile_K, nbatch_K2, stride_K, k_VKQ_sup);
         }
     }
 
@@ -1290,7 +1314,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, last_iter, oob_check,
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
                 (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
-                 ne01, ne02, stride_K, stride_V, stride_mask, block_table_local, page_count, block_size, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+                 ne01, ne02, stride_K, stride_V, stride_mask, block_table_local, page_count, block_size, bt_contig, bt_base_block, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
                  KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
         }
         constexpr bool last_iter = true;
@@ -1300,7 +1324,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, last_iter, oob_check,
               T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
             (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
-             ne01, ne02, stride_K, stride_V, stride_mask, block_table_local, page_count, block_size, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+             ne01, ne02, stride_K, stride_V, stride_mask, block_table_local, page_count, block_size, bt_contig, bt_base_block, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
              KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
     } else {
         constexpr bool oob_check = false;
@@ -1311,7 +1335,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, last_iter, oob_check,
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
                 (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
-                 ne01, ne02, stride_K, stride_V, stride_mask, block_table_local, page_count, block_size, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+                 ne01, ne02, stride_K, stride_V, stride_mask, block_table_local, page_count, block_size, bt_contig, bt_base_block, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
                  KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
         }
         constexpr bool last_iter = true;
@@ -1320,7 +1344,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, last_iter, oob_check,
              T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
             (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
-             ne01, ne02, stride_K, stride_V, stride_mask, block_table_local, page_count, block_size, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+             ne01, ne02, stride_K, stride_V, stride_mask, block_table_local, page_count, block_size, bt_contig, bt_base_block, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
              KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
     }
 
@@ -1800,6 +1824,11 @@ static __global__ void flash_attn_ext_f16(
 
         const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, zt_Q, n_head_log2, m0, m1) : 1.0f;
 
+        // Contiguous fast-path: if all pages map to consecutive physical blocks, bypass
+        // paged_resolve_cell_mma and use the flat load_tile path (coalesced HBM access).
+        const bool bt_contig     = seq_bt ? check_pages_contiguous(seq_bt + page_start, page_count - page_start) : false;
+        const int  bt_base_block = (bt_contig && seq_bt) ? seq_bt[page_start] : 0;
+
         if (paged_mma) {
             const int iter_k_paged = (page_count*block_size + (nbatch_fa - 1)) / nbatch_fa;
             kb0_start = page_start + kb0_start;
@@ -1812,12 +1841,12 @@ static __global__ void flash_attn_ext_f16(
             constexpr bool needs_fixup = false; // CUDA block is working on an entire tile.
             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup>
                 (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
-                 ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, seq_bt, page_count, block_size, jt, zt_gqa, kb0_start, kb0_stop);
+                 ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, seq_bt, page_count, block_size, bt_contig, bt_base_block, jt, zt_gqa, kb0_start, kb0_stop);
         } else {
             constexpr bool needs_fixup = true; // CUDA block is missing the beginning of a tile.
             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup>
                 (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
-                 ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, seq_bt, page_count, block_size, jt, zt_gqa, kb0_start, kb0_stop);
+                 ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, seq_bt, page_count, block_size, bt_contig, bt_base_block, jt, zt_gqa, kb0_start, kb0_stop);
         }
 
         kbc += iter_k;
@@ -1867,6 +1896,9 @@ static __global__ void flash_attn_ext_f16(
 
     const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, zt_Q, n_head_log2, m0, m1) : 1.0f;
 
+    const bool bt_contig     = seq_bt ? check_pages_contiguous(seq_bt + page_start, page_count - page_start) : false;
+    const int  bt_base_block = (bt_contig && seq_bt) ? seq_bt[page_start] : 0;
+
     if (paged_mma) {
         const int iter_k_paged = (page_count*block_size + (nbatch_fa - 1)) / nbatch_fa;
         kb0_start = page_start + kb0_start;
@@ -1879,7 +1911,7 @@ static __global__ void flash_attn_ext_f16(
     constexpr bool needs_fixup = false;
     flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup>
         (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
-         ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, seq_bt, page_count, block_size, jt, zt_gqa, kb0_start, kb0_stop);
+         ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, seq_bt, page_count, block_size, bt_contig, bt_base_block, jt, zt_gqa, kb0_start, kb0_stop);
 #else
     GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,

@@ -953,9 +953,13 @@ void launch_fattn(
 
     // block_table layout is I32[max_pages, n_seqs]; ne[0] is max_pages.
     const int32_t bt_max_pages  = block_table_t ? (int32_t) block_table_t->ne[0] : 0;
-    // block_size is fixed at the paged-cache default (LLAMA_KV_BLOCK_SIZE_DEFAULT == 16).
-    // The Metal paged kernels also hardcode this value.
-    const int32_t bt_block_size = block_table_t ? 16 : 0;
+    // block_size matches LLAMA_KV_BLOCK_SIZE_DEFAULT; configurable at compile time
+    // via -DLLAMA_KV_BLOCK_SIZE=N (must be a positive power of two, default 16).
+    // Metal paged kernels must use the same value.
+#ifndef LLAMA_KV_BLOCK_SIZE
+#define LLAMA_KV_BLOCK_SIZE 16
+#endif
+    const int32_t bt_block_size = block_table_t ? LLAMA_KV_BLOCK_SIZE : 0;
     ggml_tensor * KQV = dst;
 
     GGML_ASSERT(Q->type == GGML_TYPE_F32);

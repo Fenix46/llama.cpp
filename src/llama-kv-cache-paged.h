@@ -47,7 +47,13 @@
 // Default block size (number of KV cells per block).
 // Must be a power of two for efficient alignment math.
 // 16 is a common choice; vLLM uses 16, PagedAttention paper uses 16/32.
-static constexpr uint32_t LLAMA_KV_BLOCK_SIZE_DEFAULT = 16;
+// Override at compile time via -DLLAMA_KV_BLOCK_SIZE=32 (or 64, etc.).
+#ifndef LLAMA_KV_BLOCK_SIZE
+#define LLAMA_KV_BLOCK_SIZE 16
+#endif
+static_assert((LLAMA_KV_BLOCK_SIZE & (LLAMA_KV_BLOCK_SIZE - 1)) == 0 && LLAMA_KV_BLOCK_SIZE > 0,
+              "LLAMA_KV_BLOCK_SIZE must be a positive power of two");
+static constexpr uint32_t LLAMA_KV_BLOCK_SIZE_DEFAULT = LLAMA_KV_BLOCK_SIZE;
 
 // Sentinel value meaning "no block assigned".
 static constexpr uint32_t LLAMA_KV_BLOCK_ID_NONE = std::numeric_limits<uint32_t>::max();
