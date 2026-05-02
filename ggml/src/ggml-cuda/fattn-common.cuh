@@ -18,6 +18,14 @@
 // The macro on the following line shifts it by a factor of 2**3=8, as was needed to fix https://github.com/ggml-org/llama.cpp/issues/18606 .
 #define FATTN_KQ_MAX_OFFSET (3.0f*0.6931f)
 
+// Paged-attention extension:
+//   block_table    : I32[max_pages, n_seqs]  — physical block id per (seq_id, logical_page) or -1
+//   seq_ids_q      : I32[n_tokens_q]         — seq_id for each Q-token (row of block_table to use)
+//   page_limits_q  : I32[2, n_tokens_q]      — [page_start, page_end) per Q-token (SWA-aware)
+//   max_pages      : stride (in entries) of block_table along the page dimension
+//   block_size     : cells per block (token granularity, default 16)
+// All paged pointers are nullptr in legacy (slot/contiguous) mode; kernels that do not
+// implement paged behavior must ignore them.
 typedef void (* fattn_kernel_t)(
         const char * __restrict__ Q,
         const char * __restrict__ K,
@@ -39,7 +47,12 @@ typedef void (* fattn_kernel_t)(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33);
+                            const int32_t nb31, const int32_t nb32, const int64_t nb33,
+        const int * __restrict__ block_table,
+        const int * __restrict__ seq_ids_q,
+        const int * __restrict__ page_limits_q,
+        const int32_t max_pages,
+        const int32_t block_size);
 
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
@@ -929,6 +942,21 @@ void launch_fattn(
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
 
+    // Paged-attention inputs (nullptr in legacy mode).
+    const ggml_tensor * block_table_t   = dst->src[5];
+    const ggml_tensor * seq_ids_q_t     = dst->src[6];
+    const ggml_tensor * page_limits_q_t = dst->src[7];
+
+    const int * block_table_d   = block_table_t   ? (const int *) block_table_t->data   : nullptr;
+    const int * seq_ids_q_d     = seq_ids_q_t     ? (const int *) seq_ids_q_t->data     : nullptr;
+    const int * page_limits_q_d = page_limits_q_t ? (const int *) page_limits_q_t->data : nullptr;
+
+    // block_table layout is I32[max_pages, n_seqs]; ne[0] is max_pages.
+    const int32_t bt_max_pages  = block_table_t ? (int32_t) block_table_t->ne[0] : 0;
+    // block_size is fixed at the paged-cache default (LLAMA_KV_BLOCK_SIZE_DEFAULT == 16).
+    // The Metal paged kernels also hardcode this value.
+    const int32_t bt_block_size = block_table_t ? 16 : 0;
+
     ggml_tensor * KQV = dst;
 
     GGML_ASSERT(Q->type == GGML_TYPE_F32);
@@ -1159,7 +1187,8 @@ void launch_fattn(
         K->ne[0], K->ne[1], K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
+        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
+        block_table_d, seq_ids_q_d, page_limits_q_d, bt_max_pages, bt_block_size
     );
     CUDA_CHECK(cudaGetLastError());
 

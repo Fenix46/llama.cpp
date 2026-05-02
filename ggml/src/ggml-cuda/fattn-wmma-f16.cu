@@ -20,6 +20,17 @@ namespace wmma = rocwmma;
 #endif // !defined(GGML_USE_HIP)
 #endif // GGML_USE_WMMA_FATTN
 
+static __device__ __forceinline__ int paged_resolve_cell_wmma(
+        const int * __restrict__ block_table_local,
+        int logical_cell, int page_count, int block_size) {
+    const int page  = logical_cell / block_size;
+    const int intra = logical_cell - page*block_size;
+    if (page >= page_count) return -1;
+    const int blk_id = block_table_local[page];
+    if (blk_id < 0) return -1;
+    return blk_id*block_size + intra;
+}
+
 // D == head size, VKQ_stride == num VKQ rows calculated in parallel:
 template<int D, int ncols, int nwarps, int VKQ_stride, typename KQ_acc_t, bool use_logit_softcap>
 __launch_bounds__(nwarps*ggml_cuda_get_physical_warp_size(), 1)
@@ -44,7 +55,12 @@ static __global__ void flash_attn_ext_f16(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33) {
+                            const int32_t nb31, const int32_t nb32, const int64_t nb33,
+        const int * __restrict__ block_table,
+        const int * __restrict__ seq_ids_q,
+        const int * __restrict__ page_limits_q,
+        const int32_t max_pages,
+        const int32_t block_size) {
 #if defined(FLASH_ATTN_AVAILABLE) && (defined(GGML_HIP_ROCWMMA_FATTN) && defined(GGML_USE_WMMA_FATTN))
     // Skip unused kernel variants for faster compilation:
     if (use_logit_softcap && !(D == 128 || D == 256)) {
@@ -95,6 +111,22 @@ static __global__ void flash_attn_ext_f16(
     const half  * maskh  = (const half  *) (mask + nb33*(sequence % ne33)                           + nb31*ic0);
     const half2 * mask2  = (const half2 *)  maskh;
     const float * sinksf = (const float *) sinks;
+    const bool paged_wmma = (block_table != nullptr);
+    const int seq_id = (paged_wmma && seq_ids_q && ic0 < int(ne01.z)) ? seq_ids_q[ic0] : 0;
+    const int * __restrict__ seq_bt = paged_wmma ? block_table + (int64_t) seq_id * max_pages : nullptr;
+    int page_start = 0;
+    int page_count = 0;
+    if (paged_wmma) {
+        if (page_limits_q) {
+            const int ps = page_limits_q[ic0*2 + 0];
+            const int pe = page_limits_q[ic0*2 + 1];
+            page_start = ps > 0 ? ps : 0;
+            page_count = pe < max_pages ? pe : max_pages;
+        } else {
+            page_start = 0;
+            page_count = max_pages;
+        }
+    }
 
     const int stride_Q  = nb01 / sizeof(float);
     const int stride_KV = nb11 / sizeof(half);
@@ -188,8 +220,9 @@ static __global__ void flash_attn_ext_f16(
     __syncthreads();
 
     // Iterate over ne11 == previous tokens:
-    const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
-    for (int k_VKQ_0 = blockIdx.y*FATTN_KQ_STRIDE; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*FATTN_KQ_STRIDE) {
+    const int k_VKQ_max = paged_wmma ? page_count*block_size : (KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11);
+    const int k_VKQ_init = paged_wmma ? page_start*block_size + blockIdx.y*FATTN_KQ_STRIDE : blockIdx.y*FATTN_KQ_STRIDE;
+    for (int k_VKQ_0 = k_VKQ_init; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*FATTN_KQ_STRIDE) {
         // Calculate tile of KQ:
 #pragma unroll
         for (int i_KQ_0 = 0; i_KQ_0 < FATTN_KQ_STRIDE; i_KQ_0 += KQ_stride_tc) {
@@ -201,7 +234,21 @@ static __global__ void flash_attn_ext_f16(
 #pragma unroll
             for (int k_KQ_0 = 0; k_KQ_0 < D; k_KQ_0 += 16) {
                 frag_a_K K_a;
-                wmma::load_matrix_sync(K_a, K_h_f16 + int64_t(k_VKQ_0 + i_KQ_0 + frag_m*threadIdx.y)*stride_KV + k_KQ_0, stride_KV);
+                if (paged_wmma) {
+                    half tmp_K[frag_m*16];
+#pragma unroll
+                    for (int r = 0; r < frag_m; ++r) {
+                        const int logical = k_VKQ_0 + i_KQ_0 + frag_m*threadIdx.y + r;
+                        const int phys = paged_resolve_cell_wmma(seq_bt, logical, page_count, block_size);
+#pragma unroll
+                        for (int c = 0; c < 16; ++c) {
+                            tmp_K[r*16 + c] = phys >= 0 ? K_h_f16[(int64_t) phys * stride_KV + k_KQ_0 + c] : __float2half(0.0f);
+                        }
+                    }
+                    wmma::load_matrix_sync(K_a, tmp_K, 16);
+                } else {
+                    wmma::load_matrix_sync(K_a, K_h_f16 + int64_t(k_VKQ_0 + i_KQ_0 + frag_m*threadIdx.y)*stride_KV + k_KQ_0, stride_KV);
+                }
 #pragma unroll
                 for (int j = 0; j < ncols/frag_n; ++j) {
                     wmma::mma_sync(KQ_c[j], K_a, Q_b[k_KQ_0/16][j], KQ_c[j]);
@@ -349,7 +396,22 @@ static __global__ void flash_attn_ext_f16(
                 const int k = k0 + (threadIdx.y % VKQ_ratio)*16;
 
                 frag_a_V v_a;
-                wmma::load_matrix_sync(v_a, V_h_f16 + int64_t(k_VKQ_0 + k)*stride_KV + i_VKQ_0 + frag_m*(threadIdx.y/VKQ_ratio), stride_KV);
+                if (paged_wmma) {
+                    half tmp_V[frag_m*16];
+                    const int base_col = i_VKQ_0 + frag_m*(threadIdx.y/VKQ_ratio);
+#pragma unroll
+                    for (int c = 0; c < 16; ++c) {
+#pragma unroll
+                        for (int r = 0; r < frag_m; ++r) {
+                            const int logical = k_VKQ_0 + k + r;
+                            const int phys = paged_resolve_cell_wmma(seq_bt, logical, page_count, block_size);
+                            tmp_V[c*frag_m + r] = phys >= 0 ? V_h_f16[(int64_t) phys * stride_KV + base_col + c] : __float2half(0.0f);
+                        }
+                    }
+                    wmma::load_matrix_sync(v_a, tmp_V, frag_m);
+                } else {
+                    wmma::load_matrix_sync(v_a, V_h_f16 + int64_t(k_VKQ_0 + k)*stride_KV + i_VKQ_0 + frag_m*(threadIdx.y/VKQ_ratio), stride_KV);
+                }
 #pragma unroll
                 for (int j = 0; j < ncols/frag_n; ++j) {
                     wmma::mma_sync(VKQ_c[i_VKQ_0/VKQ_stride][j], v_a, KQ_b[k0/(VKQ_ratio*16)][j], VKQ_c[i_VKQ_0/VKQ_stride][j]);
@@ -501,7 +563,8 @@ static __global__ void flash_attn_ext_f16(
               nb11, nb12, nb13,
               nb21, nb22, nb23,
               ne31, ne32, ne33,
-              nb31, nb32, nb33);
+              nb31, nb32, nb33,
+        block_table, seq_ids_q, page_limits_q, max_pages, block_size);
     NO_DEVICE_CODE;
 #endif // defined(FLASH_ATTN_AVAILABLE) && (defined(GGML_HIP_ROCWMMA_FATTN) && defined(GGML_USE_WMMA_FATTN))
 }

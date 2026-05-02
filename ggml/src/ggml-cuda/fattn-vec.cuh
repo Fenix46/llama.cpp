@@ -39,7 +39,12 @@ static __global__ void flash_attn_ext_vec(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33) {
+                            const int32_t nb31, const int32_t nb32, const int64_t nb33,
+        const int * __restrict__ block_table,
+        const int * __restrict__ seq_ids_q,
+        const int * __restrict__ page_limits_q,
+        const int32_t max_pages,
+        const int32_t block_size) {
 #ifdef FLASH_ATTN_AVAILABLE
 
     // Skip unused kernel variants for faster compilation:
@@ -52,7 +57,8 @@ static __global__ void flash_attn_ext_vec(
                   nb11, nb12, nb13,
                   nb21, nb22, nb23,
                   ne31, ne32, ne33,
-                  nb31, nb32, nb33);
+                  nb31, nb32, nb33,
+            block_table, seq_ids_q, page_limits_q, max_pages, block_size);
         NO_DEVICE_CODE;
         return;
     }
@@ -236,13 +242,66 @@ static __global__ void flash_attn_ext_vec(
 #endif // V_DOT2_F32_F16_AVAILABLE
     }
 
-    const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
-    K     += blockIdx.y*nthreads * nb11;
-    V     += blockIdx.y*nthreads * nb21;
-    maskh += blockIdx.y*nthreads;
-    for (int k_VKQ_0 = blockIdx.y*nthreads; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nthreads,
-             // Increment pointers after each loop:
-             K += gridDim.y*nthreads*nb11, V += gridDim.y*nthreads*nb21, maskh += gridDim.y*nthreads) {
+    // ------------------------------------------------------------------
+    // Paged-attention setup. When block_table is non-null we iterate the
+    // logical pages assigned to the current sequence and translate each
+    // logical cell index into a physical slab cell via block_table.
+    //   logical_cell  = k_VKQ_0 + i_KQ
+    //   page          = logical_cell / block_size
+    //   intra         = logical_cell % block_size
+    //   block_id      = block_table[seq_id*max_pages + page]
+    //   physical_cell = block_id*block_size + intra   (or skip if block_id<0)
+    // K/V base pointers stay at the head offset; per-cell offsets are
+    // computed from K_base/V_base + physical_cell*nb1{1,2}1.
+    // The mask is laid out as [pool_size, n_q] over physical cells, so it
+    // must be indexed by physical_cell as well.
+    // ------------------------------------------------------------------
+    const bool   paged  = (block_table != nullptr);
+    const char * K_base = K;
+    const char * V_base = V;
+
+    const int * __restrict__ seq_bt = nullptr;
+    int page_start = 0;
+    int page_count = 0;
+    if (paged) {
+        const int seq_id = (seq_ids_q && ic0 < int(ne01.z)) ? seq_ids_q[ic0] : 0;
+        seq_bt = block_table + (int64_t) seq_id * max_pages;
+        if (page_limits_q) {
+            const int ps = page_limits_q[ic0*2 + 0];
+            const int pe = page_limits_q[ic0*2 + 1];
+            page_start = ps > 0 ? ps : 0;
+            page_count = pe < max_pages ? pe : max_pages;
+        } else {
+            page_start = 0;
+            page_count = max_pages;
+        }
+    }
+
+    const int k_VKQ_max = paged
+        ? page_count * block_size
+        : (KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11);
+    const int k_VKQ_0_init = paged
+        ? page_start * block_size + blockIdx.y*nthreads
+        : blockIdx.y*nthreads;
+
+    // mask base row pointer (covers the whole pool along ne11). For both
+    // paths we keep maskh anchored at the start of the row and index by
+    // the appropriate cell index inside the loop.
+    const half * mask_row_base = maskh;
+
+    if (!paged) {
+        K     += blockIdx.y*nthreads * nb11;
+        V     += blockIdx.y*nthreads * nb21;
+        maskh += blockIdx.y*nthreads;
+    }
+
+    for (int k_VKQ_0 = k_VKQ_0_init; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nthreads,
+             // Increment pointers for the legacy path only. In the paged path
+             // K/V/mask are addressed via physical cell indices computed inside
+             // the loop body, so the base pointers must stay put.
+             K     = paged ? K     : K     + gridDim.y*nthreads*nb11,
+             V     = paged ? V     : V     + gridDim.y*nthreads*nb21,
+             maskh = paged ? maskh : maskh + gridDim.y*nthreads) {
 
         // Calculate KQ tile and keep track of new maximum KQ values:
         float KQ_reg[ncols]; // KQ in registers.
@@ -257,9 +316,34 @@ static __global__ void flash_attn_ext_vec(
         for (int i_KQ_0 = 0; i_KQ_0 < nthreads_KQ; ++i_KQ_0) {
             const int i_KQ = threadIdx.y*WARP_SIZE + (nthreads_KQ == WARP_SIZE ? 0 : (threadIdx.x & ~(nthreads_KQ-1))) + i_KQ_0;
 
+            // Resolve K row pointer + physical cell index for mask.
+            const char * K_row;
+            int          phys_cell;
+            bool         valid = true;
+            if (!paged) {
+                K_row     = K + i_KQ*nb11;
+                phys_cell = i_KQ; // legacy: maskh already advanced; index relative
+            } else {
+                const int logical = k_VKQ_0 + i_KQ;
+                const int page    = logical / block_size;
+                const int intra   = logical - page * block_size;
+                int       blk_id  = -1;
+                if (page < page_count) {
+                    blk_id = seq_bt[page];
+                }
+                if (blk_id < 0) {
+                    valid     = false;
+                    phys_cell = 0;
+                    K_row     = K_base; // dummy; result will be masked out
+                } else {
+                    phys_cell = blk_id * block_size + intra;
+                    K_row     = K_base + (int64_t) phys_cell * nb11;
+                }
+            }
+
 #pragma unroll
             for (int j = 0; j < ncols; ++j) {
-                float sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
+                float sum = vec_dot_KQ(K_row, Q_reg[j], Q_i32[j], Q_ds[j]);
                 sum = warp_reduce_sum<nthreads_KQ>(sum);
 
                 if (use_logit_softcap) {
@@ -267,7 +351,14 @@ static __global__ void flash_attn_ext_vec(
                 }
 
                 if (mask && (ncols == 1 || ic0 + j < int(ne01.z))) {
-                    sum += slope*__half2float(maskh[j*ne11 + i_KQ]);
+                    if (paged) {
+                        sum += slope*__half2float(mask_row_base[j*ne11 + phys_cell]);
+                    } else {
+                        sum += slope*__half2float(maskh[j*ne11 + i_KQ]);
+                    }
+                }
+                if (!valid) {
+                    sum = -FLT_MAX/2.0f;
                 }
 
                 KQ_max_new[j] = fmaxf(KQ_max_new[j], sum + FATTN_KQ_MAX_OFFSET);
@@ -314,6 +405,31 @@ static __global__ void flash_attn_ext_vec(
         for (int k0 = 0; k0 < WARP_SIZE; k0 += V_cols_per_iter) {
             const int k = threadIdx.y*WARP_SIZE + k0 + (nthreads_V == WARP_SIZE ? 0 : threadIdx.x / nthreads_V);
 
+            // Resolve V row pointer for this column. Legacy: V already has the
+            // base offset for this loop iteration applied. Paged: translate the
+            // logical cell (k_VKQ_0 + k) into a physical slab cell.
+            const char * V_row;
+            if (!paged) {
+                V_row = V + k*nb21;
+            } else {
+                const int logical_v = k_VKQ_0 + k;
+                const int page_v    = logical_v / block_size;
+                const int intra_v   = logical_v - page_v * block_size;
+                int       blk_id_v  = -1;
+                if (page_v < page_count) {
+                    blk_id_v = seq_bt[page_v];
+                }
+                if (blk_id_v < 0) {
+                    // KQ value for invalid cells was forced to -INF; the
+                    // contribution exp(KQ-max)*V is effectively zero. Use
+                    // V_base as a safe dummy; KQ_k will be ~0.
+                    V_row = V_base;
+                } else {
+                    const int64_t cell_v = (int64_t) blk_id_v * block_size + intra_v;
+                    V_row = V_base + cell_v * nb21;
+                }
+            }
+
 #ifdef V_DOT2_F32_F16_AVAILABLE
             half2 KQ_k[ncols];
 #pragma unroll
@@ -325,14 +441,14 @@ static __global__ void flash_attn_ext_vec(
                 half2 tmp[V_rows_per_thread/2];
                 if constexpr (type_V == GGML_TYPE_BF16) {
                     float2 tmp_f[V_rows_per_thread/2];
-                    dequantize_V(V + k*nb21, tmp_f,
+                    dequantize_V(V_row, tmp_f,
                         2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
 #pragma unroll
                     for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
                         tmp[i_VKQ_1] = __float22half2_rn(tmp_f[i_VKQ_1]);
                     }
                 } else {
-                    dequantize_V(V + k*nb21, tmp,
+                    dequantize_V(V_row, tmp,
                         2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
                 }
 #pragma unroll
@@ -352,7 +468,7 @@ static __global__ void flash_attn_ext_vec(
 #pragma unroll
             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
                 float2 tmp[V_rows_per_thread/2];
-                dequantize_V(V + k*nb21, tmp,
+                dequantize_V(V_row, tmp,
                     2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
 #pragma unroll
                 for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
@@ -511,7 +627,8 @@ static __global__ void flash_attn_ext_vec(
               nb11, nb12, nb13,
               nb21, nb22, nb23,
               ne31, ne32, ne33,
-              nb31, nb32, nb33);
+              nb31, nb32, nb33,
+        block_table, seq_ids_q, page_limits_q, max_pages, block_size);
     NO_DEVICE_CODE;
 #endif // FLASH_ATTN_AVAILABLE
 }

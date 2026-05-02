@@ -309,6 +309,113 @@ static constexpr __device__ int ggml_cuda_fattn_mma_get_nstages(const int DKQ, c
 
 // ------------------------------------------------------------------------------------------------------------------
 
+// Resolve a physical cell index for a logical cell during paged-attention.
+// Returns -1 if the page is past page_count or the slot is unmapped.
+static __device__ __forceinline__ int paged_resolve_cell_mma(
+        const int * __restrict__ block_table_local,
+        int logical_cell, int page_count, int block_size) {
+    const int page  = logical_cell / block_size;
+    const int intra = logical_cell - page*block_size;
+    if (page >= page_count) return -1;
+    const int blk_id = block_table_local[page];
+    if (blk_id < 0) return -1;
+    return blk_id*block_size + intra;
+}
+
+// Paged variant of flash_attn_ext_f16_load_tile. Same shared-memory layout,
+// but every row of the tile is gathered through block_table.
+//   logical = k_VKQ_0 + i
+//   phys    = block_table_local[logical/block_size]*block_size + logical%block_size
+// Rows whose page is missing or whose block_id is -1 are filled with zeros so
+// the KQ contribution vanishes (the mask is expected to suppress the softmax
+// weight as well in those cases).
+template<int stride_tile, int nwarps, int nbatch_fa, bool use_cp_async, bool oob_check>
+static __device__ __forceinline__ void flash_attn_ext_f16_load_tile_paged(
+        const half2 * const __restrict__ KV_base,
+        half2       * const __restrict__ tile_KV,
+        const int                       D2,
+        const int                       stride_KV,
+        const int                       i_sup,
+        const int   * __restrict__      block_table_local,
+        const int                       k_VKQ_0,
+        const int                       page_count,
+        const int                       block_size,
+        const int                       k_offset_h2) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int h2_per_chunk = 16/sizeof(half2);
+    const int chunks_per_row = D2 / h2_per_chunk;
+
+    if constexpr (use_cp_async) {
+        static_assert(warp_size == 32, "bad warp_size");
+        static_assert(!oob_check, "OOB check not compatible with cp_async");
+        constexpr int preload = 64;
+
+        const unsigned int tile_KV_32 = ggml_cuda_cvta_generic_to_shared(tile_KV);
+        // Zero buffer in shared mem for invalid rows: cp.async requires a
+        // global address. Fall back to a synchronous zero-fill on misses.
+        auto load = [&] __device__ (auto n) {
+            const int stride_k = warp_size >> n;
+            const int k0_start = stride_k == warp_size ? 0 : chunks_per_row - chunks_per_row % (2*stride_k);
+            const int k0_stop  =                             chunks_per_row - chunks_per_row % (1*stride_k);
+            const int stride_i = warp_size / stride_k;
+            if (k0_start == k0_stop) return;
+
+#pragma unroll
+            for (int i0 = 0; i0 < nbatch_fa; i0 += nwarps*stride_i) {
+                const int i = i0 + threadIdx.y*stride_i + (stride_k == warp_size ? 0 : threadIdx.x / stride_k);
+                if (i0 + nwarps*stride_i > nbatch_fa && i >= nbatch_fa) break;
+
+                const int phys = paged_resolve_cell_mma(block_table_local, k_VKQ_0 + i, page_count, block_size);
+
+#pragma unroll
+                for (int k0 = k0_start; k0 < k0_stop; k0 += stride_k) {
+                    const int k = k0 + (stride_k == warp_size ? threadIdx.x : threadIdx.x % stride_k);
+
+                    if (phys < 0) {
+                        // Synchronously zero the SRAM slot; cp.async cannot
+                        // read from a null source. The cp_async_wait_all that
+                        // follows the loader synchronizes both paths.
+                        const half2 zero[4] = {{0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}};
+                        ggml_cuda_memcpy_1<16>(tile_KV + i*stride_tile + k*4, zero);
+                    } else {
+                        cp_async_cg_16<preload>(
+                            tile_KV_32 + i*(stride_tile*sizeof(half2)) + k*16,
+                            KV_base + (int64_t) phys * stride_KV + k_offset_h2 + k*h2_per_chunk);
+                    }
+                }
+            }
+        };
+        ggml_cuda_unroll<6>{}(load);
+    } else {
+        const half2 zero[4] = {{0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}};
+        auto load = [&] __device__ (const int n) {
+            const int stride_k = 32 >> n;
+            const int k0_start = stride_k == 32 ? 0 : chunks_per_row - chunks_per_row % (2*stride_k);
+            const int k0_stop  =                      chunks_per_row - chunks_per_row % (1*stride_k);
+            const int stride_i = warp_size / stride_k;
+            if (k0_start == k0_stop) return;
+
+#pragma unroll
+            for (int i0 = 0; i0 < nbatch_fa; i0 += nwarps*stride_i) {
+                const int i = i0 + threadIdx.y*stride_i + (stride_k == warp_size ? 0 : threadIdx.x / stride_k);
+                if (i0 + nwarps*stride_i > nbatch_fa && i >= nbatch_fa) break;
+
+                const int phys = paged_resolve_cell_mma(block_table_local, k_VKQ_0 + i, page_count, block_size);
+                const bool valid = phys >= 0 && (!oob_check || i < i_sup);
+
+#pragma unroll
+                for (int k0 = k0_start; k0 < k0_stop; k0 += stride_k) {
+                    const int k = k0 + (stride_k == warp_size ? threadIdx.x : threadIdx.x % stride_k);
+
+                    ggml_cuda_memcpy_1<16>(tile_KV + i*stride_tile + k*4,
+                        valid ? KV_base + (int64_t) phys * stride_KV + k_offset_h2 + k*h2_per_chunk : zero);
+                }
+            }
+        };
+        ggml_cuda_unroll<6>{}(load);
+    }
+}
+
 template<int stride_tile, int nwarps, int nbatch_fa, bool use_cp_async, bool oob_check>
 static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
         const half2 * const __restrict__ KV, half2 * const __restrict__ tile_KV, const int D2, const int stride_KV, const int i_sup) {
@@ -494,6 +601,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         const int stride_K,
         const int stride_V,
         const int stride_mask,
+        const int * __restrict__ block_table_local,
+        const int page_count,
+        const int block_size,
         half2        * const __restrict__ tile_Q,
         half2        * const __restrict__ tile_K,
         half2        * const __restrict__ tile_V,
@@ -538,8 +648,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         constexpr bool use_cp_async = true;
         cp_async_wait_all();
         __syncthreads();
-        flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check>
-            (V_h2 + int64_t(k_VKQ_0)*stride_V, tile_V, nbatch_V2, stride_V, k_VKQ_sup);
+        if (block_table_local) {
+            flash_attn_ext_f16_load_tile_paged<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check>
+                (V_h2, tile_V, nbatch_V2, stride_V, k_VKQ_sup, block_table_local, k_VKQ_0, page_count, block_size, 0);
+        } else {
+            flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check>
+                (V_h2 + int64_t(k_VKQ_0)*stride_V, tile_V, nbatch_V2, stride_V, k_VKQ_sup);
+        }
     } else {
         constexpr bool use_cp_async = nstages == 1;
         if (ncols2 > 1 || mask_h) {
@@ -557,8 +672,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
         if constexpr (nstages <= 1) {
             constexpr bool use_cp_async = nstages == 1;
-            flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
-                (K_h2 + int64_t(k_VKQ_0)*stride_K + k0_start, tile_K, k0_diff, stride_K, k_VKQ_sup);
+            if (block_table_local) {
+                flash_attn_ext_f16_load_tile_paged<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
+                    (K_h2, tile_K, k0_diff, stride_K, k_VKQ_sup, block_table_local, k_VKQ_0, page_count, block_size, k0_start);
+            } else {
+                flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
+                    (K_h2 + int64_t(k_VKQ_0)*stride_K + k0_start, tile_K, k0_diff, stride_K, k_VKQ_sup);
+            }
             if (use_cp_async) {
                 cp_async_wait_all();
             }
@@ -869,8 +989,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check>
                     (mask_h + k_VKQ_0 + nbatch_fa, tile_mask, stride_mask, k_VKQ_sup, jt*ncols1, ne01);
             }
-            flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
-                (K_h2 + int64_t(k_VKQ_0 + nbatch_fa)*stride_K, tile_K, nbatch_K2, stride_K, k_VKQ_sup);
+            if (block_table_local) {
+                flash_attn_ext_f16_load_tile_paged<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
+                    (K_h2, tile_K, nbatch_K2, stride_K, k_VKQ_sup, block_table_local, k_VKQ_0 + nbatch_fa, page_count, block_size, 0);
+            } else {
+                flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
+                    (K_h2 + int64_t(k_VKQ_0 + nbatch_fa)*stride_K, tile_K, nbatch_K2, stride_K, k_VKQ_sup);
+            }
         }
     }
 
@@ -885,8 +1010,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         if constexpr (nstages <= 1) {
             if (!V_is_K_view || i0_stop > 2*nbatch_K2) {
                 constexpr bool use_cp_async = nstages == 1;
-                flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check>
-                    (V_h2 + int64_t(k_VKQ_0)*stride_V + i0_start/2, tile_V, i0_diff/2, stride_V, k_VKQ_sup);
+                if (block_table_local) {
+                    flash_attn_ext_f16_load_tile_paged<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check>
+                        (V_h2, tile_V, i0_diff/2, stride_V, k_VKQ_sup, block_table_local, k_VKQ_0, page_count, block_size, i0_start/2);
+                } else {
+                    flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check>
+                        (V_h2 + int64_t(k_VKQ_0)*stride_V + i0_start/2, tile_V, i0_diff/2, stride_V, k_VKQ_sup);
+                }
                 if (use_cp_async) {
                     cp_async_wait_all();
                 }
@@ -944,7 +1074,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 #else
     GGML_UNUSED_VARS(Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup,
         scale, slope, logit_softcap, ne01, ne02,
-        stride_K, stride_V, stride_mask,
+        stride_K, stride_V, stride_mask, block_table_local, page_count, block_size,
         tile_Q, tile_K, tile_V, tile_mask,
         Q_B, VKQ_C, KQ_max, KQ_rowsum, kb0);
     NO_DEVICE_CODE;
@@ -1009,6 +1139,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         const int stride_K,
         const int stride_V,
         const int stride_mask,
+        const int * __restrict__ block_table_local,
+        const int page_count,
+        const int block_size,
         const int jt,
         const int zt_gqa,
         const int kb0_start,
@@ -1138,8 +1271,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check>
                 (mask_h + kb0*nbatch_fa, tile_mask, stride_mask, k_VKQ_sup, jt*ncols1, ne01);
         }
-        flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
-            (K_h2 + int64_t(kb0)*nbatch_fa*stride_K, tile_K, nbatch_K2, stride_K, k_VKQ_sup);
+        if (block_table_local) {
+            flash_attn_ext_f16_load_tile_paged<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
+                (K_h2, tile_K, nbatch_K2, stride_K, k_VKQ_sup, block_table_local, kb0*nbatch_fa, page_count, block_size, 0);
+        } else {
+            flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
+                (K_h2 + int64_t(kb0)*nbatch_fa*stride_K, tile_K, nbatch_K2, stride_K, k_VKQ_sup);
+        }
     }
 
     // kb0_start is always < kb0_stop so the last iter can be executed unconditionally.
@@ -1152,16 +1290,17 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, last_iter, oob_check,
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
                 (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
-                 ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+                 ne01, ne02, stride_K, stride_V, stride_mask, block_table_local, page_count, block_size, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
                  KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
         }
         constexpr bool last_iter = true;
-        const     int  k_VKQ_sup = ne11 - kb0*nbatch_fa;
+        const int logical_k_max = block_table_local ? page_count*block_size : ne11;
+        const int k_VKQ_sup = logical_k_max - kb0*nbatch_fa;
         flash_attn_ext_f16_iter
             <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, last_iter, oob_check,
               T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
             (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
-             ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+             ne01, ne02, stride_K, stride_V, stride_mask, block_table_local, page_count, block_size, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
              KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
     } else {
         constexpr bool oob_check = false;
@@ -1172,7 +1311,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, last_iter, oob_check,
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
                 (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
-                 ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+                 ne01, ne02, stride_K, stride_V, stride_mask, block_table_local, page_count, block_size, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
                  KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
         }
         constexpr bool last_iter = true;
@@ -1181,7 +1320,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, last_iter, oob_check,
              T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
             (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
-             ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+             ne01, ne02, stride_K, stride_V, stride_mask, block_table_local, page_count, block_size, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
              KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
     }
 
@@ -1524,7 +1663,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 #else
     GGML_UNUSED_VARS(Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dstk_fixup,
         scale, slope, logit_softcap, ne01, ne02, gqa_ratio,
-        stride_Q1, stride_Q2, stride_K, stride_V, stride_mask,
+        stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, block_table_local, page_count, block_size,
         jt, kb0_start, kb0_stop);
     NO_DEVICE_CODE;
 #endif // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || (defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)) || defined(AMD_MFMA_AVAILABLE)
@@ -1553,9 +1692,13 @@ static __global__ void flash_attn_ext_f16(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33) {
+                            const int32_t nb31, const int32_t nb32, const int64_t nb33,
+        const int * __restrict__ block_table,
+        const int * __restrict__ seq_ids_q,
+        const int * __restrict__ page_limits_q,
+        const int32_t max_pages,
+        const int32_t block_size) {
 #if defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || (defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)) || defined(AMD_MFMA_AVAILABLE))
-
     // Skip unused kernel variants for faster compilation:
     if (use_logit_softcap && !(DKQ == 128 || DKQ == 256 || DKQ == 512)) {
         NO_DEVICE_CODE;
@@ -1637,23 +1780,44 @@ static __global__ void flash_attn_ext_f16(
 
         const half2 * V_h2 = V_is_K_view ? K_h2 : (const half2 *) (V + nb23*sequence + nb22*z_KV);
         const float * sinks_f = sinks ? (const float *) sinks + zt_Q : nullptr;
+        const bool paged_mma = (block_table != nullptr);
+        const int col_Q_0 = jt*ncols1;
+        const int seq_id = (paged_mma && seq_ids_q && col_Q_0 < int(ne01.z)) ? seq_ids_q[col_Q_0] : 0;
+        const int * __restrict__ seq_bt = paged_mma ? block_table + (int64_t) seq_id * max_pages : nullptr;
+        int page_start = 0;
+        int page_count = 0;
+        if (paged_mma) {
+            if (page_limits_q) {
+                const int ps = page_limits_q[col_Q_0*2 + 0];
+                const int pe = page_limits_q[col_Q_0*2 + 1];
+                page_start = ps > 0 ? ps : 0;
+                page_count = pe < max_pages ? pe : max_pages;
+            } else {
+                page_start = 0;
+                page_count = max_pages;
+            }
+        }
 
         const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, zt_Q, n_head_log2, m0, m1) : 1.0f;
 
-        if (KV_max) {
+        if (paged_mma) {
+            const int iter_k_paged = (page_count*block_size + (nbatch_fa - 1)) / nbatch_fa;
+            kb0_start = page_start + kb0_start;
+            kb0_stop = min(kb0_start + (kbc_stop - kbc), page_start + iter_k_paged);
+        } else if (KV_max) {
             kb0_stop = min(kb0_stop, KV_max[sequence*iter_j + jt] / nbatch_fa);
         }
         constexpr bool is_fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
-        if (kb0_start == 0) {
+        if (kb0_start == (paged_mma ? page_start : 0)) {
             constexpr bool needs_fixup = false; // CUDA block is working on an entire tile.
             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup>
                 (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
-                 ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
+                 ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, seq_bt, page_count, block_size, jt, zt_gqa, kb0_start, kb0_stop);
         } else {
             constexpr bool needs_fixup = true; // CUDA block is missing the beginning of a tile.
             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup>
                 (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
-                 ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
+                 ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, seq_bt, page_count, block_size, jt, zt_gqa, kb0_start, kb0_stop);
         }
 
         kbc += iter_k;
@@ -1683,10 +1847,31 @@ static __global__ void flash_attn_ext_f16(
 
     const half2 * V_h2 = V_is_K_view ? K_h2 : (const half2 *) (V + nb23*sequence + nb22*z_KV);
     const float * sinks_f = sinks ? (const float *) sinks + zt_Q : nullptr;
+    const bool paged_mma = (block_table != nullptr);
+    const int col_Q_0 = jt*ncols1;
+    const int seq_id = (paged_mma && seq_ids_q && col_Q_0 < int(ne01.z)) ? seq_ids_q[col_Q_0] : 0;
+    const int * __restrict__ seq_bt = paged_mma ? block_table + (int64_t) seq_id * max_pages : nullptr;
+    int page_start = 0;
+    int page_count = 0;
+    if (paged_mma) {
+        if (page_limits_q) {
+            const int ps = page_limits_q[col_Q_0*2 + 0];
+            const int pe = page_limits_q[col_Q_0*2 + 1];
+            page_start = ps > 0 ? ps : 0;
+            page_count = pe < max_pages ? pe : max_pages;
+        } else {
+            page_start = 0;
+            page_count = max_pages;
+        }
+    }
 
     const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, zt_Q, n_head_log2, m0, m1) : 1.0f;
 
-    if (KV_max) {
+    if (paged_mma) {
+        const int iter_k_paged = (page_count*block_size + (nbatch_fa - 1)) / nbatch_fa;
+        kb0_start = page_start + kb0_start;
+        kb0_stop = min(kb0_start + (kbc_stop - kbc), page_start + iter_k_paged);
+    } else if (KV_max) {
         kb0_stop = min(kb0_stop, KV_max[sequence*iter_j + jt] / nbatch_fa);
     }
 
@@ -1694,7 +1879,7 @@ static __global__ void flash_attn_ext_f16(
     constexpr bool needs_fixup = false;
     flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup>
         (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
-         ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
+         ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, seq_bt, page_count, block_size, jt, zt_gqa, kb0_start, kb0_stop);
 #else
     GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
@@ -1704,7 +1889,8 @@ static __global__ void flash_attn_ext_f16(
               nb11, nb12, nb13,
               nb21, nb22, nb23,
               ne31, ne32, ne33,
-              nb31, nb32, nb33);
+              nb31, nb32, nb33,
+        block_table, seq_ids_q, page_limits_q, max_pages, block_size);
     NO_DEVICE_CODE;
 #endif // defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || (defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)) || defined(AMD_MFMA_AVAILABLE))
 }

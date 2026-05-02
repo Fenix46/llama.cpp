@@ -331,6 +331,16 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const ggml_tensor * K     = dst->src[1];
     const ggml_tensor * V     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * block_table = dst->src[5];
+
+    static const bool paged_attn_enabled = []() {
+        const char * env = getenv("LLAMA_PAGED_ATTN");
+        return env == nullptr || env[0] != '0';
+    }();
+    const bool paged_attn_active = block_table != nullptr && paged_attn_enabled;
+    if (paged_attn_active && (dst->src[6] == nullptr || dst->src[7] == nullptr)) {
+        return BEST_FATTN_KERNEL_NONE;
+    }
 
     const int gqa_ratio = Q->ne[2] / K->ne[2];
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
@@ -468,7 +478,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     // Use the WMMA kernel if possible:
-    if (ggml_cuda_should_use_wmma_fattn(cc) && K->ne[1] % FATTN_KQ_STRIDE == 0 && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[0] != 512 && Q->ne[0] != 576) {
+    if (!paged_attn_active &&
+        ggml_cuda_should_use_wmma_fattn(cc) && K->ne[1] % FATTN_KQ_STRIDE == 0 && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[0] != 512 && Q->ne[0] != 576) {
         if (can_use_vector_kernel && Q->ne[1] <= 2) {
             return BEST_FATTN_KERNEL_VEC;
         }
