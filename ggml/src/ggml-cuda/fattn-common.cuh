@@ -956,7 +956,6 @@ void launch_fattn(
     // block_size is fixed at the paged-cache default (LLAMA_KV_BLOCK_SIZE_DEFAULT == 16).
     // The Metal paged kernels also hardcode this value.
     const int32_t bt_block_size = block_table_t ? 16 : 0;
-
     ggml_tensor * KQV = dst;
 
     GGML_ASSERT(Q->type == GGML_TYPE_F32);
