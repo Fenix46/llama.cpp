@@ -1826,8 +1826,10 @@ static __global__ void flash_attn_ext_f16(
 
         // Contiguous fast-path: if all pages map to consecutive physical blocks, bypass
         // paged_resolve_cell_mma and use the flat load_tile path (coalesced HBM access).
+        // bt_base_block is adjusted by -page_start so that (bt_base_block + kb0)*block_size
+        // gives the correct physical offset even after kb0_start is shifted by page_start below.
         const bool bt_contig     = seq_bt ? check_pages_contiguous(seq_bt + page_start, page_count - page_start) : false;
-        const int  bt_base_block = (bt_contig && seq_bt) ? seq_bt[page_start] : 0;
+        const int  bt_base_block = (bt_contig && seq_bt) ? seq_bt[page_start] - page_start : 0;
 
         if (paged_mma) {
             const int iter_k_paged = (page_count*block_size + (nbatch_fa - 1)) / nbatch_fa;
@@ -1897,7 +1899,7 @@ static __global__ void flash_attn_ext_f16(
     const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, zt_Q, n_head_log2, m0, m1) : 1.0f;
 
     const bool bt_contig     = seq_bt ? check_pages_contiguous(seq_bt + page_start, page_count - page_start) : false;
-    const int  bt_base_block = (bt_contig && seq_bt) ? seq_bt[page_start] : 0;
+    const int  bt_base_block = (bt_contig && seq_bt) ? seq_bt[page_start] - page_start : 0;
 
     if (paged_mma) {
         const int iter_k_paged = (page_count*block_size + (nbatch_fa - 1)) / nbatch_fa;
