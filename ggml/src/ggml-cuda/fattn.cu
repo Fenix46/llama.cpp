@@ -337,6 +337,24 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         const char * env = getenv("LLAMA_PAGED_ATTN");
         return env == nullptr || env[0] != '0';
     }();
+    enum paged_kernel_pref {
+        PAGED_KERNEL_TILE,
+        PAGED_KERNEL_MMA,
+        PAGED_KERNEL_AUTO,
+    };
+    static const paged_kernel_pref paged_kernel = []() {
+        const char * env = getenv("LLAMA_PAGED_KERNEL");
+        if (env == nullptr || env[0] == '\0') {
+            return PAGED_KERNEL_TILE; // safe default
+        }
+        if (strcmp(env, "mma") == 0) {
+            return PAGED_KERNEL_MMA;
+        }
+        if (strcmp(env, "auto") == 0) {
+            return PAGED_KERNEL_AUTO;
+        }
+        return PAGED_KERNEL_TILE;
+    }();
     const bool paged_attn_active = block_table != nullptr && paged_attn_enabled;
     if (block_table != nullptr && !paged_attn_enabled) {
         // Paged scheduler provides paged KV layout. Forcing legacy attention here
@@ -347,7 +365,22 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_NONE;
     }
     if (paged_attn_active) {
-        // Conservative route: tile paged path is currently the validated backend.
+        if (paged_kernel == PAGED_KERNEL_TILE) {
+            return BEST_FATTN_KERNEL_TILE;
+        }
+        if (paged_kernel == PAGED_KERNEL_MMA) {
+            if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+                return BEST_FATTN_KERNEL_MMA_F16;
+            }
+            if (volta_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+                return BEST_FATTN_KERNEL_MMA_F16;
+            }
+            if (amd_mfma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[0] != 256 && Q->ne[0] != 512 && Q->ne[0] != 576) {
+                return BEST_FATTN_KERNEL_MMA_F16;
+            }
+            return BEST_FATTN_KERNEL_TILE;
+        }
+        // auto: currently same as safe mode; can be tuned after validation.
         return BEST_FATTN_KERNEL_TILE;
     }
 
