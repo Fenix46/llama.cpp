@@ -3467,6 +3467,12 @@ private:
                                 req.prompt.checkpoints.rbegin(),
                                 req.prompt.checkpoints.rend(),
                                 [&](const auto & cur) {
+                                    // For non-SWA paths, the useful checkpoint criterion is whether it does not
+                                    // advance beyond the reusable token prefix (n_past), regardless of pos_min drift.
+                                    if (n_swa == 0) {
+                                        return cur.n_tokens > 0 && cur.n_tokens <= n_past;
+                                    }
+                                    // For SWA/hybrid paths, fall back to positional criterion.
                                     return cur.pos_min < pos_min_thold || cur.pos_min == 0;
                                 }
                             );
@@ -3491,7 +3497,10 @@ private:
                             }
 
                             if (do_reset) {
-                                PGD_WRN(req, "%s", "forcing full prompt re-processing due to lack of cache data (likely SWA or hybrid/recurrent memory)\n");
+                                PGD_WRN(req,
+                                        "forcing full prompt re-processing due to lack of cache data "
+                                        "(likely SWA or hybrid/recurrent memory): n_past=%d, pos_min_thold=%d, checkpoints=%zu\n",
+                                        n_past, pos_min_thold, req.prompt.checkpoints.size());
                                 pos_next = 0;
                                 n_past = 0;
                             }
