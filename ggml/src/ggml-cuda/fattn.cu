@@ -346,7 +346,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     static const paged_kernel_pref paged_kernel = []() {
         const char * env = getenv("LLAMA_PAGED_KERNEL");
         if (env == nullptr || env[0] == '\0') {
-            return PAGED_KERNEL_TILE; // safe default
+            return PAGED_KERNEL_AUTO;
         }
         if (strcmp(env, "mma") == 0) {
             return PAGED_KERNEL_MMA;
@@ -366,22 +366,60 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_NONE;
     }
     if (paged_attn_active) {
+        const bool paged_mma_shape_supported = [&]() -> bool {
+            if (Q->ne[2] % K->ne[2] != 0) {
+                return false;
+            }
+            const int gqa_ratio = Q->ne[2] / K->ne[2];
+
+            float max_bias = 0.0f;
+            memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
+            const bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+
+            switch (Q->ne[0]) {
+                case 64:
+                case 80:
+                case 96:
+                case 112:
+                case 128:
+                case 256:
+                    return V->ne[0] == Q->ne[0];
+                case 320:
+                    return V->ne[0] == 256 && gqa_opt_applies && gqa_ratio % 32 == 0;
+                case 512:
+                    return V->ne[0] == 512 && gqa_opt_applies;
+                case 576:
+                    return V->ne[0] == 512 && gqa_opt_applies;
+                default:
+                    return false;
+            }
+        }();
+
         if (paged_kernel == PAGED_KERNEL_TILE) {
             return BEST_FATTN_KERNEL_TILE;
         }
         if (paged_kernel == PAGED_KERNEL_MMA) {
-            if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+            if (paged_mma_shape_supported && turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
                 return BEST_FATTN_KERNEL_MMA_F16;
             }
-            if (volta_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+            if (paged_mma_shape_supported && volta_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
                 return BEST_FATTN_KERNEL_MMA_F16;
             }
-            if (amd_mfma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[0] != 256 && Q->ne[0] != 512 && Q->ne[0] != 576) {
+            if (paged_mma_shape_supported && amd_mfma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[0] != 256 && Q->ne[0] != 512 && Q->ne[0] != 576) {
                 return BEST_FATTN_KERNEL_MMA_F16;
             }
             return BEST_FATTN_KERNEL_TILE;
         }
-        // auto: currently same as safe mode; can be tuned after validation.
+        // auto: prefer MMA when hardware + shape are supported, otherwise fallback to tile.
+        if (paged_mma_shape_supported && turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+            return BEST_FATTN_KERNEL_MMA_F16;
+        }
+        if (paged_mma_shape_supported && volta_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+            return BEST_FATTN_KERNEL_MMA_F16;
+        }
+        if (paged_mma_shape_supported && amd_mfma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[0] != 256 && Q->ne[0] != 512 && Q->ne[0] != 576) {
+            return BEST_FATTN_KERNEL_MMA_F16;
+        }
         return BEST_FATTN_KERNEL_TILE;
     }
 

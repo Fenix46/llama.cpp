@@ -42,6 +42,28 @@ Run on Apple Silicon with a local GGUF model:
   --webui
 ```
 
+Run on CUDA (Linux) with paged scheduler and paged MMA auto-selection:
+
+```sh
+LLAMA_PAGED_ATTN=1 LLAMA_PAGED_KERNEL=auto \
+./build/bin/llama-server \
+  -m /path/to/model.gguf \
+  --host 127.0.0.1 \
+  --port 8080 \
+  -ngl 99 \
+  --scheduler paged \
+  --max-model-len 128000 \
+  --gpu-memory-utilization 0.90 \
+  --kv-prefix-cache \
+  --cache-ram 0
+```
+
+To force paged MMA kernel selection (fallback to tile remains enabled when shape/hardware is unsupported):
+
+```sh
+LLAMA_PAGED_ATTN=1 LLAMA_PAGED_KERNEL=mma ./build/bin/llama-server -m /path/to/model.gguf -ngl 99 --scheduler paged
+```
+
 Check the server:
 
 ```sh
