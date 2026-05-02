@@ -338,8 +338,17 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return env == nullptr || env[0] != '0';
     }();
     const bool paged_attn_active = block_table != nullptr && paged_attn_enabled;
+    if (block_table != nullptr && !paged_attn_enabled) {
+        // Paged scheduler provides paged KV layout. Forcing legacy attention here
+        // is invalid and can produce garbage output.
+        return BEST_FATTN_KERNEL_NONE;
+    }
     if (paged_attn_active && (dst->src[6] == nullptr || dst->src[7] == nullptr)) {
         return BEST_FATTN_KERNEL_NONE;
+    }
+    if (paged_attn_active) {
+        // Conservative route: tile paged path is currently the validated backend.
+        return BEST_FATTN_KERNEL_TILE;
     }
 
     const int gqa_ratio = Q->ne[2] / K->ne[2];
