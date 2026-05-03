@@ -1100,6 +1100,15 @@ private:
 
         if (ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
             SRV_WRN("%s", "speculative decoding will use checkpoints\n");
+
+            // Paged scheduler now avoids CPU checkpoints in the hot path.
+            // If speculative decoding requires FULL seq-rm semantics, disable it
+            // to prevent broken generation from partial speculative acceptance.
+            if (params_base.scheduler == "paged" &&
+                params_base.speculative.type != COMMON_SPECULATIVE_TYPE_NONE) {
+                SRV_WRN("%s", "[paged] disabling speculative decoding: context requires checkpoints but checkpoint path is disabled\n");
+                params_base.speculative.type = COMMON_SPECULATIVE_TYPE_NONE;
+            }
         }
 
         // cache for dynamic slot creation
