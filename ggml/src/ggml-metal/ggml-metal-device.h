@@ -204,7 +204,8 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
 // Paged attention kernel (no mask, uses block_table + seq_ids_q instead)
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_paged(
         ggml_metal_library_t lib,
-        const struct ggml_tensor * op);
+        const struct ggml_tensor * op,
+        int32_t nsg);
 
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_paged_vec(
         ggml_metal_library_t lib,

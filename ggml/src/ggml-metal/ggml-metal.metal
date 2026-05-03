@@ -6505,7 +6505,7 @@ kernel void kernel_flash_attn_ext_paged(
     const int iq2 = tgpig[1]; // head index
     const int iq3 = tgpig[2]; // stream index
     const int lane = tiisg;
-    const int nsg = 8;
+    const int nsg = FC_flash_attn_ext_nsg;
 
     if (iq0 >= args.ne01) return;
 

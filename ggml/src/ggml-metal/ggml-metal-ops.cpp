@@ -2849,7 +2849,29 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             /*.has_sinks     =*/ has_sinks ? 1 : 0,
         };
 
-        auto pipeline_paged = ggml_metal_library_get_pipeline_flash_attn_ext_paged(lib, op);
+        int32_t nsg_paged = ne11 >= 4096 ? 16 : (ne11 >= 1024 ? 8 : 4);
+        ggml_metal_pipeline_with_params pipeline_paged;
+        size_t shm_paged = 0;
+
+        for (;;) {
+            pipeline_paged = ggml_metal_library_get_pipeline_flash_attn_ext_paged(lib, op, nsg_paged);
+            shm_paged = (2 + 32 * 20) * (size_t) nsg_paged * sizeof(float);
+
+            if (shm_paged <= props_dev->max_theadgroup_memory_size &&
+                nsg_paged * 32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline_paged)) {
+                break;
+            }
+
+            if (nsg_paged > 8) {
+                nsg_paged = 8;
+            } else if (nsg_paged > 4) {
+                nsg_paged = 4;
+            } else if (nsg_paged > 2) {
+                nsg_paged = 2;
+            } else {
+                nsg_paged = 1;
+            }
+        }
 
         ggml_metal_encoder_set_pipeline(enc, pipeline_paged);
         ggml_metal_encoder_set_bytes  (enc, &args_paged, sizeof(args_paged), 0);
@@ -2863,9 +2885,6 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer (enc, bid_src4, 8); // sinks
         ggml_metal_encoder_set_buffer (enc, bid_dst,  9); // output
 
-        // Eight simdgroups per query token/head/stream to parallelize KV cache scan.
-        const int32_t nsg_paged = 8;
-        const size_t  shm_paged = (2 + 32 * 20) * nsg_paged * sizeof(float);
         ggml_metal_encoder_set_threadgroup_memory_size(enc, shm_paged, 0);
         ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, 32, nsg_paged, 1);
 
