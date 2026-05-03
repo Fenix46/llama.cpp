@@ -2287,12 +2287,12 @@ static bool set_input_kq_mask_paged_impl(const args_set_input_kq_mask & args, fl
             const llama_seq_id seq_id = ubatch->seq_id[i][0];
             const uint32_t strm = args.seq_to_stream[seq_id];
             if (strm >= args.v_block_alloc.size()) {
-                return false;
+                continue;
             }
 
             const auto & alloc = args.v_block_alloc[strm];
             if (alloc.n_blocks() == 0) {
-                return false;
+                continue;
             }
 
             const auto & cells = args.v_cells.at(strm);
@@ -2317,13 +2317,10 @@ static bool set_input_kq_mask_paged_impl(const args_set_input_kq_mask & args, fl
                 }
             }
 
-            bool found_page = false;
-            args.block_table.for_each_seq_page(seq_id, [&](uint32_t page, uint32_t blk_id) {
+            for (uint32_t page = page_lo; page < page_hi; ++page) {
+                const uint32_t blk_id = args.block_table.lookup(seq_id, page);
                 if (blk_id == LLAMA_KV_BLOCK_ID_NONE || blk_id >= alloc.n_blocks()) {
-                    return;
-                }
-                if (page < page_lo || page >= page_hi) {
-                    return;
+                    continue;
                 }
 
                 const auto & blk = alloc.get(blk_id);
@@ -2359,11 +2356,6 @@ static bool set_input_kq_mask_paged_impl(const args_set_input_kq_mask & args, fl
                     }
                 }
 
-                found_page = true;
-            });
-
-            if (!found_page) {
-                return false;
             }
         }
     }

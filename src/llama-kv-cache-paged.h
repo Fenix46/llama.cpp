@@ -37,7 +37,6 @@
 #include <cassert>
 #include <cstdint>
 #include <limits>
-#include <unordered_map>
 #include <vector>
 
 // -----------------------------------------------------------------------------
@@ -250,66 +249,92 @@ public:
     // Record that logical page `page` of sequence `seq_id` is stored in
     // physical block `block_id`.
     void insert(llama_seq_id seq_id, uint32_t logical_page, uint32_t block_id) {
-        table[make_key(seq_id, logical_page)] = block_id;
+        if (seq_id < 0 || (size_t) seq_id >= seq_pages.size()) {
+            return;
+        }
+        auto & pages = seq_pages[(size_t) seq_id];
+        if (logical_page >= pages.size()) {
+            pages.resize((size_t) logical_page + 1, LLAMA_KV_BLOCK_ID_NONE);
+        }
+        if (pages[logical_page] == LLAMA_KV_BLOCK_ID_NONE) {
+            ++n_entries;
+        }
+        pages[logical_page] = block_id;
     }
 
     // Look up the physical block for (seq_id, logical_page).
     // Returns LLAMA_KV_BLOCK_ID_NONE if not found.
     uint32_t lookup(llama_seq_id seq_id, uint32_t logical_page) const {
-        auto it = table.find(make_key(seq_id, logical_page));
-        return (it != table.end()) ? it->second : LLAMA_KV_BLOCK_ID_NONE;
+        if (seq_id < 0 || (size_t) seq_id >= seq_pages.size()) {
+            return LLAMA_KV_BLOCK_ID_NONE;
+        }
+        const auto & pages = seq_pages[(size_t) seq_id];
+        if (logical_page >= pages.size()) {
+            return LLAMA_KV_BLOCK_ID_NONE;
+        }
+        return pages[logical_page];
     }
 
     // Remove the mapping for a single (seq_id, page) pair.
     void erase_page(llama_seq_id seq_id, uint32_t logical_page) {
-        table.erase(make_key(seq_id, logical_page));
+        if (seq_id < 0 || (size_t) seq_id >= seq_pages.size()) {
+            return;
+        }
+        auto & pages = seq_pages[(size_t) seq_id];
+        if (logical_page >= pages.size()) {
+            return;
+        }
+        if (pages[logical_page] != LLAMA_KV_BLOCK_ID_NONE) {
+            pages[logical_page] = LLAMA_KV_BLOCK_ID_NONE;
+            --n_entries;
+        }
     }
 
     // Remove all mappings for seq_id (called by seq_rm / seq_keep).
     void erase_seq(llama_seq_id seq_id) {
-        // Erase all keys whose upper 32 bits match seq_id.
-        // Linear scan is acceptable: seq_rm is not on the hot decode path.
-        const uint64_t prefix = (uint64_t)(uint32_t) seq_id << 32;
-        const uint64_t mask   = (uint64_t) 0xFFFFFFFF00000000ULL;
-        auto it = table.begin();
-        while (it != table.end()) {
-            if ((it->first & mask) == prefix) {
-                it = table.erase(it);
-            } else {
-                ++it;
+        if (seq_id < 0 || (size_t) seq_id >= seq_pages.size()) {
+            return;
+        }
+        auto & pages = seq_pages[(size_t) seq_id];
+        for (uint32_t blk_id : pages) {
+            if (blk_id != LLAMA_KV_BLOCK_ID_NONE) {
+                --n_entries;
             }
         }
+        pages.clear();
     }
 
     // Copy all logical-page mappings from src_seq to dst_seq (seq_cp).
     // Existing dst_seq entries are overwritten.
     void copy_seq(llama_seq_id src_seq, llama_seq_id dst_seq) {
-        const uint64_t src_prefix = (uint64_t)(uint32_t) src_seq << 32;
-        const uint64_t mask       = (uint64_t) 0xFFFFFFFF00000000ULL;
-        const uint64_t dst_prefix = (uint64_t)(uint32_t) dst_seq << 32;
-
-        // collect first to avoid iterator invalidation
-        std::vector<std::pair<uint64_t, uint32_t>> to_insert;
-        for (const auto & kv : table) {
-            if ((kv.first & mask) == src_prefix) {
-                const uint32_t page = (uint32_t)(kv.first & 0xFFFFFFFFULL);
-                to_insert.emplace_back(dst_prefix | page, kv.second);
-            }
+        if (src_seq < 0 || dst_seq < 0) {
+            return;
         }
-        for (const auto & kv : to_insert) {
-            table[kv.first] = kv.second;
+        if ((size_t) src_seq >= seq_pages.size() || (size_t) dst_seq >= seq_pages.size()) {
+            return;
+        }
+        erase_seq(dst_seq);
+
+        const auto & src_pages = seq_pages[(size_t) src_seq];
+        auto & dst_pages = seq_pages[(size_t) dst_seq];
+        dst_pages = src_pages;
+        for (uint32_t blk_id : dst_pages) {
+            if (blk_id != LLAMA_KV_BLOCK_ID_NONE) {
+                ++n_entries;
+            }
         }
     }
 
     template<typename Fn>
     void for_each_seq_page(llama_seq_id seq_id, Fn && fn) const {
-        const uint64_t prefix = (uint64_t)(uint32_t) seq_id << 32;
-        const uint64_t mask   = (uint64_t) 0xFFFFFFFF00000000ULL;
-
-        for (const auto & kv : table) {
-            if ((kv.first & mask) == prefix) {
-                const uint32_t page = (uint32_t)(kv.first & 0xFFFFFFFFULL);
-                fn(page, kv.second);
+        if (seq_id < 0 || (size_t) seq_id >= seq_pages.size()) {
+            return;
+        }
+        const auto & pages = seq_pages[(size_t) seq_id];
+        for (uint32_t page = 0; page < pages.size(); ++page) {
+            const uint32_t blk_id = pages[page];
+            if (blk_id != LLAMA_KV_BLOCK_ID_NONE) {
+                fn(page, blk_id);
             }
         }
     }
@@ -317,18 +342,27 @@ public:
     // Iterate all (seq_id, page, block_id) entries in the table.
     template<typename Fn>
     void for_each_entry(Fn && fn) const {
-        for (const auto & kv : table) {
-            const llama_seq_id seq_id = (llama_seq_id)(uint32_t)(kv.first >> 32);
-            const uint32_t     page   = (uint32_t)(kv.first & 0xFFFFFFFFULL);
-            fn(seq_id, page, kv.second);
+        for (uint32_t seq_id = 0; seq_id < seq_pages.size(); ++seq_id) {
+            const auto & pages = seq_pages[seq_id];
+            for (uint32_t page = 0; page < pages.size(); ++page) {
+                const uint32_t blk_id = pages[page];
+                if (blk_id != LLAMA_KV_BLOCK_ID_NONE) {
+                    fn((llama_seq_id) seq_id, page, blk_id);
+                }
+            }
         }
     }
 
     // Remove all entries (called on cache clear).
-    void clear() { table.clear(); }
+    void clear() {
+        for (auto & pages : seq_pages) {
+            pages.clear();
+        }
+        n_entries = 0;
+    }
 
     // Number of live (seq, page) → block mappings.
-    size_t size() const { return table.size(); }
+    size_t size() const { return n_entries; }
 
     // Compute the logical page index for a given token position.
     static uint32_t logical_page(llama_pos pos, uint32_t block_size) {
@@ -341,5 +375,6 @@ public:
     }
 
 private:
-    std::unordered_map<key_t, uint32_t> table;
+    std::vector<std::vector<uint32_t>> seq_pages = std::vector<std::vector<uint32_t>>(LLAMA_MAX_SEQ);
+    size_t n_entries = 0;
 };
