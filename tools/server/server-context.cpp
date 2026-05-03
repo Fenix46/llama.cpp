@@ -3405,6 +3405,8 @@ private:
 
                 const auto n_tokens_prev = batch.n_tokens;
 
+                const bool checkpoints_enabled = false;
+
                 if (req.phase == PAGED_REQUEST_STARTED) {
                     req.t_start_process_prompt = ggml_time_us();
                     req.t_start_generation     = 0;
@@ -3451,7 +3453,7 @@ private:
                     llama_pos pos_next = req.prompt.tokens.pos_next(n_past);
                     const auto pos_min_thold = std::max(0, pos_next - n_swa);
 
-                    if (n_past > 0 && n_past < req.prompt.n_tokens()) {
+                    if (checkpoints_enabled && n_past > 0 && n_past < req.prompt.n_tokens()) {
                         const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), req.seq_id);
                         if (pos_min == -1) {
                             PGD_ERR(req, "n_past = %d, prompt.tokens.size() = %d, seq_id = %d, pos_min = %d\n",
@@ -3513,15 +3515,19 @@ private:
                         }
                     }
 
-                    for (auto it = req.prompt.checkpoints.begin(); it != req.prompt.checkpoints.end();) {
-                        const auto & cur = *it;
-                        if (cur.pos_max > pos_next) {
-                            PGD_WRN(req, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n",
-                                    cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.data.size() / 1024 / 1024);
-                            it = req.prompt.checkpoints.erase(it);
-                        } else {
-                            ++it;
+                    if (checkpoints_enabled) {
+                        for (auto it = req.prompt.checkpoints.begin(); it != req.prompt.checkpoints.end();) {
+                            const auto & cur = *it;
+                            if (cur.pos_max > pos_next) {
+                                PGD_WRN(req, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n",
+                                        cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.data.size() / 1024 / 1024);
+                                it = req.prompt.checkpoints.erase(it);
+                            } else {
+                                ++it;
+                            }
                         }
+                    } else if (!req.prompt.checkpoints.empty()) {
+                        req.prompt.checkpoints.clear();
                     }
 
                     // [TAG_PROMPT_LOGITS] need at least 1 token evaluated
@@ -3548,10 +3554,6 @@ private:
                     req.prompt.checkpoints.clear();
                     req.n_prompt_tokens_cache = 0;
                 }
-
-                const bool checkpoints_enabled =
-                        params_base.n_ctx_checkpoints > 0 &&
-                        params_base.checkpoint_every_nt > 0;
 
                 bool do_checkpoint = checkpoints_enabled;
                 do_checkpoint = do_checkpoint && req.task->type == SERVER_TASK_TYPE_COMPLETION;
@@ -3880,7 +3882,8 @@ private:
                     GGML_ASSERT(n_draft > 0);
 
                     {
-                        const bool use_ckpt = req.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+                        // Paged scheduler: avoid CPU checkpoints/snapshots in speculative path.
+                        const bool use_ckpt = false;
 
                         common_sampler_ptr smpl_save;
                         if (use_ckpt) {

@@ -298,9 +298,7 @@ struct paged_request_state {
             const auto & params_spec      = task->params.speculative;
 
             if (!spec.spec_draft.empty()) {
-                if (ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
-                    GGML_ASSERT(!spec.spec_ckpt.empty());
-                }
+                // no-op: paged scheduler avoids speculative CPU checkpoints
             } else {
                 GGML_ASSERT(spec.spec_i_batch.empty());
 
@@ -312,15 +310,7 @@ struct paged_request_state {
                     spec.spec_draft.resize(n_draft_max);
                 }
 
-                if (!spec.spec_draft.empty() && ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
-                    const auto n_tokens = prompt.tokens.size();
-                    spec.spec_ckpt = server_get_checkpoint(ctx, seq_id, n_tokens);
-
-                    PGD_DBG(*this,
-                            "created speculative checkpoint (pos_min = %d, pos_max = %d, n_tokens = %zu, size = %.3f MiB)\n",
-                            spec.spec_ckpt.pos_min, spec.spec_ckpt.pos_max,
-                            n_tokens, (float) spec.spec_ckpt.data.size() / 1024 / 1024);
-                }
+                // no speculative checkpoints in paged path
             }
 
             GGML_ASSERT(spec.spec_draft.size() <= (size_t) n_draft_max);
