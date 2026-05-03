@@ -1728,6 +1728,7 @@ private:
         req.prompt.checkpoints.clear();
         req.n_prompt_tokens_cache = 0;
         req.n_prompt_tokens_processed = 0;
+        req.drop_cache_on_release = false;
 
         SRV_WRN("[paged] hard reset seq_id=%d reason=%s\n", req.seq_id, reason);
     }
@@ -1738,6 +1739,7 @@ private:
             seq_id >= 0 &&
             req != nullptr &&
             req->task &&
+            !req->drop_cache_on_release &&
             req->task->params.cache_prompt &&
             req->task->type == SERVER_TASK_TYPE_COMPLETION &&
             !req->prompt.tokens.has_mtmd &&
@@ -2001,6 +2003,7 @@ private:
         req.ctx_seq_rm_type  = ctx_seq_rm_type_;
         req.alora_invocation_start = (int32_t) alora_invocation_start;
         req.reserved_blocks  = paged_task_reserved_blocks(task);
+        req.drop_cache_on_release = false;
         req.callback_on_release = [this](int32_t sid) {
             register_paged_prefix_cache_on_release(sid);
         };
@@ -3121,8 +3124,8 @@ private:
                     if (params_base.scheduler == "paged") {
                         for (auto & req : paged_requests) {
                             if (req.task && req.task->id == task.id_target) {
-                                // On cancel, do not keep any reusable cached state.
-                                reset_paged_request_state(req, "cancel");
+                                // Defer KV teardown to the normal release path.
+                                req.drop_cache_on_release = true;
                                 req.release();
                                 break;
                             }

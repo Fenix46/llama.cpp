@@ -86,6 +86,7 @@ struct paged_request_state {
     int32_t seq_id          = -1;
     int32_t reserved_blocks = 0;
     int32_t n_ctx           = 0;
+    bool drop_cache_on_release = false;
 
     paged_request_phase phase = PAGED_REQUEST_IDLE;
 
@@ -442,6 +443,7 @@ struct paged_request_state {
         request_id      = -1;
         parent_id       = -1;
         reserved_blocks = 0;
+        drop_cache_on_release = false;
         phase           = PAGED_REQUEST_IDLE;
         task.reset();
         smpl.reset();
