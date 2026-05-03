@@ -366,6 +366,16 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_NONE;
     }
     if (paged_attn_active) {
+        const bool can_use_paged_vector_kernel =
+            Q->ne[0] <= 256 &&
+            Q->ne[0] % 64 == 0 &&
+            K->ne[1] % FATTN_KQ_STRIDE == 0 &&
+            Q->ne[1] <= 8;
+
+        if (can_use_paged_vector_kernel) {
+            return BEST_FATTN_KERNEL_VEC;
+        }
+
         const bool paged_mma_shape_supported = [&]() -> bool {
             if (Q->ne[2] % K->ne[2] != 0) {
                 return false;

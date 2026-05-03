@@ -3778,11 +3778,15 @@ private:
             for (int32_t i = 0; i < batch.n_tokens; i = i_next) {
                 int32_t n_tokens = std::min(cur_n_batch, batch.n_tokens - i);
 
-                // Paged attention kernels currently assume that all Q rows in a
-                // single llama_decode() segment share the same seq_id/page window.
-                // Split mixed-request batches at seq boundaries to avoid
-                // cross-request corruption when multiple paged requests are active.
-                if (params_base.scheduler == "paged" && batch.n_seq_id[i] > 0) {
+                // Keep the decode-token prefix together so CUDA can batch
+                // concurrently generating requests. Prefill segments remain
+                // split by seq_id because paged FA still assumes one seq/page
+                // window per large prefill segment.
+                if (params_base.scheduler == "paged" &&
+                    i < decode_tokens_in_batch &&
+                    decode_tokens_in_batch > 0) {
+                    n_tokens = std::min(n_tokens, decode_tokens_in_batch - i);
+                } else if (params_base.scheduler == "paged" && batch.n_seq_id[i] > 0) {
                     const llama_seq_id seq_id_cur = batch.seq_id[i][0];
                     int32_t n_same_seq = 1;
                     while (n_same_seq < n_tokens) {
