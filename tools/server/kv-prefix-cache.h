@@ -11,7 +11,7 @@
 // Shared blocks are protected by paged KV block refcounts; divergent write-side
 // copy-on-write is implemented separately.
 //
-// Granularity: LLAMA_KV_BLOCK_SIZE_DEFAULT (16 tokens/page).
+// Granularity: runtime KV block size (tokens/page).
 // Only complete block pages are eligible for reuse.
 //
 // Algorithm:
@@ -59,7 +59,7 @@ public:
         size_t   slots         = 0;
     };
 
-    explicit kv_prefix_cache(uint32_t block_size = LLAMA_KV_BLOCK_SIZE_DEFAULT)
+    explicit kv_prefix_cache(uint32_t block_size)
         : bs_(block_size) {}
 
     // Register the token sequence cached in `slot_id`.

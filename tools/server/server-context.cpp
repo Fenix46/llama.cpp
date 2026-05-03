@@ -738,7 +738,7 @@ private:
             return;
         }
 
-        const int32_t bs = (int32_t) LLAMA_KV_BLOCK_SIZE_DEFAULT;
+        const int32_t bs = (int32_t) params_base.kv_block_size;
         const int64_t kv_pool_tokens = (int64_t) paged_total_blocks * bs;
 
         // Sanity: allocated KV cells must match the requested pool size.
@@ -1045,7 +1045,7 @@ private:
                 paged_max_model_len = n_ctx_train;
             }
 
-            const int32_t bs = (int32_t) LLAMA_KV_BLOCK_SIZE_DEFAULT;
+            const int32_t bs = (int32_t) params_base.kv_block_size;
             paged_total_blocks = llama_kv_cache_n_free_blocks(llama_get_memory(ctx));
             paged_blocks_per_seq = (paged_max_model_len + bs - 1) / bs;
             paged_max_full_ctx_concurrency = paged_blocks_per_seq > 0 ? paged_total_blocks / paged_blocks_per_seq : 0;
@@ -1151,16 +1151,16 @@ private:
                 SRV_WRN("%s", "[kv-prefix-cache] requires --kv-unified for cross-slot seq_cp — disabling\n");
                 params_base.kv_prefix_cache = false;
             } else {
-                prefix_cache_ = std::make_unique<kv_prefix_cache>(LLAMA_KV_BLOCK_SIZE_DEFAULT);
+                prefix_cache_ = std::make_unique<kv_prefix_cache>(params_base.kv_block_size);
                 SRV_INF("[kv-prefix-cache] enabled (experimental): cross-slot prefix reuse, block_size=%d\n",
-                        (int)LLAMA_KV_BLOCK_SIZE_DEFAULT);
+                        (int)params_base.kv_block_size);
             }
         }
 
         // Dynamic slot scheduler
         if (params_base.dynamic_slots) {
             const int32_t seq_max = (int32_t) llama_n_seq_max(ctx);
-            const int32_t bs      = (int32_t) LLAMA_KV_BLOCK_SIZE_DEFAULT;
+            const int32_t bs      = (int32_t) params_base.kv_block_size;
             const int32_t blks_per_full_ctx = params_base.scheduler == "paged" ? paged_blocks_per_seq : (n_ctx_slot + bs - 1) / bs;
             const int32_t free_blocks = llama_kv_cache_n_free_blocks(llama_get_memory(ctx));
 
@@ -1335,7 +1335,7 @@ private:
 
         const int32_t seq_max     = (int32_t) llama_n_seq_max(ctx);
         const int32_t n_cur       = (int32_t) slots.size();
-        const int32_t bs          = (int32_t) LLAMA_KV_BLOCK_SIZE_DEFAULT;
+        const int32_t bs          = (int32_t) params_base.kv_block_size;
         const int32_t blks_needed = (n_ctx_slot_ + bs - 1) / bs;
 
         int32_t n_free_blk = llama_kv_cache_n_free_blocks(llama_get_memory(ctx));
@@ -2769,7 +2769,7 @@ private:
             return 0;
         }
 
-        const int32_t bs = (int32_t) LLAMA_KV_BLOCK_SIZE_DEFAULT;
+        const int32_t bs = (int32_t) params_base.kv_block_size;
 
         if (params_base.paged_admission != "actual-len") {
             return paged_blocks_per_seq_;

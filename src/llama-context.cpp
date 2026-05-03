@@ -169,6 +169,7 @@ llama_context::llama_context(
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
     cparams.paged_kv   = params.paged_kv;
+    cparams.kv_block_size = params.kv_block_size > 0 ? params.kv_block_size : 32;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -287,9 +288,10 @@ llama_context::llama_context(
     // init the memory module
     if (!hparams.vocab_only) {
         llama_memory_params params_mem = {
-            /*.type_k   =*/ params.type_k,
-            /*.type_v   =*/ params.type_v,
-            /*.swa_full =*/ params.swa_full,
+            /*.type_k        =*/ params.type_k,
+            /*.type_v        =*/ params.type_v,
+            /*.kv_block_size =*/ params.kv_block_size,
+            /*.swa_full      =*/ params.swa_full,
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
@@ -2930,6 +2932,7 @@ llama_context_params llama_context_default_params() {
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
         /*.paged_kv                    =*/ false,
+        /*.kv_block_size               =*/ 32,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
     };
@@ -2952,6 +2955,11 @@ llama_context * llama_init_from_model(
 
     if (params.n_ctx == 0 && model->hparams.n_ctx_train == 0) {
         LLAMA_LOG_ERROR("%s: n_ctx and model->hparams.n_ctx_train cannot both be zero\n", __func__);
+        return nullptr;
+    }
+
+    if (params.kv_block_size == 0 || (params.kv_block_size & (params.kv_block_size - 1)) != 0) {
+        LLAMA_LOG_ERROR("%s: kv_block_size must be a positive power of two\n", __func__);
         return nullptr;
     }
 

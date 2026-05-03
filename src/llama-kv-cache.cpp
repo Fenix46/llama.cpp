@@ -178,15 +178,17 @@ llama_kv_cache::llama_kv_cache(
                      bool   paged,
                  uint32_t   kv_size,
                  uint32_t   n_seq_max,
+                 uint32_t   kv_block_size,
                  uint32_t   n_pad,
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse) :
     model(model), hparams(model.hparams), v_trans(v_trans), paged(paged),
-    n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type) {
+    block_size(kv_block_size), n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type) {
 
     GGML_ASSERT(kv_size % n_pad == 0);
+    GGML_ASSERT(block_size > 0 && (block_size & (block_size - 1)) == 0);
 
     const uint32_t n_layer_kv = hparams.n_layer_kv();
 
@@ -236,7 +238,7 @@ llama_kv_cache::llama_kv_cache(
     // [paged] initialise one block allocator per stream, covering the same flat slab
     v_block_alloc.resize(n_stream);
     for (uint32_t s = 0; s < n_stream; ++s) {
-        v_block_alloc[s].init(kv_size, LLAMA_KV_BLOCK_SIZE_DEFAULT);
+        v_block_alloc[s].init(kv_size, block_size);
     }
 
     // by default, all sequence ids are mapped to the 0th stream
@@ -2000,7 +2002,7 @@ ggml_tensor * llama_kv_cache::build_input_block_table(ggml_context * ctx) const 
         return nullptr;
     }
 
-    const uint32_t bs         = LLAMA_KV_BLOCK_SIZE_DEFAULT;
+    const uint32_t bs         = block_size;
     const uint32_t max_pages  = (get_size() + bs - 1) / bs;
 
     ggml_tensor * bt = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, max_pages, n_seq_max);
@@ -2088,7 +2090,7 @@ void llama_kv_cache::set_input_page_limits_q(ggml_tensor * dst, const llama_ubat
     int32_t * data = (int32_t *) dst->data;
     for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
         const llama_pos p1 = ubatch->pos[i];
-        const int32_t end_page = (int32_t) (llama_kv_block_table::logical_page(p1, LLAMA_KV_BLOCK_SIZE_DEFAULT) + 1);
+        const int32_t end_page = (int32_t) (llama_kv_block_table::logical_page(p1, block_size) + 1);
 
         int32_t start_page = 0;
         if (swa_active) {
@@ -2096,7 +2098,7 @@ void llama_kv_cache::set_input_page_limits_q(ggml_tensor * dst, const llama_ubat
             // i.e. only cells with p0 > p1 - n_swa are visible. Convert to logical pages.
             const llama_pos oldest_visible = p1 - (llama_pos) (n_swa - 1);
             if (oldest_visible > 0) {
-                start_page = (int32_t) llama_kv_block_table::logical_page(oldest_visible, LLAMA_KV_BLOCK_SIZE_DEFAULT);
+                start_page = (int32_t) llama_kv_block_table::logical_page(oldest_visible, block_size);
             }
             if (start_page > end_page) start_page = end_page;
         }
@@ -2307,7 +2309,7 @@ static bool set_input_kq_mask_paged_impl(const args_set_input_kq_mask & args, fl
             // Reachability window in logical pages. For SWA layers only pages whose
             // tokens fall within [p1 - n_swa + 1, p1] can produce a non-masked cell;
             // walking the older pages is wasted work that grows O(pos).
-            const uint32_t bs = LLAMA_KV_BLOCK_SIZE_DEFAULT;
+            const uint32_t bs = alloc.block_size();
             uint32_t page_lo = 0;
             const uint32_t page_hi = (p1 < 0) ? 0u : (uint32_t)(p1 / (llama_pos) bs) + 1u;
             if (swa && args.n_swa > 0) {

@@ -118,12 +118,13 @@ public:
                          bool   v_trans,
                          bool   offload,
                          bool   unified,
-                         bool   paged,
-                     uint32_t   kv_size,
-                     uint32_t   n_seq_max,
-                     uint32_t   n_pad,
-                     uint32_t   n_swa,
-               llama_swa_type   swa_type,
+                     bool   paged,
+                 uint32_t   kv_size,
+                 uint32_t   n_seq_max,
+                 uint32_t   kv_block_size,
+                 uint32_t   n_pad,
+                 uint32_t   n_swa,
+           llama_swa_type   swa_type,
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse);
 
@@ -275,6 +276,7 @@ private:
 
     bool v_trans = true;  // the value tensor is transposed
     bool paged = false;   // use block table allocator for new KV pages
+    uint32_t block_size = LLAMA_KV_BLOCK_SIZE_DEFAULT;
 
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;

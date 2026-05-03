@@ -549,7 +549,7 @@ struct common_params {
     std::string scheduler   = "slots"; // server scheduler mode: slots, paged
     std::string paged_admission = "full-ctx"; // paged scheduler admission policy
     float paged_gpu_memory_utilization = 0.90f; // target device memory utilization for paged scheduler fit
-    int32_t kv_block_size   = 16; // paged KV block size, currently fixed to 16
+    int32_t kv_block_size   = 32; // paged KV block size in tokens
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool use_mmap          = true;  // enable mmap to use filesystem cache

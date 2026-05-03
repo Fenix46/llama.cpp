@@ -22,6 +22,7 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                      bool   paged,
                  uint32_t   kv_size,
                  uint32_t   n_seq_max,
+                 uint32_t   kv_block_size,
                  uint32_t   n_ubatch,
                  uint32_t   n_pad,
     const layer_filter_cb & filter,
@@ -67,14 +68,14 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
 
     kv_base = std::make_unique<llama_kv_cache>(
             model, type_k, type_v,
-            v_trans, offload, unified, paged, size_base, n_seq_max, n_pad,
+            v_trans, offload, unified, paged, size_base, n_seq_max, kv_block_size, n_pad,
             0, LLAMA_SWA_TYPE_NONE, filter_base, reuse);
 
     LLAMA_LOG_INFO("%s: creating     SWA KV cache, size = %u cells\n", __func__, size_swa);
 
     kv_swa = std::make_unique<llama_kv_cache>(
             model, type_k, type_v,
-            v_trans, offload, unified, paged, size_swa, n_seq_max, n_pad,
+            v_trans, offload, unified, paged, size_swa, n_seq_max, kv_block_size, n_pad,
             hparams.n_swa, hparams.swa_type, filter_swa, reuse);
 }
 

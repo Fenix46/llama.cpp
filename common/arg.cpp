@@ -1362,10 +1362,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_GPU_MEMORY_UTILIZATION").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--kv-block-size"}, "N",
-        "paged KV block size in tokens (currently only 16 is supported)",
+        "paged KV block size in tokens (power of 2, default: 32)",
         [](common_params & params, int value) {
-            if (value != 16) {
-                throw std::invalid_argument("error: --kv-block-size currently supports only 16\n");
+            if (value <= 0 || (value & (value - 1)) != 0) {
+                throw std::invalid_argument("error: --kv-block-size must be a positive power of two\n");
             }
             params.kv_block_size = value;
         }

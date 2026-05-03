@@ -25,6 +25,7 @@ public:
                 ggml_type   type_v,
                      bool   v_trans,
                  uint32_t   kv_size,
+                 uint32_t   kv_block_size,
                  uint32_t   n_pad,
                  uint32_t   n_swa,
            llama_swa_type   swa_type,

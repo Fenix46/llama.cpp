@@ -39,6 +39,7 @@ struct llama_cparams {
     bool op_offload;
     bool kv_unified;
     bool paged_kv;
+    uint32_t kv_block_size;
     bool pipeline_parallel;
 
     enum llama_pooling_type pooling_type;

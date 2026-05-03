@@ -376,6 +376,7 @@ extern "C" {
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
         bool paged_kv;    // [EXPERIMENTAL] allocate new KV pages through the paged block allocator
+        uint32_t kv_block_size; // paged KV block size in tokens (power of 2)
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
