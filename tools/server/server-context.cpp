@@ -3776,7 +3776,24 @@ private:
             int32_t cur_n_batch = n_batch;
 
             for (int32_t i = 0; i < batch.n_tokens; i = i_next) {
-                const int32_t n_tokens = std::min(cur_n_batch, batch.n_tokens - i);
+                int32_t n_tokens = std::min(cur_n_batch, batch.n_tokens - i);
+
+                // Paged attention kernels currently assume that all Q rows in a
+                // single llama_decode() segment share the same seq_id/page window.
+                // Split mixed-request batches at seq boundaries to avoid
+                // cross-request corruption when multiple paged requests are active.
+                if (params_base.scheduler == "paged" && batch.n_seq_id[i] > 0) {
+                    const llama_seq_id seq_id_cur = batch.seq_id[i][0];
+                    int32_t n_same_seq = 1;
+                    while (n_same_seq < n_tokens) {
+                        const int32_t idx = i + n_same_seq;
+                        if (batch.n_seq_id[idx] <= 0 || batch.seq_id[idx][0] != seq_id_cur) {
+                            break;
+                        }
+                        ++n_same_seq;
+                    }
+                    n_tokens = n_same_seq;
+                }
 
                 llama_batch batch_view = {
                     n_tokens,
