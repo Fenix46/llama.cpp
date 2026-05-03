@@ -3467,10 +3467,11 @@ private:
                                 req.prompt.checkpoints.rbegin(),
                                 req.prompt.checkpoints.rend(),
                                 [&](const auto & cur) {
-                                    // For non-SWA paths, the useful checkpoint criterion is whether it does not
-                                    // advance beyond the reusable token prefix (n_past), regardless of pos_min drift.
+                                    // For non-SWA paths we can still restore checkpoints that extend past n_past:
+                                    // the KV will be truncated to n_past right after reuse setup. Restricting to
+                                    // cur.n_tokens <= n_past can force unnecessary full prompt re-processing.
                                     if (n_swa == 0) {
-                                        return cur.n_tokens > 0 && cur.n_tokens <= n_past;
+                                        return cur.pos_min < pos_min_thold || cur.pos_min == 0;
                                     }
                                     // For SWA/hybrid paths, fall back to positional criterion.
                                     return cur.pos_min < pos_min_thold || cur.pos_min == 0;
