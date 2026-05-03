@@ -2723,7 +2723,10 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         ggml_metal_buffer_id bid_src6 = ggml_metal_get_buffer_id(op->src[6]); // seq_ids_q
         ggml_metal_buffer_id bid_src7 = ggml_metal_get_buffer_id(op->src[7]); // page_limits_q
 
-        const int32_t block_size   = 16; // LLAMA_KV_BLOCK_SIZE_DEFAULT
+        int32_t block_size         = ggml_get_op_params_i32(op, 4);
+        if (block_size <= 0 || (block_size & (block_size - 1)) != 0) {
+            block_size = 16; // legacy default when op params are not populated
+        }
         const int32_t max_pages    = (int32_t) op->src[5]->ne[0];
         const int32_t n_seqs_bt    = (int32_t) op->src[5]->ne[1];
 

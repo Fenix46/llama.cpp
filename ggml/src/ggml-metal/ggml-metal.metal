@@ -6479,7 +6479,7 @@ kernel void kernel_flash_attn_ext(
 //   buffer 4: block_table    [max_pages, n_seqs_bt]    I32
 //   buffer 5: seq_ids        [ne01]                    I32 (seq_id per query)
 //   buffer 6: mask           [ne11, ne01, ne32, ne33]  F16
-//   buffer 7: page_limits    [ne01]                    I32
+//   buffer 7: page_limits    [2, ne01]                 I32
 //   buffer 8: sinks          [ne02]                    F32
 //   buffer 9: dst            [ne00, ne01, ne02, ne03]  F32
 //
