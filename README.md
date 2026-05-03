@@ -26,7 +26,7 @@ Build:
 cmake --build build-arm64-apple-clang-release --target llama-server -j8
 ```
 
-Run on Apple Silicon with a local GGUF model:
+Run on Apple Silicon (Metal) with a local GGUF model:
 
 ```sh
 ./build-arm64-apple-clang-release/bin/llama-server \
@@ -35,33 +35,43 @@ Run on Apple Silicon with a local GGUF model:
   --port 8080 \
   -ngl 99 \
   --scheduler paged \
+  --flash-attn on \
+  -c 128000 \
   --max-model-len 128000 \
+  -b 2048 \
+  -ub 512 \
+  --kv-block-size 64 \
   --gpu-memory-utilization 0.90 \
   --kv-prefix-cache \
   --cache-ram 0 \
   --webui
 ```
 
-Run on CUDA (Linux) with paged scheduler and paged MMA auto-selection:
+Run on CUDA (Linux / NVIDIA) with paged scheduler:
 
 ```sh
-LLAMA_PAGED_ATTN=1 LLAMA_PAGED_KERNEL=auto \
+LLAMA_PAGED_ATTN=1 LLAMA_PAGED_KERNEL=mma \
 ./build/bin/llama-server \
   -m /path/to/model.gguf \
   --host 127.0.0.1 \
   --port 8080 \
   -ngl 99 \
   --scheduler paged \
-  --max-model-len 128000 \
+  --flash-attn on \
+  -c 262144 \
+  --max-model-len 262144 \
+  -b 8192 \
+  -ub 2048 \
+  --kv-block-size 64 \
   --gpu-memory-utilization 0.90 \
   --kv-prefix-cache \
   --cache-ram 0
 ```
 
-To force paged MMA kernel selection (fallback to tile remains enabled when shape/hardware is unsupported):
+If the paged MMA path is not suitable for a given shape or GPU, force the paged tile kernel instead:
 
 ```sh
-LLAMA_PAGED_ATTN=1 LLAMA_PAGED_KERNEL=mma ./build/bin/llama-server -m /path/to/model.gguf -ngl 99 --scheduler paged
+LLAMA_PAGED_ATTN=1 LLAMA_PAGED_KERNEL=tile ./build/bin/llama-server -m /path/to/model.gguf -ngl 99 --scheduler paged
 ```
 
 Check the server:
