@@ -3438,8 +3438,15 @@ private:
             }
 
             const int32_t decode_tokens_in_batch = batch.n_tokens;
-            const int32_t prefill_budget          = std::max(0, n_batch - decode_tokens_in_batch);
-            int32_t       prefill_added           = 0;
+            int32_t       prefill_budget         = std::max(0, n_batch - decode_tokens_in_batch);
+            int32_t       prefill_added          = 0;
+
+            if (decode_tokens_in_batch > 0 && prefill_budget > 0) {
+                const int32_t paged_prefill_slice = std::max<int32_t>(
+                    64,
+                    std::min<int32_t>(256, std::max<int32_t>(decode_tokens_in_batch * 32, n_ubatch / 16)));
+                prefill_budget = std::min(prefill_budget, paged_prefill_slice);
+            }
 
             SRV_DBG("[paged] decode_tokens=%d, prefill_budget=%d\n", decode_tokens_in_batch, prefill_budget);
 
@@ -3778,15 +3785,11 @@ private:
             for (int32_t i = 0; i < batch.n_tokens; i = i_next) {
                 int32_t n_tokens = std::min(cur_n_batch, batch.n_tokens - i);
 
-                // Keep the decode-token prefix together so CUDA can batch
-                // concurrently generating requests. Prefill segments remain
-                // split by seq_id because paged FA still assumes one seq/page
-                // window per large prefill segment.
-                if (params_base.scheduler == "paged" &&
-                    i < decode_tokens_in_batch &&
-                    decode_tokens_in_batch > 0) {
-                    n_tokens = std::min(n_tokens, decode_tokens_in_batch - i);
-                } else if (params_base.scheduler == "paged" && batch.n_seq_id[i] > 0) {
+                // Paged attention kernels currently assume that all Q rows in a
+                // single llama_decode() segment share the same seq_id/page window.
+                // Split mixed-request batches at seq boundaries to avoid
+                // cross-request corruption when multiple paged requests are active.
+                if (params_base.scheduler == "paged" && batch.n_seq_id[i] > 0) {
                     const llama_seq_id seq_id_cur = batch.seq_id[i][0];
                     int32_t n_same_seq = 1;
                     while (n_same_seq < n_tokens) {
