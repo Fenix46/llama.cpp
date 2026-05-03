@@ -953,13 +953,18 @@ void launch_fattn(
 
     // block_table layout is I32[max_pages, n_seqs]; ne[0] is max_pages.
     const int32_t bt_max_pages  = block_table_t ? (int32_t) block_table_t->ne[0] : 0;
-    // block_size matches LLAMA_KV_BLOCK_SIZE_DEFAULT; configurable at compile time
-    // via -DLLAMA_KV_BLOCK_SIZE=N (must be a positive power of two, default 16).
-    // Metal paged kernels must use the same value.
+    // Runtime paged KV block size attached to FLASH_ATTN_EXT op params.
+    // Falls back to LLAMA_KV_BLOCK_SIZE only when the param is absent (legacy graphs).
 #ifndef LLAMA_KV_BLOCK_SIZE
 #define LLAMA_KV_BLOCK_SIZE 16
 #endif
-    const int32_t bt_block_size = block_table_t ? LLAMA_KV_BLOCK_SIZE : 0;
+    int32_t bt_block_size = 0;
+    if (block_table_t) {
+        bt_block_size = ggml_get_op_params_i32(dst, 4);
+        if (bt_block_size <= 0 || (bt_block_size & (bt_block_size - 1)) != 0) {
+            bt_block_size = LLAMA_KV_BLOCK_SIZE;
+        }
+    }
     ggml_tensor * KQV = dst;
 
     GGML_ASSERT(Q->type == GGML_TYPE_F32);

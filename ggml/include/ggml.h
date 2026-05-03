@@ -2424,6 +2424,12 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * page_limits_q);
 
+    // Set paged KV block size for FLASH_ATTN_EXT kernels (runtime, power-of-two > 0).
+    // Used together with block_table/seq_ids_q/page_limits_q in paged attention.
+    GGML_API void ggml_flash_attn_ext_set_block_size(
+            struct ggml_tensor * a,
+            int32_t              block_size);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,

@@ -5420,6 +5420,14 @@ void ggml_flash_attn_ext_set_page_limits_q(
     a->src[7] = page_limits_q;
 }
 
+void ggml_flash_attn_ext_set_block_size(
+        struct ggml_tensor * a,
+        int32_t              block_size) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(block_size > 0 && (block_size & (block_size - 1)) == 0);
+    ggml_set_op_params_i32(a, 4, block_size);
+}
+
 // ggml_flash_attn_back
 
 struct ggml_tensor * ggml_flash_attn_back(

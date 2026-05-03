@@ -2060,6 +2060,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         if (block_table) {
             ggml_flash_attn_ext_set_block_table(cur, block_table);
+            ggml_flash_attn_ext_set_block_size(cur, (int32_t) cparams.kv_block_size);
         }
 
         if (seq_ids_q) {
