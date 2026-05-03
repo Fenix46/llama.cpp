@@ -113,7 +113,13 @@ public:
             blk.first_cell = i * bs;
             blk.size       = (i + 1 < n_blocks) ? bs : (n_cells - i * bs);
             blocks.push_back(blk);
-            free_ids.push_back(i);
+        }
+
+        // alloc()/peek_free() pop from the back. Keep the initial allocation
+        // order low-to-high so a fresh prompt maps logical pages to contiguous
+        // physical blocks and keeps n_kv bounded by the live prefix.
+        for (uint32_t i = n_blocks; i > 0; --i) {
+            free_ids.push_back(i - 1);
         }
     }
 
@@ -222,7 +228,9 @@ public:
         free_ids.clear();
         for (uint32_t i = 0; i < (uint32_t) blocks.size(); ++i) {
             ref_counts[i] = 0;
-            free_ids.push_back(i);
+        }
+        for (uint32_t i = (uint32_t) blocks.size(); i > 0; --i) {
+            free_ids.push_back(i - 1);
         }
     }
 
