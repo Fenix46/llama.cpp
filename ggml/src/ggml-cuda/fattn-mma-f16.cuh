@@ -801,7 +801,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         for (int k0 = 0; k0 < nbatch_fa; k0 += np*T_C_KQ::I) {
 #pragma unroll
             for (int l = 0; l < T_C_KQ::ne; ++l) {
-                if (!oob_check || k0 + (threadIdx.y % np)*T_C_KQ::I + T_C_KQ::get_i(l) < k_VKQ_sup) {
+                const int i_kq = k0 + (threadIdx.y % np)*T_C_KQ::I + T_C_KQ::get_i(l);
+                const bool valid_oob = !oob_check || i_kq < k_VKQ_sup;
+                const bool valid_block = !block_table_local || bt_contig ||
+                    paged_resolve_cell_mma(block_table_local, k_VKQ_0 + i_kq, page_count, block_size) >= 0;
+                if (valid_oob && valid_block) {
 #if defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
                     constexpr int KQ_idx = 0;
 #else
@@ -827,7 +831,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         for (int k0 = 0; k0 < nbatch_fa; k0 += np*T_C_KQ::I) {
 #pragma unroll
             for (int l = 0; l < T_C_KQ::ne; ++l) {
-                if (!oob_check || k0 + (threadIdx.y % np)*T_C_KQ::I + T_C_KQ::get_i(l) < k_VKQ_sup) {
+                const int i_kq = k0 + (threadIdx.y % np)*T_C_KQ::I + T_C_KQ::get_i(l);
+                const bool valid_oob = !oob_check || i_kq < k_VKQ_sup;
+                const bool valid_block = !block_table_local || bt_contig ||
+                    paged_resolve_cell_mma(block_table_local, k_VKQ_0 + i_kq, page_count, block_size) >= 0;
+                if (valid_oob && valid_block) {
 #if defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
                     constexpr int KQ_idx = 0;
 #else
@@ -865,7 +873,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         for (int k0 = 0; k0 < nbatch_fa; k0 += np*T_C_KQ::J) {
 #pragma unroll
             for (int l = 0; l < T_C_KQ::ne; ++l) {
-                if (!oob_check || k0 + (threadIdx.y % np)*T_C_KQ::J + T_C_KQ::get_j(l) < k_VKQ_sup) {
+                const int i_kq = k0 + (threadIdx.y % np)*T_C_KQ::J + T_C_KQ::get_j(l);
+                const bool valid_oob = !oob_check || i_kq < k_VKQ_sup;
+                const bool valid_block = !block_table_local || bt_contig ||
+                    paged_resolve_cell_mma(block_table_local, k_VKQ_0 + i_kq, page_count, block_size) >= 0;
+                if (valid_oob && valid_block) {
 #if defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
                     constexpr int KQ_idx = 0;
 #else
@@ -907,7 +919,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         for (int k0 = 0; k0 < nbatch_fa; k0 += np*T_C_KQ::J) {
 #pragma unroll
             for (int l = 0; l < T_C_KQ::ne; ++l) {
-                if (!oob_check || k0 + (threadIdx.y % np)*T_C_KQ::J + T_C_KQ::get_j(l) < k_VKQ_sup) {
+                const int i_kq = k0 + (threadIdx.y % np)*T_C_KQ::J + T_C_KQ::get_j(l);
+                const bool valid_oob = !oob_check || i_kq < k_VKQ_sup;
+                const bool valid_block = !block_table_local || bt_contig ||
+                    paged_resolve_cell_mma(block_table_local, k_VKQ_0 + i_kq, page_count, block_size) >= 0;
+                if (valid_oob && valid_block) {
 #if defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
                     constexpr int KQ_idx = 0;
 #else
