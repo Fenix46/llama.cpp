@@ -1683,6 +1683,34 @@ private:
         return nullptr;
     }
 
+    void assert_paged_seq_cleared(const paged_request_state & req) {
+        if (req.seq_id < 0) {
+            return;
+        }
+
+        // Rebuild first: if stale block-table metadata remains, this normalizes it.
+        llama_kv_cache_rebuild_block_table(llama_get_memory(ctx), req.seq_id);
+
+        const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), req.seq_id);
+        const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx), req.seq_id);
+        GGML_ASSERT(pos_min == -1 && pos_max == -1 && "paged seq clear invariant violated");
+    }
+
+    void reset_paged_request_state(paged_request_state & req, const char * reason) {
+        if (req.seq_id >= 0) {
+            prefix_cache_invalidate(req.seq_id);
+            (void) llama_memory_seq_rm(llama_get_memory(ctx), req.seq_id, -1, -1);
+            assert_paged_seq_cleared(req);
+        }
+
+        req.prompt.tokens.clear();
+        req.prompt.checkpoints.clear();
+        req.n_prompt_tokens_cache = 0;
+        req.n_prompt_tokens_processed = 0;
+
+        SRV_WRN("[paged] hard reset seq_id=%d reason=%s\n", req.seq_id, reason);
+    }
+
     void register_paged_prefix_cache_on_release(int32_t seq_id) {
         paged_request_state * req = get_paged_request_by_seq_id(seq_id);
         const bool can_cache =
@@ -1700,11 +1728,14 @@ private:
             }
             paged_seq_leases.mark_cached(seq_id);
         } else {
-            prefix_cache_invalidate(seq_id);
-            if (req != nullptr && seq_id >= 0) {
-                llama_memory_seq_rm(llama_get_memory(ctx), seq_id, -1, -1);
-                req->prompt.tokens.clear();
-                req->prompt.checkpoints.clear();
+            if (req != nullptr) {
+                reset_paged_request_state(*req, "release-uncached");
+            } else if (seq_id >= 0) {
+                prefix_cache_invalidate(seq_id);
+                (void) llama_memory_seq_rm(llama_get_memory(ctx), seq_id, -1, -1);
+                llama_kv_cache_rebuild_block_table(llama_get_memory(ctx), seq_id);
+                GGML_ASSERT(llama_memory_seq_pos_min(llama_get_memory(ctx), seq_id) == -1);
+                GGML_ASSERT(llama_memory_seq_pos_max(llama_get_memory(ctx), seq_id) == -1);
             }
             paged_seq_leases.release_uncached(seq_id);
             if (req != nullptr) {
@@ -1744,10 +1775,7 @@ private:
         SRV_INF("[kv-prefix-cache] paged reuse: donor=%d -> seq=%d, n_cached=%d (cur_common=%d)\n",
                 res.donor_slot_id, req.seq_id, res.n_cached_tokens, cur_pages);
 
-        prefix_cache_invalidate(req.seq_id);
-        llama_memory_seq_rm(llama_get_memory(ctx), req.seq_id, -1, -1);
-        req.prompt.tokens.clear();
-        req.prompt.checkpoints.clear();
+        reset_paged_request_state(req, "prefix-reuse");
 
         llama_memory_seq_cp(
             llama_get_memory(ctx),
@@ -3072,6 +3100,8 @@ private:
                     if (params_base.scheduler == "paged") {
                         for (auto & req : paged_requests) {
                             if (req.task && req.task->id == task.id_target) {
+                                // On cancel, do not keep any reusable cached state.
+                                reset_paged_request_state(req, "cancel");
                                 req.release();
                                 break;
                             }
@@ -3446,6 +3476,18 @@ private:
                         if (req.alora_invocation_start > 0) {
                             n_past = std::min(n_past, req.alora_invocation_start - 1);
                         }
+
+                        // Early divergence tends to leave fragmented KV/cache metadata and can
+                        // poison subsequent generation. Prefer a hard reset in this case.
+                        if (req.prompt.n_tokens() > 0 &&
+                            n_past > 0 &&
+                            n_past < req.prompt.n_tokens() &&
+                            n_past < 64) {
+                            SRV_WRN("[paged] early divergence (n_past=%d < 64), forcing full reset for seq_id=%d\n",
+                                    n_past, req.seq_id);
+                            reset_paged_request_state(req, "early-divergence");
+                            n_past = 0;
+                        }
                     } else {
                         n_past = 0;
                     }
@@ -3548,11 +3590,8 @@ private:
                 // truncate any KV tokens beyond n_past
                 const llama_pos p0 = req.prompt.tokens.pos_next();
                 if (!llama_memory_seq_rm(llama_get_memory(ctx), req.seq_id, p0, -1)) {
-                    PGD_WRN(req, "failed to truncate KV at pos %d - clearing\n", p0);
-                    prefix_cache_invalidate(req.seq_id);
-                    req.prompt_clear(true);
-                    req.prompt.checkpoints.clear();
-                    req.n_prompt_tokens_cache = 0;
+                    PGD_WRN(req, "failed to truncate KV at pos %d - hard resetting\n", p0);
+                    reset_paged_request_state(req, "truncate-failed");
                 }
 
                 bool do_checkpoint = checkpoints_enabled;
