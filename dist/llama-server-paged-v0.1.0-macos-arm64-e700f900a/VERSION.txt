@@ -1,0 +1,6 @@
+name=llama-server-paged
+version=v0.1.0
+platform=macos-arm64
+commit=e700f900a
+branch=paged-kv-cache-phase1
+build_dir=build-arm64-apple-clang-release
