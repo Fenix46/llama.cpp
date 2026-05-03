@@ -3467,13 +3467,18 @@ private:
                                 req.prompt.checkpoints.rbegin(),
                                 req.prompt.checkpoints.rend(),
                                 [&](const auto & cur) {
-                                    // For non-SWA paths we can still restore checkpoints that extend past n_past:
-                                    // the KV will be truncated to n_past right after reuse setup. Restricting to
-                                    // cur.n_tokens <= n_past can force unnecessary full prompt re-processing.
-                                    if (n_swa == 0) {
-                                        return cur.pos_min < pos_min_thold || cur.pos_min == 0;
+                                    // Prefer the most recent checkpoint that does not go beyond current reuse
+                                    // boundary. This avoids restoring very old checkpoints that would lower
+                                    // pos_next and invalidate newer checkpoints.
+                                    if (cur.pos_max > pos_next) {
+                                        return false;
                                     }
-                                    // For SWA/hybrid paths, fall back to positional criterion.
+
+                                    if (n_swa == 0) {
+                                        return cur.n_tokens > 0;
+                                    }
+
+                                    // For SWA/hybrid paths, additionally require positional compatibility.
                                     return cur.pos_min < pos_min_thold || cur.pos_min == 0;
                                 }
                             );
@@ -4331,6 +4336,15 @@ private:
                                             // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
                                             LOG_INF("slot %12.*s: id %2d | task %d | Checking checkpoint with [%d, %d] against %d...\n", 12,
                                                 func_name, (slot).id, ((slot).task ? (slot).task->id : -1), cur.pos_min, cur.pos_max, pos_min_thold);
+                                            // Prefer the newest checkpoint bounded by current pos_next.
+                                            if (cur.pos_max > pos_next) {
+                                                return false;
+                                            }
+
+                                            if (n_swa == 0) {
+                                                return cur.n_tokens > 0;
+                                            }
+
                                             return cur.pos_min < pos_min_thold || cur.pos_min == 0;
                                         }
                                     );
