@@ -3549,7 +3549,11 @@ private:
                     req.n_prompt_tokens_cache = 0;
                 }
 
-                bool do_checkpoint = params_base.n_ctx_checkpoints > 0;
+                const bool checkpoints_enabled =
+                        params_base.n_ctx_checkpoints > 0 &&
+                        params_base.checkpoint_every_nt > 0;
+
+                bool do_checkpoint = checkpoints_enabled;
                 do_checkpoint = do_checkpoint && req.task->type == SERVER_TASK_TYPE_COMPLETION;
                 do_checkpoint = do_checkpoint && (
                         (req.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) ||
@@ -3597,18 +3601,28 @@ private:
                     req.n_prompt_tokens_processed++;
 
                     if (do_checkpoint) {
-                        const int checkpoint_offsets[] = {4 + n_ubatch, 4};
+                        int64_t last_checkpoint_nt = 0;
+                        if (!req.prompt.checkpoints.empty()) {
+                            last_checkpoint_nt = req.prompt.checkpoints.back().n_tokens;
+                        }
 
-                        bool should_break = false;
-                        for (int offset : checkpoint_offsets) {
-                            const int n_last = std::min(n_batch, offset);
-                            if (req.task->n_tokens() == req.prompt.n_tokens() + n_last) {
-                                should_break = true;
+                        const bool checkpoint_due =
+                                (req.prompt.n_tokens() - last_checkpoint_nt) >= params_base.checkpoint_every_nt;
+
+                        if (checkpoint_due) {
+                            const int checkpoint_offsets[] = {4 + n_ubatch, 4};
+
+                            bool should_break = false;
+                            for (int offset : checkpoint_offsets) {
+                                const int n_last = std::min(n_batch, offset);
+                                if (req.task->n_tokens() == req.prompt.n_tokens() + n_last) {
+                                    should_break = true;
+                                    break;
+                                }
+                            }
+                            if (should_break) {
                                 break;
                             }
-                        }
-                        if (should_break) {
-                            break;
                         }
                     }
                 }
@@ -3635,23 +3649,18 @@ private:
                     PGD_INF(req, "prompt done, n_tokens=%d, batch.n_tokens=%d\n",
                             req.prompt.n_tokens(), batch.n_tokens);
                 } else {
-                    if (req.task->n_tokens() < req.prompt.n_tokens() + n_ubatch) {
-                        do_checkpoint = do_checkpoint && true;
-                    } else {
-                        do_checkpoint = do_checkpoint && params_base.checkpoint_every_nt > 0;
+                    if (do_checkpoint) {
+                        const int64_t n_tokens_processed = req.prompt.n_tokens() - n_tokens_cur;
+                        int64_t last_checkpoint_nt = 0;
+                        if (!req.prompt.checkpoints.empty()) {
+                            last_checkpoint_nt = req.prompt.checkpoints.back().n_tokens;
+                        }
+
+                        do_checkpoint = n_tokens_processed - last_checkpoint_nt >= params_base.checkpoint_every_nt;
 
                         if (do_checkpoint) {
-                            llama_pos last_checkpoint = 0;
-                            if (!req.prompt.checkpoints.empty()) {
-                                last_checkpoint = req.prompt.checkpoints.back().n_tokens;
-                            }
-
-                            do_checkpoint = do_checkpoint && req.prompt.n_tokens() - batch.n_tokens - last_checkpoint >= params_base.checkpoint_every_nt;
-
-                            if (do_checkpoint) {
-                                PGD_INF(req, "%d tokens since last checkpoint at %d, creating new checkpoint during processing at position %d\n",
-                                        params_base.checkpoint_every_nt, last_checkpoint, req.prompt.n_tokens());
-                            }
+                            PGD_INF(req, "%d tokens since last checkpoint at %d, creating new checkpoint during processing at position %d\n",
+                                    params_base.checkpoint_every_nt, (int) last_checkpoint_nt, req.prompt.n_tokens());
                         }
                     }
 
@@ -4450,7 +4459,11 @@ private:
                         alora_disabled_id = enabled_loras[0];
                     }
 
-                    bool do_checkpoint = params_base.n_ctx_checkpoints > 0;
+                    const bool checkpoints_enabled =
+                            params_base.n_ctx_checkpoints > 0 &&
+                            params_base.checkpoint_every_nt > 0;
+
+                    bool do_checkpoint = checkpoints_enabled;
 
                     // make checkpoints only for completion tasks
                     do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
@@ -4522,18 +4535,28 @@ private:
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
                         if (do_checkpoint) {
-                            static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
+                            int64_t last_checkpoint_nt = 0;
+                            if (!slot.prompt.checkpoints.empty()) {
+                                last_checkpoint_nt = slot.prompt.checkpoints.back().n_tokens;
+                            }
 
-                            bool should_break = false;
-                            for (int offset : checkpoint_offsets) {
-                                const int n_last = std::min(n_batch, offset);
-                                if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
-                                    should_break = true;
+                            const bool checkpoint_due =
+                                    (slot.prompt.n_tokens() - last_checkpoint_nt) >= params_base.checkpoint_every_nt;
+
+                            if (checkpoint_due) {
+                                static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
+
+                                bool should_break = false;
+                                for (int offset : checkpoint_offsets) {
+                                    const int n_last = std::min(n_batch, offset);
+                                    if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
+                                        should_break = true;
+                                        break;
+                                    }
+                                }
+                                if (should_break) {
                                     break;
                                 }
-                            }
-                            if (should_break) {
-                                break;
                             }
                         }
                     }
@@ -4556,24 +4579,18 @@ private:
                         slot.init_sampler();
                         SLT_INF(slot, "prompt processing done, n_tokens = %d, batch.n_tokens = %d\n", slot.prompt.n_tokens(), batch.n_tokens);
                     } else {
-                        if (slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch) {
-                            // near the end of the prompt
-                            do_checkpoint = do_checkpoint && true;
-                        } else {
-                            // only do non-end checkpoints if the "checkpoint every n tokens" option is set
-                            do_checkpoint = do_checkpoint && params_base.checkpoint_every_nt > 0;
+                        if (do_checkpoint) {
+                            const int64_t n_tokens_processed = slot.prompt.n_tokens() - n_tokens_cur;
+                            int64_t last_checkpoint_nt = 0;
+                            if (!slot.prompt.checkpoints.empty()) {
+                                last_checkpoint_nt = slot.prompt.checkpoints.back().n_tokens;
+                            }
+
+                            do_checkpoint = n_tokens_processed - last_checkpoint_nt >= params_base.checkpoint_every_nt;
 
                             if (do_checkpoint) {
-                                llama_pos last_checkpoint = 0;
-                                if (!slot.prompt.checkpoints.empty()) {
-                                    last_checkpoint = slot.prompt.checkpoints.back().n_tokens;
-                                }
-
-                                do_checkpoint = do_checkpoint && slot.prompt.n_tokens() - batch.n_tokens - last_checkpoint >= params_base.checkpoint_every_nt;
-
-                                if (do_checkpoint) {
-                                    SLT_INF(slot, "%d tokens since last checkpoint at %d, creating new checkpoint during processing at position %d\n", params_base.checkpoint_every_nt, last_checkpoint, slot.prompt.n_tokens());
-                                }
+                                SLT_INF(slot, "%d tokens since last checkpoint at %d, creating new checkpoint during processing at position %d\n",
+                                        params_base.checkpoint_every_nt, (int) last_checkpoint_nt, slot.prompt.n_tokens());
                             }
                         }
 
