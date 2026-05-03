@@ -485,18 +485,25 @@ void llama_kv_cache::paged_seq_rm(llama_seq_id seq_id) {
         return;
     }
 
-    // Free each block owned by this seq, then erase its table entries.
-    // We iterate through the flat allocator and release blocks whose only
-    // remaining logical owner is seq_id.  For now (Phase 1, unified stream)
-    // we use stream 0 when n_stream == 1, otherwise the seq's stream.
+    if ((size_t) seq_id >= seq_to_stream.size()) {
+        return;
+    }
+
+    // Free each block owned by this seq, then erase its table entries. The
+    // table can be sparse, so iterate actual entries instead of stopping at the
+    // first missing logical page.
     const uint32_t strm = (n_stream == 1) ? 0 : seq_to_stream[seq_id];
     if (strm < v_block_alloc.size()) {
         auto & alloc = v_block_alloc[strm];
-        for (uint32_t page = 0; ; ++page) {
-            const uint32_t blk_id = block_table.lookup(seq_id, page);
-            if (blk_id == LLAMA_KV_BLOCK_ID_NONE) {
-                break;
+        std::vector<uint32_t> blocks;
+
+        block_table.for_each_seq_page(seq_id, [&](uint32_t, uint32_t blk_id) {
+            if (blk_id != LLAMA_KV_BLOCK_ID_NONE && blk_id < alloc.n_blocks()) {
+                blocks.push_back(blk_id);
             }
+        });
+
+        for (const uint32_t blk_id : blocks) {
             alloc.free(blk_id);
         }
     }
@@ -574,22 +581,11 @@ void llama_kv_cache::paged_seq_cp(llama_seq_id src, llama_seq_id dst, llama_pos 
 
 void llama_kv_cache::paged_seq_keep(llama_seq_id seq_id) {
     // Erase every sequence except seq_id and release their blocks.
-    for (int32_t s = 0; s < (int32_t) LLAMA_MAX_SEQ; ++s) {
+    for (int32_t s = 0; s < (int32_t) seq_to_stream.size(); ++s) {
         if (s == seq_id) {
             continue;
         }
-        const uint32_t strm = (n_stream == 1) ? 0 : (uint32_t) seq_to_stream[s];
-        if (strm < v_block_alloc.size()) {
-            auto & alloc = v_block_alloc[strm];
-            for (uint32_t page = 0; ; ++page) {
-                const uint32_t blk_id = block_table.lookup(s, page);
-                if (blk_id == LLAMA_KV_BLOCK_ID_NONE) {
-                    break;
-                }
-                alloc.free(blk_id);
-            }
-        }
-        block_table.erase_seq(s);
+        paged_seq_rm(s);
     }
 
     if (debug > 1) {
@@ -624,9 +620,9 @@ void llama_kv_cache::paged_record_cell(uint32_t strm, uint32_t cell_idx,
         return;
     }
 
-    // Mark the block as allocated in the pool if it wasn't already.
-    // alloc.alloc_specific() removes blk_id from the free list if present.
-    alloc.alloc_specific(blk_id);
+    // Add one logical owner for this block. A rebuild can discover pages that
+    // share an already allocated block with another sequence.
+    alloc.acquire_specific(blk_id);
 
     block_table.insert(seq_id, page, blk_id);
 
@@ -764,8 +760,9 @@ void llama_kv_cache::rebuild_block_table_for_seq(llama_seq_id seq_id) {
         return;
     }
 
-    // remove stale block table entries for this seq, return blocks to free list
-    block_table.erase_seq(seq_id);
+    // Remove stale block-table entries for this seq and release their refs
+    // before rebuilding from the physical cells.
+    paged_seq_rm(seq_id);
 
     // rescan all cells — any cell belonging to seq_id rebuilds the mapping
     const auto & c = v_cells[strm];
@@ -820,11 +817,11 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
             if (strm_id < v_block_alloc.size()) {
                 auto & alloc       = v_block_alloc[strm_id];
                 const uint32_t bs  = alloc.block_size();
+                std::vector<uint32_t> empty_pages;
 
-                for (uint32_t page = 0; ; ++page) {
-                    const uint32_t blk_id = block_table.lookup(seq_id, page);
-                    if (blk_id == LLAMA_KV_BLOCK_ID_NONE) {
-                        break;
+                block_table.for_each_seq_page(seq_id, [&](uint32_t page, uint32_t blk_id) {
+                    if (blk_id == LLAMA_KV_BLOCK_ID_NONE || blk_id >= alloc.n_blocks()) {
+                        return;
                     }
 
                     const auto & blk = alloc.get(blk_id);
@@ -838,13 +835,22 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
                     }
 
                     if (block_empty) {
-                        alloc.free(blk_id);
-                        block_table.erase_page(seq_id, page);
+                        empty_pages.push_back(page);
+                    }
+                });
 
-                        if (debug > 1) {
-                            LLAMA_LOG_DEBUG("%s: [paged] seq %d page %u → block %u freed\n",
-                                    __func__, seq_id, page, blk_id);
-                        }
+                for (const uint32_t page : empty_pages) {
+                    const uint32_t blk_id = block_table.lookup(seq_id, page);
+                    if (blk_id == LLAMA_KV_BLOCK_ID_NONE || blk_id >= alloc.n_blocks()) {
+                        continue;
+                    }
+
+                    alloc.free(blk_id);
+                    block_table.erase_page(seq_id, page);
+
+                    if (debug > 1) {
+                        LLAMA_LOG_DEBUG("%s: [paged] seq %d page %u → block %u freed\n",
+                                __func__, seq_id, page, blk_id);
                     }
                 }
             }

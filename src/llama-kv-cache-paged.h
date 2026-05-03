@@ -180,6 +180,17 @@ public:
         // not in free list → already allocated, nothing to do
     }
 
+    // Acquire one logical owner for a specific block. If the block is free,
+    // allocate it; otherwise increment its refcount.
+    void acquire_specific(uint32_t id) {
+        assert(id < blocks.size());
+        if (ref_counts[id] == 0) {
+            alloc_specific(id);
+            return;
+        }
+        ref_counts[id]++;
+    }
+
     // Add one logical owner for an already allocated block.
     void retain(uint32_t id) {
         assert(id < blocks.size());
