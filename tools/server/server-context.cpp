@@ -1093,8 +1093,14 @@ private:
             paged_seq_leases.reset((int32_t) llama_n_seq_max(ctx));
         }
 
-        const auto ctx_seq_rm_type = common_context_can_seq_rm(ctx);
-        if (ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+        common_context_seq_rm_type ctx_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+
+        // In paged scheduler we do not use checkpoint-based seq-rm probing in the hot path.
+        // Skip capability probing to avoid misleading warnings and side effects.
+        if (params_base.scheduler != "paged") {
+            ctx_seq_rm_type = common_context_can_seq_rm(ctx);
+        }
+        if (params_base.scheduler != "paged" && ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             SRV_WRN("%s", "speculative decoding not supported by this context\n");
         }
 
@@ -1109,6 +1115,12 @@ private:
                 SRV_WRN("%s", "[paged] disabling speculative decoding: context requires checkpoints but checkpoint path is disabled\n");
                 params_base.speculative.type = COMMON_SPECULATIVE_TYPE_NONE;
             }
+        }
+
+        if (params_base.scheduler == "paged" &&
+            params_base.speculative.type != COMMON_SPECULATIVE_TYPE_NONE) {
+            SRV_WRN("%s", "[paged] disabling speculative decoding: checkpoint-based speculative is unsupported\n");
+            params_base.speculative.type = COMMON_SPECULATIVE_TYPE_NONE;
         }
 
         // cache for dynamic slot creation
