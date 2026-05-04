@@ -3493,154 +3493,60 @@ private:
                 if (!prefill_cursor.can_schedule_request()) {
                     continue;
                 }
-                int32_t req_prefill_added = 0;
+                PGD_INF(req, "new prompt, n_ctx=%d, n_keep=%d, task.n_tokens=%d\n",
+                        req.n_ctx, req.task->params.n_keep, req.task->n_tokens());
+                const auto prefill_res = server_scheduler::PagedScheduler::process_prefill_request(
+                    req,
+                    batch,
+                    prefill_cursor,
+                    server_scheduler::PrefillRequestParams{
+                        /*ctx=*/ctx,
+                        /*mctx=*/mctx,
+                        /*n_batch=*/n_batch,
+                        /*n_ubatch=*/n_ubatch,
+                        /*n_swa=*/n_swa,
+                        /*checkpoint_every_nt=*/params_base.checkpoint_every_nt,
+                        /*checkpoints_enabled=*/false,
+                    },
+                    server_scheduler::PrefillRequestCallbacks{
+                        /*on_release_final=*/[this](paged_request_state & r) {
+                            PGD_WRN(r, "%s", "empty prompt - releasing");
+                            r.print_timings();
+                            send_final_response(r);
+                            r.release();
+                        },
+                        /*on_release_error=*/[this](paged_request_state & r, const std::string & msg, error_type t) {
+                            send_error(r, msg, t);
+                            r.release();
+                        },
+                        /*on_hard_reset=*/[this](paged_request_state & r, const char * reason) {
+                            reset_paged_request_state(r, reason);
+                        },
+                        /*on_create_checkpoint=*/[this](paged_request_state & r, int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+                            create_checkpoint(r, n_tokens_cur, pos_min, pos_max);
+                        },
+                        /*on_partial_progress=*/[this](paged_request_state & r) {
+                            send_partial_response(r, {}, true);
+                        },
+                    });
 
-                const auto & input_tokens = req.task->tokens;
-
-                const auto n_tokens_prev = batch.n_tokens;
-
-                const bool checkpoints_enabled = false;
-
-                if (server_scheduler::PagedScheduler::should_begin_prefill(req)) {
-                    const int64_t t_prefill_start = ggml_time_us();
-
-                    PGD_INF(req, "new prompt, n_ctx=%d, n_keep=%d, task.n_tokens=%d\n",
-                            req.n_ctx, req.task->params.n_keep, req.task->n_tokens());
-
-                    const auto init = server_scheduler::PagedScheduler::prepare_prefill_start(
-                        req, llama_get_memory(ctx) != nullptr);
-                    if (init.release_with_final) {
-                        PGD_WRN(req, "%s", "empty prompt - releasing\n");
-                        req.print_timings();
-                        send_final_response(req);
-                        req.release();
-                        continue;
-                    }
-                    if (init.release_with_error) {
-                        send_error(req, init.error_message, init.error_kind);
-                        req.release();
-                        continue;
-                    }
-                    GGML_ASSERT(init.ok);
-                    int n_past = init.n_past;
-
-                    if (init.force_early_reset) {
-                        SRV_WRN("[paged] early divergence (n_past=%d < 64), forcing full reset for seq_id=%d\n",
-                                n_past, req.seq_id);
-                        reset_paged_request_state(req, "early-divergence");
-                        n_past = 0;
-                    }
-
-                    const auto ckpt = server_scheduler::PagedScheduler::restore_or_reset_checkpoint(
-                        req, ctx, checkpoints_enabled, n_swa, n_past);
-                    n_past = ckpt.n_past;
-                    llama_pos pos_next = ckpt.pos_next;
-
-                    server_scheduler::PagedScheduler::prune_invalid_checkpoints(req, pos_next, checkpoints_enabled);
-
-                    n_past = server_scheduler::PagedScheduler::adjust_n_past_for_prompt_logits(req, n_past);
-
-                    server_scheduler::PagedScheduler::begin_prefill(req, n_past, t_prefill_start);
-
-                    if (server_scheduler::PagedScheduler::should_send_prefill_progress(req)) {
-                        send_partial_response(req, {}, true);
-                    }
-                }
-
-                // truncate any KV tokens beyond n_past
-                const llama_pos p0 = req.prompt.tokens.pos_next();
-                if (!server_scheduler::PagedScheduler::validate_prefill_truncate(ctx, req)) {
-                    PGD_WRN(req, "failed to truncate KV at pos %d - hard resetting\n", p0);
-                    reset_paged_request_state(req, "truncate-failed");
-                }
-
-                bool do_checkpoint = server_scheduler::PagedScheduler::should_enable_checkpoints(req, n_swa, checkpoints_enabled);
-
-                bool has_mtmd = false;
-
-                bool request_released = false;
-                // fill batch with prompt tokens
-                while (req.prompt.n_tokens() < req.task->n_tokens() &&
-                       prefill_cursor.can_append_token(batch.n_tokens, n_batch, req_prefill_added)) {
-
-                    // handle multimodal chunks
-                    const auto mtmd = server_scheduler::PagedScheduler::advance_mtmd_chunks(
-                        req,
-                        [&](size_t prompt_n_tokens, llama_pos pos_next, size_t & n_tokens_out) {
-                            return input_tokens.process_chunk(
-                                ctx, mctx, prompt_n_tokens, pos_next, req.seq_id, n_tokens_out);
-                        });
-                    if (!mtmd.ok) {
-                        PGD_ERR(req, "%s", "failed to process image chunk");
-                        send_error(req, "failed to process image", ERROR_TYPE_SERVER);
-                        req.release();
-                        request_released = true;
-                        break;
-                    }
-                    if (mtmd.consumed_any) {
-                        has_mtmd = true;
-                    }
-                    if (request_released) {
-                        break;
-                    }
-
-                    if (req.prompt.n_tokens() >= req.task->n_tokens()) {
-                        break;
-                    }
-
-                    const auto appended = server_scheduler::PagedScheduler::append_prompt_token(
-                        req,
-                        batch,
-                        prefill_cursor,
-                        req_prefill_added,
-                        n_batch,
-                        n_ubatch,
-                        do_checkpoint,
-                        params_base.checkpoint_every_nt);
-                    if (!appended.appended) {
-                        break;
-                    }
-                    if (appended.should_break) {
-                        break;
-                    }
-                }
-
-                if (request_released || !req.is_processing()) {
+                if (prefill_res.released || !req.is_processing()) {
                     continue;
                 }
 
-                const auto n_tokens_cur = batch.n_tokens - n_tokens_prev;
-                const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), req.seq_id);
-                const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx), req.seq_id);
-                const auto prefill_finalize = server_scheduler::PagedScheduler::finalize_prefill_step(
-                        req,
-                        batch,
-                        n_tokens_cur,
-                        do_checkpoint,
-                        params_base.checkpoint_every_nt,
-                        has_mtmd,
-                        pos_min);
-                do_checkpoint = prefill_finalize.should_checkpoint;
-
-                if (prefill_finalize.prompt_done) {
+                if (prefill_res.prompt_done) {
                     PGD_INF(req, "prompt done, n_tokens=%d, batch.n_tokens=%d\n",
                             req.prompt.n_tokens(), batch.n_tokens);
-                } else if (prefill_finalize.should_log_progress) {
+                } else {
                     PGD_INF(req, "prefill progress, n_tokens=%d/%d\n",
                             req.prompt.n_tokens(), req.task->n_tokens());
-                }
-
-                PGD_DBG(req, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
-
-                if (do_checkpoint) {
-                    create_checkpoint(req, n_tokens_cur, pos_min, pos_max);
                 }
 
                 if (!req_batched) {
                     req_batched = &req;
                 }
 
-                if (batch.n_tokens >= n_batch) {
+                if (prefill_res.batch_full) {
                     break;
                 }
             }

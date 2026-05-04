@@ -4,6 +4,7 @@
 #include "prefill_policy.h"
 #include "scheduler_core.h"
 #include "llama.h"
+#include "mtmd.h"
 #include <functional>
 #include <string>
 #include <unordered_set>
@@ -77,6 +78,32 @@ struct MtmdAdvanceResult {
     bool consumed_any = false;
 };
 
+struct PrefillRequestParams {
+    llama_context * ctx = nullptr;
+    mtmd_context * mctx = nullptr;
+    int32_t n_batch = 0;
+    int32_t n_ubatch = 0;
+    int32_t n_swa = 0;
+    int32_t checkpoint_every_nt = 0;
+    bool checkpoints_enabled = false;
+};
+
+struct PrefillRequestCallbacks {
+    std::function<void(RequestState &)> on_release_final;
+    std::function<void(RequestState &, const std::string &, error_type)> on_release_error;
+    std::function<void(RequestState &, const char *)> on_hard_reset;
+    std::function<void(RequestState &, int64_t, llama_pos, llama_pos)> on_create_checkpoint;
+    std::function<void(RequestState &)> on_partial_progress;
+};
+
+struct PrefillRequestResult {
+    bool released = false;
+    bool batch_full = false;
+    bool prompt_done = false;
+    bool has_mtmd = false;
+    bool checkpoint_created = false;
+};
+
 struct PrefillInitDecision {
     bool ok = false;
     bool release_with_final = false;
@@ -147,6 +174,12 @@ public:
             int32_t n_past);
     static int32_t adjust_n_past_for_prompt_logits(const RequestState & req, int32_t n_past);
     static bool should_send_prefill_progress(const RequestState & req);
+    static PrefillRequestResult process_prefill_request(
+            RequestState & req,
+            llama_batch & batch,
+            PrefillWorkCursor & cursor,
+            const PrefillRequestParams & params,
+            const PrefillRequestCallbacks & cbs);
 
     TickOutcome tick(const PagedRuntime & runtime) const;
     PagedTickDecision tick(const PagedTickInput & in) const;

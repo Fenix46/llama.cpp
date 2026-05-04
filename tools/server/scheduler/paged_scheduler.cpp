@@ -354,6 +354,98 @@ bool PagedScheduler::should_send_prefill_progress(const RequestState & req) {
     return req.task && req.task->params.stream && req.task->params.return_progress;
 }
 
+PrefillRequestResult PagedScheduler::process_prefill_request(
+        RequestState & req,
+        llama_batch & batch,
+        PrefillWorkCursor & cursor,
+        const PrefillRequestParams & params,
+        const PrefillRequestCallbacks & cbs) {
+    PrefillRequestResult out;
+    int32_t req_prefill_added = 0;
+    const int64_t n_tokens_prev = batch.n_tokens;
+
+    if (should_begin_prefill(req)) {
+        const int64_t t_prefill_start = ggml_time_us();
+        const auto init = prepare_prefill_start(req, params.ctx && llama_get_memory(params.ctx) != nullptr);
+        if (init.release_with_final) {
+            if (cbs.on_release_final) cbs.on_release_final(req);
+            out.released = true;
+            return out;
+        }
+        if (init.release_with_error) {
+            if (cbs.on_release_error) cbs.on_release_error(req, init.error_message, init.error_kind);
+            out.released = true;
+            return out;
+        }
+
+        GGML_ASSERT(init.ok);
+        int32_t n_past = init.n_past;
+        if (init.force_early_reset) {
+            if (cbs.on_hard_reset) cbs.on_hard_reset(req, "early-divergence");
+            n_past = 0;
+        }
+
+        const auto ckpt = restore_or_reset_checkpoint(req, params.ctx, params.checkpoints_enabled, params.n_swa, n_past);
+        n_past = adjust_n_past_for_prompt_logits(req, ckpt.n_past);
+        prune_invalid_checkpoints(req, ckpt.pos_next, params.checkpoints_enabled);
+        begin_prefill(req, n_past, t_prefill_start);
+        if (should_send_prefill_progress(req) && cbs.on_partial_progress) {
+            cbs.on_partial_progress(req);
+        }
+    }
+
+    if (!validate_prefill_truncate(params.ctx, req)) {
+        if (cbs.on_hard_reset) cbs.on_hard_reset(req, "truncate-failed");
+    }
+
+    bool do_checkpoint = should_enable_checkpoints(req, params.n_swa, params.checkpoints_enabled);
+    while (req.task &&
+           req.prompt.n_tokens() < req.task->n_tokens() &&
+           cursor.can_append_token(batch.n_tokens, params.n_batch, req_prefill_added)) {
+        const auto mtmd = advance_mtmd_chunks(
+            req,
+            [&](size_t prompt_n_tokens, llama_pos pos_next, size_t & n_tokens_out) {
+                return req.task->tokens.process_chunk(
+                    params.ctx, params.mctx, prompt_n_tokens, pos_next, req.seq_id, n_tokens_out);
+            });
+        if (!mtmd.ok) {
+            if (cbs.on_release_error) cbs.on_release_error(req, "failed to process image", ERROR_TYPE_SERVER);
+            out.released = true;
+            return out;
+        }
+        out.has_mtmd = out.has_mtmd || mtmd.consumed_any;
+        if (req.task && req.prompt.n_tokens() >= req.task->n_tokens()) {
+            break;
+        }
+
+        const auto appended = append_prompt_token(
+            req, batch, cursor, req_prefill_added, params.n_batch, params.n_ubatch, do_checkpoint, params.checkpoint_every_nt);
+        if (!appended.appended || appended.should_break) {
+            break;
+        }
+    }
+
+    if (!req.is_processing()) {
+        out.released = true;
+        return out;
+    }
+
+    const int64_t n_tokens_cur = batch.n_tokens - n_tokens_prev;
+    const auto pos_min = params.ctx ? llama_memory_seq_pos_min(llama_get_memory(params.ctx), req.seq_id) : -1;
+    const auto pos_max = params.ctx ? llama_memory_seq_pos_max(llama_get_memory(params.ctx), req.seq_id) : -1;
+    const auto fin = finalize_prefill_step(
+        req, batch, n_tokens_cur, do_checkpoint, params.checkpoint_every_nt, out.has_mtmd, pos_min);
+    out.prompt_done = fin.prompt_done;
+
+    if (fin.should_checkpoint && cbs.on_create_checkpoint) {
+        cbs.on_create_checkpoint(req, n_tokens_cur, pos_min, pos_max);
+        out.checkpoint_created = true;
+    }
+
+    out.batch_full = batch.n_tokens >= params.n_batch;
+    return out;
+}
+
 bool PrefillWorkCursor::can_schedule_request() const {
     return prefill_added < prefill_total_budget;
 }
