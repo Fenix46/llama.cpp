@@ -68,6 +68,50 @@ BlockManager::Stats BlockManager::stats(const std::vector<RequestState> & reqs) 
     return out;
 }
 
+BlockManager::FitDecision BlockManager::can_fit_request_full(const RequestState & req, const FitContext & ctx) {
+    if (!req.task) {
+        return {false, 0, "no-task"};
+    }
+    const int32_t target_tokens = req.task->n_tokens();
+    return can_fit_tokens_delta(req, std::max(0, target_tokens - req.prompt.n_tokens()), ctx);
+}
+
+BlockManager::FitDecision BlockManager::can_fit_tokens_delta(
+        const RequestState & req,
+        int32_t delta_tokens,
+        const FitContext & ctx) {
+    FitDecision out;
+    if (delta_tokens <= 0) {
+        out.can_fit = true;
+        return out;
+    }
+    const int32_t bs = std::max(1, ctx.block_size);
+    const int32_t current_tokens = std::max(0, req.prompt.n_tokens());
+    const int32_t current_blocks = (current_tokens + bs - 1) / bs;
+    const int32_t target_tokens = current_tokens + delta_tokens;
+    if (ctx.max_model_len > 0 && target_tokens > ctx.max_model_len) {
+        out.reason = "max-model-len";
+        return out;
+    }
+    const int32_t target_blocks = (target_tokens + bs - 1) / bs;
+    out.needed_blocks = std::max(0, target_blocks - current_blocks);
+    if (ctx.total_blocks <= 0) {
+        out.can_fit = true;
+        return out;
+    }
+    const int32_t free_blocks = std::max(0, ctx.total_blocks - ctx.reserved_blocks);
+    out.can_fit = out.needed_blocks <= free_blocks;
+    out.reason = out.can_fit ? "ok" : "kv-pressure";
+    return out;
+}
+
+float BlockManager::pressure_ratio(const Stats & stats, int32_t total_blocks) {
+    if (total_blocks <= 0) {
+        return 0.0f;
+    }
+    return (float) stats.reserved_blocks / (float) total_blocks;
+}
+
 bool BlockManager::clear_sequence(llama_context * ctx, int32_t seq_id) {
     if (!ctx) {
         return false;

@@ -3414,9 +3414,8 @@ private:
             const int32_t n_batch  = llama_n_batch(ctx);
             const int32_t n_ubatch = llama_n_ubatch(ctx);
             const auto blk_stats = server_scheduler::BlockManager::stats(paged_requests);
-            const float kv_pressure_ratio = paged_total_blocks_ > 0
-                ? (float) blk_stats.reserved_blocks / (float) paged_total_blocks_
-                : 0.0f;
+            const float kv_pressure_ratio = server_scheduler::BlockManager::pressure_ratio(blk_stats, paged_total_blocks_);
+            const int32_t block_size_for_fit = paged_blocks_per_seq_ > 0 ? std::max(1, n_ctx_slot_ / paged_blocks_per_seq_) : 1;
             const auto schedule_decision = paged_core.schedule(server_scheduler::SchedulerCore::RuntimeSnapshot{
                 /*reqs=*/&paged_requests,
                 /*max_running=*/std::max(1, max_running),
@@ -3445,7 +3444,18 @@ private:
                         server_scheduler::SchedulerCore::normalize_reason(admission.reason),
                     };
                 },
-                /*can_fit_tokens=*/nullptr,
+                /*can_fit_tokens=*/[this, blk_stats, block_size_for_fit](const server_scheduler::RequestState & req, int32_t delta_tokens) {
+                    const auto fit = server_scheduler::BlockManager::can_fit_tokens_delta(
+                        req,
+                        delta_tokens,
+                        server_scheduler::BlockManager::FitContext{
+                            /*max_model_len=*/n_ctx_slot_,
+                            /*block_size=*/block_size_for_fit,
+                            /*total_blocks=*/paged_total_blocks_,
+                            /*reserved_blocks=*/blk_stats.reserved_blocks,
+                        });
+                    return fit.can_fit;
+                },
             });
             const auto & active_seq_ids = schedule_decision.active_seq_ids;
             if (schedule_decision.deferred > 0) {
