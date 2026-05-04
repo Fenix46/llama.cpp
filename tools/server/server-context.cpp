@@ -9,6 +9,7 @@
 #include "kv-prefix-cache.h"
 #include "paged-request.h"
 #include "scheduler/admission_controller.h"
+#include "scheduler/block_manager.h"
 #include "scheduler/prefill_policy.h"
 #include "scheduler/paged_scheduler.h"
 #include "scheduler/reservation_model.h"
@@ -1718,7 +1719,7 @@ private:
         }
 
         // Rebuild first: if stale block-table metadata remains, this normalizes it.
-        llama_kv_cache_rebuild_block_table(llama_get_memory(ctx), req.seq_id);
+        server_scheduler::BlockManager::rebuild_block_table(ctx, req.seq_id);
 
         const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), req.seq_id);
         const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx), req.seq_id);
@@ -1764,7 +1765,7 @@ private:
             } else if (seq_id >= 0) {
                 prefix_cache_invalidate(seq_id);
                 (void) llama_memory_seq_rm(llama_get_memory(ctx), seq_id, -1, -1);
-                llama_kv_cache_rebuild_block_table(llama_get_memory(ctx), seq_id);
+                server_scheduler::BlockManager::rebuild_block_table(ctx, seq_id);
                 GGML_ASSERT(llama_memory_seq_pos_min(llama_get_memory(ctx), seq_id) == -1);
                 GGML_ASSERT(llama_memory_seq_pos_max(llama_get_memory(ctx), seq_id) == -1);
             }
@@ -3520,7 +3521,7 @@ private:
                                             it->pos_min, it->pos_max, it->n_tokens, (float) checkpoint_size / 1024 / 1024);
                                     do_reset = true;
                                 } else {
-                                    llama_kv_cache_rebuild_block_table(llama_get_memory(ctx), req.seq_id);
+                                    server_scheduler::BlockManager::rebuild_block_table(ctx, req.seq_id);
                                     pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                     n_past = std::min(req.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
                                     PGD_WRN(req, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n",
@@ -3571,7 +3572,7 @@ private:
 
                 // truncate any KV tokens beyond n_past
                 const llama_pos p0 = req.prompt.tokens.pos_next();
-                if (!llama_memory_seq_rm(llama_get_memory(ctx), req.seq_id, p0, -1)) {
+                if (!server_scheduler::BlockManager::truncate_seq_tail(ctx, req.seq_id, p0)) {
                     PGD_WRN(req, "failed to truncate KV at pos %d - hard resetting\n", p0);
                     reset_paged_request_state(req, "truncate-failed");
                 }
