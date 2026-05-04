@@ -12,6 +12,8 @@
 #include "scheduler/prefill_policy.h"
 #include "scheduler/paged_scheduler.h"
 #include "scheduler/reservation_model.h"
+#include "scheduler/sampling_executor.h"
+#include "scheduler/step_executor.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -3744,24 +3746,9 @@ private:
             int32_t cur_n_batch = n_batch;
 
             for (int32_t i = 0; i < batch.n_tokens; i = i_next) {
-                int32_t n_tokens = std::min(cur_n_batch, batch.n_tokens - i);
-
-                // Paged attention kernels currently assume that all Q rows in a
-                // single llama_decode() segment share the same seq_id/page window.
-                // Split mixed-request batches at seq boundaries to avoid
-                // cross-request corruption when multiple paged requests are active.
-                if (params_base.scheduler == "paged" && batch.n_seq_id[i] > 0) {
-                    const llama_seq_id seq_id_cur = batch.seq_id[i][0];
-                    int32_t n_same_seq = 1;
-                    while (n_same_seq < n_tokens) {
-                        const int32_t idx = i + n_same_seq;
-                        if (batch.n_seq_id[idx] <= 0 || batch.seq_id[idx][0] != seq_id_cur) {
-                            break;
-                        }
-                        ++n_same_seq;
-                    }
-                    n_tokens = n_same_seq;
-                }
+                const auto seg = server_scheduler::StepExecutor::select_decode_segment(
+                    batch, i, cur_n_batch, params_base.scheduler == "paged");
+                const int32_t n_tokens = seg.n_tokens;
 
                 llama_batch batch_view = {
                     n_tokens,
@@ -3792,21 +3779,13 @@ private:
                         (double) metrics.t_tokens_generation);
                 }
 
-                if (ret != 0) {
-                    std::string err;
-                    if (cur_n_batch == 1 && ret == 1) {
-                        err = "Context size has been exceeded.";
-                    } else if (ret == -1) {
-                        err = "Invalid input batch.";
-                    } else if (ret < -1) {
-                        err = "Compute error.";
-                    }
-
-                    if (!err.empty()) {
-                        SRV_ERR("[paged] %s i=%d, n_batch=%d, ret=%d\n", err.c_str(), i, cur_n_batch, ret);
+                const auto ret_decision = server_scheduler::StepExecutor::classify_decode_ret(ret, cur_n_batch);
+                if (!ret_decision.ok) {
+                    if (ret_decision.fatal) {
+                        SRV_ERR("[paged] %s i=%d, n_batch=%d, ret=%d\n", ret_decision.error, i, cur_n_batch, ret);
                         for (auto & req : paged_requests) {
                             if (req.is_processing()) {
-                                send_error(req, err);
+                                send_error(req, ret_decision.error);
                                 req.release();
                             }
                         }
@@ -3814,7 +3793,7 @@ private:
                     }
 
                     if (!try_clear_idle_paged_requests()) {
-                        cur_n_batch /= 2;
+                        cur_n_batch = ret_decision.next_batch;
                     }
                     SRV_WRN("[paged] KV full, retrying batch size=%d\n", cur_n_batch);
                     continue;
@@ -3869,11 +3848,7 @@ private:
                         }
 
                         GGML_ASSERT(req.task->need_sampling());
-                        req.phase = PAGED_REQUEST_DECODING;
-
-                        if (req.can_speculate()) {
-                            common_speculative_begin(req.spec.spec.get(), req.prompt.tokens.get_text_tokens());
-                        }
+                        server_scheduler::SamplingExecutor::maybe_start_decoding(req);
                     } else if (req.phase != PAGED_REQUEST_DECODING) {
                         continue;
                     }
@@ -3889,15 +3864,11 @@ private:
                     common_sampler_accept(req.smpl.get(), id, true);
 
                     const int64_t t_current = ggml_time_us();
-                    req.n_decoded += 1;
-
-                    if (req.n_decoded == 1) {
-                        req.t_start_generation = t_current;
-                        req.t_prompt_processing = (req.t_start_generation - req.t_start_process_prompt) / 1e3;
+                    const int32_t n_before = req.n_decoded;
+                    server_scheduler::SamplingExecutor::on_sampled_token(req, t_current);
+                    if (n_before == 0 && req.n_decoded == 1) {
                         metrics.on_prompt_eval(req);
                     }
-
-                    req.t_token_generation = std::max<int64_t>(1, t_current - req.t_start_generation) / 1e3;
 
                     completion_token_output result;
                     result.tok          = id;
