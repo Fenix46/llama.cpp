@@ -3568,7 +3568,7 @@ private:
             }
 
             // 4. llama_decode loop (owned by paged scheduler with server-context callbacks)
-            (void) server_scheduler::PagedScheduler::process_decode_pass(
+            const auto decode_outcome = server_scheduler::PagedScheduler::process_decode_pass(
                 ctx,
                 batch,
                 n_batch,
@@ -3686,6 +3686,12 @@ private:
                         req.release();
                     },
                 });
+            if (decode_outcome.speculative_accept_loops > 0) {
+                SRV_DBG("[paged-stage] speculative_loops=%d\n", decode_outcome.speculative_accept_loops);
+            }
+            if (decode_outcome.fatal) {
+                SRV_DBG("%s", "[paged-stage] decode fatal outcome reported by scheduler");
+            }
 
             SRV_DBG("%s", "[paged] run completed\n");
             return; // <-- early return, skip slot-based path below

@@ -7,7 +7,7 @@ This document tracks what is still missing to complete the paged scheduler migra
 - `SchedulerCore` now supports runtime-based scheduling inputs and structured decisions.
 - `PagedScheduler` owns more prefill policy logic (budgeting, token append, checkpoint decisions, prefill-start validation).
 - `BlockManager` is partially centralized for paged KV operations.
-- `server-context.cpp` still contains a large inline paged prefill/decode orchestration block.
+- `server-context.cpp` still contains inline paged decode/spec orchestration, while prefill candidate orchestration is now delegated.
 
 ## Validation (as of current branch head)
 
@@ -21,37 +21,37 @@ This document tracks what is still missing to complete the paged scheduler migra
   - checkpoint break/progress/finalize checks
 - [x] Lifecycle transitions partially routed through `request_lifecycle`.
 - [~] BlockManager centralization in progress (core wrappers in place, full policy integration pending).
-- [ ] Full prefill orchestration extraction still incomplete.
+- [x] Full prefill orchestration extraction completed in `PagedScheduler` (request step + candidate pass).
 - [ ] Speculative path still post-pass (not first-class in planner).
 - [ ] Dedicated test additions listed below not yet implemented.
 
 ## Remaining Steps (Execution Order)
 
-## 1) Move the remaining prefill loop orchestration out of `server-context.cpp`  **[IN PROGRESS]**
+## 1) Move the remaining prefill loop orchestration out of `server-context.cpp`  **[DONE]**
 
-### What is still inline
-- Checkpoint restore branch and checkpoint invalidation scans.
-- KV truncate + reset fallback policy wiring.
-- MTMD process-chunk call flow and request release/error behavior coupling (partially extracted).
-- Batch-level control flow (`continue`, `break`, `goto next_req`) coordination.
+### Completed
+- `process_prefill_request(...)` now owns prefill request state machine and checkpoint flow.
+- `process_prefill_candidates(...)` now owns the prefill candidate pass loop.
+- `server-context` only wires callbacks/logging for prefill side-effects.
 
-### What to implement
-- Add a `PrefillStepExecutor` (or extend `PagedScheduler`) with:
-  - `prepare_request_prefill(...)`
-  - `process_request_prefill_chunk(...)`
-  - `finalize_request_prefill(...)`
-- Replace `goto next_req` with structured result enums:
-  - `continue_request`
-  - `release_request`
-  - `abort_tick`
-- Keep `server-context` as adapter for side effects:
-  - `send_partial_response`
-  - `send_error`
-  - `send_final_response`
-  - `create_checkpoint`
+### Implemented API
+- `PagedScheduler::process_prefill_request(...)`
+- `PagedScheduler::process_prefill_candidates(...)`
+- `PrefillRequestCallbacks` + `PrefillPassCallbacks`
 
 ### Acceptance
-- Paged prefill section in `update_slots()` reduced to orchestration-only calls.
+- Paged prefill section in `update_slots()` is reduced to orchestration-only call + callbacks.
+
+---
+
+## Active Unified Task: `vllm_scheduler_remaining_migration`
+
+1. [x] SchedulerCore owner policy/admission reasons incluse taxonomy normalized.
+2. [x] PagedScheduler tick path copre prefill + decode pass orchestration callbacks.
+3. [~] BlockManager porta KV paged quasi completa (restano call-site legacy non-paged).
+4. [x] Lifecycle parent/child centralizzato con propagation result strutturato.
+5. [x] Speculative integrato nel decode stage scheduler (context solo callback token/final).
+6. [ ] Dual-path switch control + readiness gates finali/perf.
 
 ## 2) Make `SchedulerCore` the single owner of tick policy decisions  **[IN PROGRESS]**
 
