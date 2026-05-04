@@ -3446,10 +3446,8 @@ private:
 
                 const bool checkpoints_enabled = false;
 
-                if (req.phase == PAGED_REQUEST_STARTED) {
-                    req.t_start_process_prompt = ggml_time_us();
-                    req.t_start_generation     = 0;
-                    req.phase                  = PAGED_REQUEST_PREFILLING;
+                if (server_scheduler::PagedScheduler::should_begin_prefill(req)) {
+                    const int64_t t_prefill_start = ggml_time_us();
 
                     PGD_INF(req, "new prompt, n_ctx=%d, n_keep=%d, task.n_tokens=%d\n",
                             req.n_ctx, req.task->params.n_keep, req.task->n_tokens());
@@ -3586,10 +3584,7 @@ private:
                         n_past--;
                     }
 
-                    req.n_prompt_tokens_cache     = n_past;
-                    req.n_prompt_tokens_processed = 0;
-
-                    req.prompt.tokens.keep_first(n_past);
+                    server_scheduler::PagedScheduler::begin_prefill(req, n_past, t_prefill_start);
 
                     if (req.task->params.stream && req.task->params.return_progress) {
                         send_partial_response(req, {}, true);
@@ -3686,15 +3681,7 @@ private:
                 const auto n_tokens_cur = batch.n_tokens - n_tokens_prev;
 
                 if (req.prompt.n_tokens() == req.task->n_tokens()) {
-                    req.phase = PAGED_REQUEST_DONE_PREFILL;
-
-                    GGML_ASSERT(batch.n_tokens > 0);
-                    batch.logits[batch.n_tokens - 1] = true;
-
-                    req.n_decoded = 0;
-                    req.i_batch   = batch.n_tokens - 1;
-
-                    req.init_sampler();
+                    server_scheduler::PagedScheduler::mark_prompt_done(req, batch);
                     PGD_INF(req, "prompt done, n_tokens=%d, batch.n_tokens=%d\n",
                             req.prompt.n_tokens(), batch.n_tokens);
                 } else {

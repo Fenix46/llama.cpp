@@ -43,6 +43,18 @@ const RequestState * SchedulerCore::find_request(const std::vector<RequestState>
     return nullptr;
 }
 
+static int phase_priority(const RequestState * req) {
+    if (!req) {
+        return 0;
+    }
+    switch (req->phase) {
+        case PAGED_REQUEST_DECODING: return 3;
+        case PAGED_REQUEST_DONE_PREFILL: return 2;
+        case PAGED_REQUEST_PREFILLING: return 1;
+        default: return 0;
+    }
+}
+
 SchedulerCore::ScheduleDecision SchedulerCore::schedule(
         const std::vector<RequestState> & reqs,
         int32_t max_running,
@@ -68,6 +80,10 @@ SchedulerCore::ScheduleDecision SchedulerCore::schedule(
             ++it;
         }
     }
+    // Decode-first: higher phase priority requests are admitted first.
+    std::stable_sort(waiting_.begin(), waiting_.end(), [&](int32_t a, int32_t b) {
+        return phase_priority(find_request(reqs, a)) > phase_priority(find_request(reqs, b));
+    });
 
     while ((int32_t) running_.size() < max_running && !waiting_.empty()) {
         const int32_t seq_id = waiting_.front();
