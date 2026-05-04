@@ -1,6 +1,7 @@
 #pragma once
 
 #include "request_state.h"
+#include "request_lifecycle.h"
 #include <vector>
 
 namespace server_scheduler {
@@ -26,7 +27,7 @@ public:
     static bool can_sample_in_segment(const RequestState & req, int32_t i, int32_t n_tokens);
     static SampleDecision sample_token(RequestState & req, int32_t i);
     static void on_sampled_token(RequestState & req, int64_t t_current_us);
-    static void propagate_parent_state(std::vector<RequestState> & reqs);
+    static GroupPropagationResult propagate_parent_state(std::vector<RequestState> & reqs);
 };
 
 } // namespace server_scheduler

@@ -28,6 +28,12 @@ bool transition(RequestState & req, RequestEvent ev) {
                 return true;
             }
             return false;
+        case RequestEvent::ParentReady:
+            if (req.phase == PAGED_REQUEST_WAIT_PARENT) {
+                req.phase = PAGED_REQUEST_DONE_PREFILL;
+                return true;
+            }
+            return false;
         case RequestEvent::Release:
             req.phase = PAGED_REQUEST_IDLE;
             return true;
@@ -48,9 +54,26 @@ GroupPropagationResult propagate_parent_prefill(std::vector<RequestState> & reqs
                 child.task &&
                 req.task->id == child.task->id_parent) {
                 child.copy_state_from(req);
-                child.phase = PAGED_REQUEST_DONE_PREFILL;
-                out.children_activated++;
+                if (transition(child, RequestEvent::ParentReady)) {
+                    out.children_activated++;
+                }
             }
+        }
+
+        bool all_children_ready = true;
+        bool has_children = false;
+        for (const auto & child : reqs) {
+            if (!child.task || child.task->id_parent != req.task->id) {
+                continue;
+            }
+            has_children = true;
+            if (!(child.phase == PAGED_REQUEST_DONE_PREFILL || child.phase == PAGED_REQUEST_DECODING)) {
+                all_children_ready = false;
+                break;
+            }
+        }
+        if (has_children && all_children_ready) {
+            out.groups_ready++;
         }
     }
     return out;

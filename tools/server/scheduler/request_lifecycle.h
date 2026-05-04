@@ -10,6 +10,7 @@ enum class RequestEvent {
     BeginPrefill,
     PromptDone,
     BeginDecode,
+    ParentReady,
     Release,
 };
 
@@ -18,6 +19,7 @@ bool transition(RequestState & req, RequestEvent ev);
 struct GroupPropagationResult {
     int32_t parents_processed = 0;
     int32_t children_activated = 0;
+    int32_t groups_ready = 0;
 };
 
 GroupPropagationResult propagate_parent_prefill(std::vector<RequestState> & reqs);

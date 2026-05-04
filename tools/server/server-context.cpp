@@ -3612,7 +3612,12 @@ private:
                         return local_batch > 0;
                     },
                     /*on_segment_sample=*/[this, &accept_special_token_paged](int32_t i, int32_t n_tokens, const llama_batch & batch_view) {
-                        server_scheduler::SamplingExecutor::propagate_parent_state(paged_requests);
+                        const auto group_state = server_scheduler::SamplingExecutor::propagate_parent_state(paged_requests);
+                        if (group_state.children_activated > 0) {
+                            SRV_DBG("[paged-lifecycle] children_activated=%d groups_ready=%d\n",
+                                    group_state.children_activated,
+                                    group_state.groups_ready);
+                        }
 
                         for (auto & req : paged_requests) {
                             if (req.phase == PAGED_REQUEST_PREFILLING ||

@@ -73,8 +73,8 @@ void SamplingExecutor::on_sampled_token(RequestState & req, int64_t t_current_us
     req.t_token_generation = std::max<int64_t>(1, t_current_us - req.t_start_generation) / 1e3;
 }
 
-void SamplingExecutor::propagate_parent_state(std::vector<RequestState> & reqs) {
-    (void) propagate_parent_prefill(reqs);
+GroupPropagationResult SamplingExecutor::propagate_parent_state(std::vector<RequestState> & reqs) {
+    return propagate_parent_prefill(reqs);
 }
 
 } // namespace server_scheduler
