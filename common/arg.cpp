@@ -1371,6 +1371,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_BLOCK_SIZE").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--paged-lookahead-tokens"}, "N",
+        string_format("extra KV blocks reserved per request beyond prompt when max_tokens is unknown (default: %d)", params.paged_lookahead_tokens),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("error: --paged-lookahead-tokens must be >= 0\n");
+            }
+            params.paged_lookahead_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_PAGED_LOOKAHEAD_TOKENS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--max-model-len"}, "N",
         "vLLM-style maximum model length per request for paged scheduler mode",
         [](common_params & params, int value) {

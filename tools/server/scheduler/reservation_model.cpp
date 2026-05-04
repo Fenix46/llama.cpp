@@ -24,7 +24,14 @@ int32_t paged_task_reserved_blocks(
         } else if (params_base.n_predict >= 0) {
             n_predict = params_base.n_predict;
         } else {
-            return paged_blocks_per_seq;
+            // n_predict is unknown (-1): reserve prompt blocks plus a lookahead
+            // buffer instead of the full context window. This matches vLLM's
+            // num_lookahead_slots approach: allocate what is needed now and let
+            // the preemption loop handle pressure if the request grows larger.
+            const int32_t lookahead = std::max(0, params_base.paged_lookahead_tokens);
+            const int32_t n_tokens_est = std::max<int32_t>(1,
+                std::min<int32_t>(n_ctx_slot, task.n_tokens() + lookahead));
+            return (n_tokens_est + bs - 1) / bs;
         }
     }
 
