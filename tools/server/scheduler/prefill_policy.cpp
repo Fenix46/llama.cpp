@@ -26,14 +26,4 @@ PrefillBudgetDecision compute_prefill_budget(int32_t n_batch, int32_t n_ubatch, 
     return out;
 }
 
-void apply_round_robin(std::vector<size_t> & candidates, size_t & rr_cursor) {
-    if (candidates.empty()) {
-        return;
-    }
-
-    const size_t rr_start = rr_cursor % candidates.size();
-    std::rotate(candidates.begin(), candidates.begin() + rr_start, candidates.end());
-    rr_cursor = rr_start + 1;
-}
-
 } // namespace server_scheduler

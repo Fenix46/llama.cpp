@@ -1,7 +1,7 @@
 #include "batch_planner.h"
 
-#include "prefill_policy.h"
 #include <algorithm>
+#include <climits>
 
 namespace server_scheduler {
 
@@ -35,16 +35,33 @@ std::vector<size_t> BatchPlanner::collect_prefill_candidates(
         if (active_seq_ids && active_seq_ids->count(req.seq_id) == 0) {
             continue;
         }
-        if (req.phase != PAGED_REQUEST_STARTED && req.phase != PAGED_REQUEST_PREFILLING) {
+        if (req.phase == PAGED_REQUEST_WAIT_PARENT) {
             continue;
         }
-        if (req.phase == PAGED_REQUEST_WAIT_PARENT) {
+        if (req.phase != PAGED_REQUEST_STARTED && req.phase != PAGED_REQUEST_PREFILLING) {
             continue;
         }
         out.push_back(i);
     }
 
-    apply_round_robin(out, rr_cursor);
+    // Sort by FCFS using task->id (assigned sequentially by server_queue,
+    // so lower id = earlier arrival). Breaks ties by seq_id for determinism.
+    // Replaces the manual round-robin cursor which could skip or starve
+    // requests when the candidate set changes between ticks.
+    std::stable_sort(out.begin(), out.end(), [&reqs](size_t a, size_t b) {
+        const auto & ra = reqs[a];
+        const auto & rb = reqs[b];
+        const int ta = ra.task ? ra.task->id : INT_MAX;
+        const int tb = rb.task ? rb.task->id : INT_MAX;
+        if (ta != tb) {
+            return ta < tb;
+        }
+        return ra.seq_id < rb.seq_id;
+    });
+
+    // Keep rr_cursor parameter to avoid breaking the API signature, but it
+    // is no longer used for ordering — FCFS provides starvation-free fairness.
+    (void) rr_cursor;
     return out;
 }
 
