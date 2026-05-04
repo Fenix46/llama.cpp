@@ -460,8 +460,29 @@ void llama_kv_cache::clear(bool data) {
 // None of these functions affect runtime decode output.
 // =============================================================================
 
+void llama_kv_cache::mark_block_table_dirty_all() const {
+    block_table_dirty_all = true;
+    if (block_table_dirty_seq.size() != n_seq_max) {
+        block_table_dirty_seq.assign(n_seq_max, 1);
+    } else {
+        std::fill(block_table_dirty_seq.begin(), block_table_dirty_seq.end(), 1);
+    }
+}
+
+void llama_kv_cache::mark_block_table_dirty_seq(llama_seq_id seq_id) const {
+    if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max) {
+        mark_block_table_dirty_all();
+        return;
+    }
+    if (block_table_dirty_seq.size() != n_seq_max) {
+        block_table_dirty_seq.assign(n_seq_max, 0);
+    }
+    block_table_dirty_seq[(uint32_t) seq_id] = 1;
+}
+
 void llama_kv_cache::paged_clear() {
     block_table.clear();
+    mark_block_table_dirty_all();
 
     for (auto & alloc : v_block_alloc) {
         alloc.reset();
@@ -476,6 +497,7 @@ void llama_kv_cache::paged_seq_rm(llama_seq_id seq_id) {
     if (seq_id < 0) {
         // seq_id == -1 means "remove all" — clear every seq's pages
         block_table.clear();
+        mark_block_table_dirty_all();
         for (auto & alloc : v_block_alloc) {
             alloc.reset();
         }
@@ -509,6 +531,7 @@ void llama_kv_cache::paged_seq_rm(llama_seq_id seq_id) {
     }
 
     block_table.erase_seq(seq_id);
+    mark_block_table_dirty_seq(seq_id);
 
     if (debug > 1) {
         LLAMA_LOG_DEBUG("%s: [paged] seq %d removed from block table\n", __func__, seq_id);
@@ -548,6 +571,7 @@ void llama_kv_cache::paged_seq_cp(llama_seq_id src, llama_seq_id dst, llama_pos 
                 alloc.free(blk_id);
                 block_table.erase_page(dst, page);
             }
+            mark_block_table_dirty_seq(dst);
         }
     }
 
@@ -570,6 +594,7 @@ void llama_kv_cache::paged_seq_cp(llama_seq_id src, llama_seq_id dst, llama_pos 
                     block_table.insert(dst, page, blk_id);
                 }
             });
+            mark_block_table_dirty_seq(dst);
         }
     }
 
@@ -625,6 +650,7 @@ void llama_kv_cache::paged_record_cell(uint32_t strm, uint32_t cell_idx,
     alloc.acquire_specific(blk_id);
 
     block_table.insert(seq_id, page, blk_id);
+    mark_block_table_dirty_seq(seq_id);
 
     if (debug > 1) {
         LLAMA_LOG_DEBUG("%s: [paged] seq %d pos %d → page %u → block %u (cell %u)\n",
@@ -735,6 +761,7 @@ bool llama_kv_cache::paged_cow_block(uint32_t strm, llama_seq_id seq_id, uint32_
     }
 
     block_table.insert(seq_id, page, new_blk_id);
+    mark_block_table_dirty_seq(seq_id);
     alloc.free(old_blk_id);
 
     if (debug > 1) {
@@ -1814,6 +1841,10 @@ const llama_kv_cache::paged_cow_stats & llama_kv_cache::get_paged_cow_stats() co
     return cow_stats;
 }
 
+uint32_t llama_kv_cache::get_block_table_max_mapped_page_plus1() const {
+    return std::max<uint32_t>(1u, block_table.max_mapped_page_plus1());
+}
+
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     uint32_t result = 0;
 
@@ -2031,17 +2062,52 @@ void llama_kv_cache::set_input_block_table(ggml_tensor * dst) const {
     const uint32_t n_seqs    = (uint32_t) dst->ne[1];
 
     int32_t * data = (int32_t *) dst->data;
+    const bool full_refresh =
+        block_table_dirty_all ||
+        block_table_last_dst != dst ||
+        block_table_last_max_pages != max_pages ||
+        block_table_last_n_seqs != n_seqs ||
+        block_table_dirty_seq.size() != n_seq_max;
 
-    // Initialize all entries to -1 (no block mapped).
-    std::fill(data, data + max_pages * n_seqs, -1);
+    if (full_refresh) {
+        // Initialize all entries to -1 (no block mapped).
+        std::fill(data, data + max_pages * n_seqs, -1);
 
-    // Fill in mapped (seq_id, page) → block_id entries.
-    block_table.for_each_entry([&](llama_seq_id seq_id, uint32_t page, uint32_t blk_id) {
-        if ((uint32_t) seq_id >= n_seqs || page >= max_pages) {
-            return;
+        // Fill in mapped (seq_id, page) → block_id entries.
+        block_table.for_each_entry([&](llama_seq_id seq_id, uint32_t page, uint32_t blk_id) {
+            if ((uint32_t) seq_id >= n_seqs || page >= max_pages) {
+                return;
+            }
+            data[(uint32_t) seq_id * max_pages + page] = (int32_t) blk_id;
+        });
+    } else {
+        // Incremental path: refresh only rows whose mappings changed.
+        for (uint32_t seq_id = 0; seq_id < std::min<uint32_t>(n_seq_max, n_seqs); ++seq_id) {
+            if (block_table_dirty_seq[seq_id] == 0) {
+                continue;
+            }
+
+            int32_t * row = data + (size_t) seq_id * max_pages;
+            std::fill(row, row + max_pages, -1);
+
+            block_table.for_each_seq_page((llama_seq_id) seq_id, [&](uint32_t page, uint32_t blk_id) {
+                if (page >= max_pages) {
+                    return;
+                }
+                row[page] = (int32_t) blk_id;
+            });
         }
-        data[(uint32_t) seq_id * max_pages + page] = (int32_t) blk_id;
-    });
+    }
+
+    block_table_last_dst = dst;
+    block_table_last_max_pages = max_pages;
+    block_table_last_n_seqs = n_seqs;
+    block_table_dirty_all = false;
+    if (block_table_dirty_seq.size() != n_seq_max) {
+        block_table_dirty_seq.assign(n_seq_max, 0);
+    } else {
+        std::fill(block_table_dirty_seq.begin(), block_table_dirty_seq.end(), 0);
+    }
 }
 
 ggml_tensor * llama_kv_cache::build_input_seq_ids_q(ggml_context * ctx, const llama_ubatch & ubatch) const {
@@ -3386,6 +3452,10 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
 
 uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
+}
+
+uint32_t llama_kv_cache_context::get_block_table_max_mapped_page_plus1() const {
+    return kv->get_block_table_max_mapped_page_plus1();
 }
 
 ggml_type llama_kv_cache_context::type_k() const {

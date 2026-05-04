@@ -185,6 +185,7 @@ public:
     const llama_kv_block_allocator & get_block_alloc(uint32_t strm = 0) const;
     const llama_kv_block_table     & get_block_table() const;
     const paged_cow_stats          & get_paged_cow_stats() const;
+    uint32_t get_block_table_max_mapped_page_plus1() const;
 
     //
     // graph_build API
@@ -335,6 +336,11 @@ private:
     std::vector<llama_kv_block_allocator> v_block_alloc; // [n_stream]
     llama_kv_block_table                  block_table;    // (seq_id, page) → block_id
     paged_cow_stats                       cow_stats;
+    mutable std::vector<uint8_t>          block_table_dirty_seq;
+    mutable bool                          block_table_dirty_all = true;
+    mutable ggml_tensor *                 block_table_last_dst = nullptr;
+    mutable uint32_t                      block_table_last_max_pages = 0;
+    mutable uint32_t                      block_table_last_n_seqs = 0;
 
     // Sync helpers — keep block_table consistent with cell mutations.
     // Called only from seq_rm / seq_cp / seq_keep / apply_ubatch / clear.
@@ -347,6 +353,8 @@ private:
                            llama_seq_id seq_id, llama_pos pos);
     bool paged_cow_block(uint32_t strm, llama_seq_id seq_id, uint32_t page, uint32_t old_blk_id, uint32_t new_blk_id, bool copy_data);
     void paged_copy_block_data(uint32_t strm, uint32_t old_blk_id, uint32_t new_blk_id);
+    void mark_block_table_dirty_all() const;
+    void mark_block_table_dirty_seq(llama_seq_id seq_id) const;
 
     std::vector<kv_layer> layers;
 
@@ -429,6 +437,7 @@ public:
     //
 
     uint32_t get_n_kv() const;
+    uint32_t get_block_table_max_mapped_page_plus1() const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;

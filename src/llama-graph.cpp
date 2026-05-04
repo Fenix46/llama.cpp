@@ -484,6 +484,7 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
     res &= !self_seq_ids_q     || self_seq_ids_q->ne[0]     == params.ubatch.n_tokens;
     res &= !self_page_limits_q || self_page_limits_q->ne[1] == params.ubatch.n_tokens;
+    res &= !self_block_table   || self_block_table->ne[0]   >= mctx->get_block_table_max_mapped_page_plus1();
 
     return res;
 }
@@ -576,6 +577,8 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
     res &= !self_page_limits_q     || self_page_limits_q->ne[1]     == params.ubatch.n_tokens;
     res &= !self_seq_ids_q_swa     || self_seq_ids_q_swa->ne[0]     == params.ubatch.n_tokens;
     res &= !self_page_limits_q_swa || self_page_limits_q_swa->ne[1] == params.ubatch.n_tokens;
+    res &= !self_block_table       || self_block_table->ne[0]       >= mctx->get_base()->get_block_table_max_mapped_page_plus1();
+    res &= !self_block_table_swa   || self_block_table_swa->ne[0]   >= mctx->get_swa()->get_block_table_max_mapped_page_plus1();
 
     return res;
 }
@@ -661,6 +664,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
     res &= !inp_attn->self_seq_ids_q     || inp_attn->self_seq_ids_q->ne[0]     == params.ubatch.n_tokens;
     res &= !inp_attn->self_page_limits_q || inp_attn->self_page_limits_q->ne[1] == params.ubatch.n_tokens;
+    res &= !inp_attn->self_block_table   || inp_attn->self_block_table->ne[0]   >= mctx->get_attn()->get_block_table_max_mapped_page_plus1();
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -802,6 +806,7 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 
         res &= !inp_attn->self_seq_ids_q     || inp_attn->self_seq_ids_q->ne[0]     == params.ubatch.n_tokens;
         res &= !inp_attn->self_page_limits_q || inp_attn->self_page_limits_q->ne[1] == params.ubatch.n_tokens;
+        res &= !inp_attn->self_block_table   || inp_attn->self_block_table->ne[0]   >= attn_ctx->get_base()->get_block_table_max_mapped_page_plus1();
     }
 
     // swa tensors may not be allocated if there are no SWA attention layers
@@ -813,6 +818,7 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 
         res &= !inp_attn->self_seq_ids_q_swa     || inp_attn->self_seq_ids_q_swa->ne[0]     == params.ubatch.n_tokens;
         res &= !inp_attn->self_page_limits_q_swa || inp_attn->self_page_limits_q_swa->ne[1] == params.ubatch.n_tokens;
+        res &= !inp_attn->self_block_table_swa   || inp_attn->self_block_table_swa->ne[0]   >= attn_ctx->get_swa()->get_block_table_max_mapped_page_plus1();
     }
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
