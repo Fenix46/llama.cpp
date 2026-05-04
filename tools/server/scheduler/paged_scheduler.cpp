@@ -3,6 +3,7 @@
 #include "block_manager.h"
 #include "common.h"
 #include "request_lifecycle.h"
+#include "speculative_executor.h"
 
 namespace server_scheduler {
 
@@ -443,6 +444,116 @@ PrefillRequestResult PagedScheduler::process_prefill_request(
     }
 
     out.batch_full = batch.n_tokens >= params.n_batch;
+    return out;
+}
+
+PrefillPassResult PagedScheduler::process_prefill_candidates(
+        std::vector<RequestState> & reqs,
+        const std::vector<size_t> & prefill_candidates,
+        llama_batch & batch,
+        PrefillWorkCursor & cursor,
+        const PrefillRequestParams & params,
+        const PrefillPassCallbacks & cbs) {
+    PrefillPassResult out;
+
+    for (size_t idx : prefill_candidates) {
+        auto & req = reqs[idx];
+        if (!cursor.can_schedule_request()) {
+            continue;
+        }
+
+        if (cbs.on_request_begin) {
+            cbs.on_request_begin(req);
+        }
+
+        const auto prefill_res = process_prefill_request(
+            req,
+            batch,
+            cursor,
+            params,
+            cbs.request_callbacks);
+
+        if (prefill_res.released || !req.is_processing()) {
+            continue;
+        }
+
+        if (prefill_res.prompt_done) {
+            if (cbs.on_request_prompt_done) {
+                cbs.on_request_prompt_done(req);
+            }
+        } else if (cbs.on_request_progress) {
+            cbs.on_request_progress(req);
+        }
+
+        if (out.first_prefill_request_index < 0) {
+            out.first_prefill_request_index = (int32_t) idx;
+        }
+
+        if (prefill_res.batch_full) {
+            out.batch_full = true;
+            break;
+        }
+    }
+
+    return out;
+}
+
+DecodePassResult PagedScheduler::process_decode_pass(
+        llama_context * ctx,
+        llama_batch & batch,
+        int32_t n_batch,
+        bool paged_scheduler,
+        const DecodePassCallbacks & cbs) {
+    DecodePassResult out;
+    int32_t i_next = 0;
+    int32_t cur_n_batch = n_batch;
+
+    for (int32_t i = 0; i < batch.n_tokens; i = i_next) {
+        const auto seg = StepExecutor::select_decode_segment(batch, i, cur_n_batch, paged_scheduler);
+        const int32_t n_tokens = seg.n_tokens;
+
+        const llama_batch batch_view = StepExecutor::make_batch_view(batch, i, n_tokens);
+        const int ret = StepExecutor::decode_segment(ctx, batch, i, n_tokens);
+        if (cbs.on_segment_decoded) {
+            cbs.on_segment_decoded();
+        }
+
+        const auto ret_decision = StepExecutor::classify_decode_ret(ret, cur_n_batch);
+        if (!ret_decision.ok) {
+            if (ret_decision.fatal) {
+                out.fatal = true;
+                if (cbs.on_fatal_error) {
+                    cbs.on_fatal_error(ret_decision.error);
+                }
+                break;
+            }
+
+            const bool retry = cbs.on_retry_kv_full ? cbs.on_retry_kv_full(ret_decision.next_batch) : false;
+            if (!retry) {
+                out.fatal = true;
+                break;
+            }
+            out.retried = true;
+            cur_n_batch = ret_decision.next_batch;
+            continue;
+        }
+
+        i_next = i + n_tokens;
+        cur_n_batch = n_batch;
+
+        if (cbs.on_segment_sample) {
+            cbs.on_segment_sample(i, n_tokens, batch_view);
+        }
+        if (cbs.reqs != nullptr && cbs.on_speculative_token && cbs.on_speculative_finish) {
+            SpeculativeExecutor::run_accept_loop(
+                *cbs.reqs,
+                cbs.allow_special,
+                cbs.on_speculative_token,
+                cbs.on_speculative_finish);
+            out.speculative_accept_loops++;
+        }
+    }
+
     return out;
 }
 

@@ -1746,8 +1746,8 @@ private:
         // Rebuild first: if stale block-table metadata remains, this normalizes it.
         server_scheduler::BlockManager::rebuild_block_table(ctx, req.seq_id);
 
-        const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), req.seq_id);
-        const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx), req.seq_id);
+        const auto pos_min = server_scheduler::BlockManager::seq_pos_min(ctx, req.seq_id);
+        const auto pos_max = server_scheduler::BlockManager::seq_pos_max(ctx, req.seq_id);
         GGML_ASSERT(pos_min == -1 && pos_max == -1 && "paged seq clear invariant violated");
     }
 
@@ -1791,8 +1791,8 @@ private:
                 prefix_cache_invalidate(seq_id);
                 (void) server_scheduler::BlockManager::clear_sequence(ctx, seq_id);
                 server_scheduler::BlockManager::rebuild_block_table(ctx, seq_id);
-                GGML_ASSERT(llama_memory_seq_pos_min(llama_get_memory(ctx), seq_id) == -1);
-                GGML_ASSERT(llama_memory_seq_pos_max(llama_get_memory(ctx), seq_id) == -1);
+                GGML_ASSERT(server_scheduler::BlockManager::seq_pos_min(ctx, seq_id) == -1);
+                GGML_ASSERT(server_scheduler::BlockManager::seq_pos_max(ctx, seq_id) == -1);
             }
             paged_seq_leases.release_uncached(seq_id);
             if (req != nullptr) {
@@ -3422,20 +3422,15 @@ private:
                 /*n_prefill_candidates=*/(int32_t) paged_requests.size(),
                 /*can_admit=*/[this](const server_scheduler::RequestState & req) {
                     if (!req.task) {
-                        return server_scheduler::SchedulerCore::AdmissionEval{ false, "no-task" };
+                        return server_scheduler::SchedulerCore::AdmissionEval{
+                            false,
+                            server_scheduler::SchedulerCore::normalize_reason("no-task"),
+                        };
                     }
                     const auto admission = paged_admission_decision(*req.task);
-                    std::string reason = admission.reason;
-                    if (!admission.accepted) {
-                        if (reason == "block-cap") {
-                            reason = "kv-pressure";
-                        } else if (reason != "request-cap" && reason != "kv-pressure") {
-                            reason = "policy-deferral";
-                        }
-                    }
                     return server_scheduler::SchedulerCore::AdmissionEval{
                         admission.accepted,
-                        reason,
+                        server_scheduler::SchedulerCore::normalize_reason(admission.reason),
                     };
                 },
             });
@@ -3443,6 +3438,11 @@ private:
             if (schedule_decision.deferred > 0) {
                 for (const auto & it : schedule_decision.deferred_reasons) {
                     SRV_DBG("[paged-scheduler] deferred=%d reason=%s\n", it.second, it.first.c_str());
+                }
+            }
+            if (schedule_decision.preempted > 0) {
+                for (const auto & it : schedule_decision.preempted_reasons) {
+                    SRV_DBG("[paged-scheduler] preempted=%d reason=%s\n", it.second, it.first.c_str());
                 }
             }
 
@@ -3488,27 +3488,34 @@ private:
             prefill_budget = budget.prefill_total_budget;
             auto prefill_cursor = paged_sched.make_prefill_cursor(budget);
 
-            for (size_t idx : prefill_candidates) {
-                auto & req = paged_requests[idx];
-                if (!prefill_cursor.can_schedule_request()) {
-                    continue;
-                }
-                PGD_INF(req, "new prompt, n_ctx=%d, n_keep=%d, task.n_tokens=%d\n",
-                        req.n_ctx, req.task->params.n_keep, req.task->n_tokens());
-                const auto prefill_res = server_scheduler::PagedScheduler::process_prefill_request(
-                    req,
-                    batch,
-                    prefill_cursor,
-                    server_scheduler::PrefillRequestParams{
-                        /*ctx=*/ctx,
-                        /*mctx=*/mctx,
-                        /*n_batch=*/n_batch,
-                        /*n_ubatch=*/n_ubatch,
-                        /*n_swa=*/n_swa,
-                        /*checkpoint_every_nt=*/params_base.checkpoint_every_nt,
-                        /*checkpoints_enabled=*/false,
+            const auto prefill_pass = server_scheduler::PagedScheduler::process_prefill_candidates(
+                paged_requests,
+                prefill_candidates,
+                batch,
+                prefill_cursor,
+                server_scheduler::PrefillRequestParams{
+                    /*ctx=*/ctx,
+                    /*mctx=*/mctx,
+                    /*n_batch=*/n_batch,
+                    /*n_ubatch=*/n_ubatch,
+                    /*n_swa=*/n_swa,
+                    /*checkpoint_every_nt=*/params_base.checkpoint_every_nt,
+                    /*checkpoints_enabled=*/false,
+                },
+                server_scheduler::PrefillPassCallbacks{
+                    /*on_request_begin=*/[](paged_request_state & r) {
+                        PGD_INF(r, "new prompt, n_ctx=%d, n_keep=%d, task.n_tokens=%d\n",
+                                r.n_ctx, r.task->params.n_keep, r.task->n_tokens());
                     },
-                    server_scheduler::PrefillRequestCallbacks{
+                    /*on_request_prompt_done=*/[this](paged_request_state & r) {
+                        PGD_INF(r, "prompt done, n_tokens=%d, batch.n_tokens=%d\n",
+                                r.prompt.n_tokens(), this->batch.n_tokens);
+                    },
+                    /*on_request_progress=*/[](paged_request_state & r) {
+                        PGD_INF(r, "prefill progress, n_tokens=%d/%d\n",
+                                r.prompt.n_tokens(), r.task->n_tokens());
+                    },
+                    /*request_callbacks=*/server_scheduler::PrefillRequestCallbacks{
                         /*on_release_final=*/[this](paged_request_state & r) {
                             PGD_WRN(r, "%s", "empty prompt - releasing");
                             r.print_timings();
@@ -3528,27 +3535,11 @@ private:
                         /*on_partial_progress=*/[this](paged_request_state & r) {
                             send_partial_response(r, {}, true);
                         },
-                    });
+                    },
+                });
 
-                if (prefill_res.released || !req.is_processing()) {
-                    continue;
-                }
-
-                if (prefill_res.prompt_done) {
-                    PGD_INF(req, "prompt done, n_tokens=%d, batch.n_tokens=%d\n",
-                            req.prompt.n_tokens(), batch.n_tokens);
-                } else {
-                    PGD_INF(req, "prefill progress, n_tokens=%d/%d\n",
-                            req.prompt.n_tokens(), req.task->n_tokens());
-                }
-
-                if (!req_batched) {
-                    req_batched = &req;
-                }
-
-                if (prefill_res.batch_full) {
-                    break;
-                }
+            if (!req_batched && prefill_pass.first_prefill_request_index >= 0) {
+                req_batched = &paged_requests[(size_t) prefill_pass.first_prefill_request_index];
             }
 
             SRV_DBG("[paged] decoding batch, n_tokens=%d\n", batch.n_tokens);
@@ -3568,131 +3559,120 @@ private:
                 n_empty_consecutive = 0;
             }
 
-            // 4. llama_decode loop
-            int32_t i_next = 0;
-            int32_t cur_n_batch = n_batch;
+            // 4. llama_decode loop (owned by paged scheduler with server-context callbacks)
+            (void) server_scheduler::PagedScheduler::process_decode_pass(
+                ctx,
+                batch,
+                n_batch,
+                params_base.scheduler == "paged",
+                server_scheduler::DecodePassCallbacks{
+                    /*on_segment_decoded=*/[this]() {
+                        metrics.on_decoded(paged_requests);
 
-            for (int32_t i = 0; i < batch.n_tokens; i = i_next) {
-                const auto seg = server_scheduler::StepExecutor::select_decode_segment(
-                    batch, i, cur_n_batch, params_base.scheduler == "paged");
-                const int32_t n_tokens = seg.n_tokens;
-
-                const llama_batch batch_view = server_scheduler::StepExecutor::make_batch_view(batch, i, n_tokens);
-                const int ret = server_scheduler::StepExecutor::decode_segment(ctx, batch, i, n_tokens);
-                metrics.on_decoded(paged_requests);
-
-                if (kv_sched) {
-                    int32_t n_active = 0;
-                    for (const auto & req : paged_requests) {
-                        if (req.is_processing()) { ++n_active; }
-                    }
-                    kv_sched->on_decoded(
-                        ctx,
-                        n_active,
-                        (int32_t) paged_requests.size(),
-                        count_paged_reserved_blocks(),
-                        metrics.n_prompt_tokens_processed,
-                        (double) metrics.t_prompt_processing,
-                        metrics.n_tokens_predicted,
-                        (double) metrics.t_tokens_generation);
-                }
-
-                const auto ret_decision = server_scheduler::StepExecutor::classify_decode_ret(ret, cur_n_batch);
-                if (!ret_decision.ok) {
-                    if (ret_decision.fatal) {
-                        SRV_ERR("[paged] %s i=%d, n_batch=%d, ret=%d\n", ret_decision.error, i, cur_n_batch, ret);
+                        if (kv_sched) {
+                            int32_t n_active = 0;
+                            for (const auto & req : paged_requests) {
+                                if (req.is_processing()) { ++n_active; }
+                            }
+                            kv_sched->on_decoded(
+                                ctx,
+                                n_active,
+                                (int32_t) paged_requests.size(),
+                                count_paged_reserved_blocks(),
+                                metrics.n_prompt_tokens_processed,
+                                (double) metrics.t_prompt_processing,
+                                metrics.n_tokens_predicted,
+                                (double) metrics.t_tokens_generation);
+                        }
+                    },
+                    /*on_fatal_error=*/[this](const char * error) {
+                        SRV_ERR("[paged] %s\n", error);
                         for (auto & req : paged_requests) {
                             if (req.is_processing()) {
-                                send_error(req, ret_decision.error);
+                                send_error(req, error);
                                 req.release();
                             }
                         }
-                        break;
-                    }
-
-                    if (!try_clear_idle_paged_requests()) {
-                        cur_n_batch = ret_decision.next_batch;
-                    }
-                    SRV_WRN("[paged] KV full, retrying batch size=%d\n", cur_n_batch);
-                    continue;
-                }
-
-                i_next = i + n_tokens;
-                cur_n_batch = n_batch;
-
-                // 4a. handle parent→child KV copy for n_cmpl > 1
-                server_scheduler::SamplingExecutor::propagate_parent_state(paged_requests);
-
-                // 4b. send prompt-progress updates and do sampling
-                for (auto & req : paged_requests) {
-                    if (req.phase == PAGED_REQUEST_PREFILLING ||
-                        req.phase == PAGED_REQUEST_DONE_PREFILL) {
-                        if (req.task->params.stream && req.task->params.return_progress) {
-                            send_partial_response(req, {}, true);
+                    },
+                    /*on_retry_kv_full=*/[this](int32_t next_batch) {
+                        int32_t local_batch = next_batch;
+                        if (try_clear_idle_paged_requests()) {
+                            SRV_WRN("%s", "[paged] KV full, retrying after idle clear\n");
+                            return true;
                         }
-                    }
+                        SRV_WRN("[paged] KV full, retrying batch size=%d\n", local_batch);
+                        return local_batch > 0;
+                    },
+                    /*on_segment_sample=*/[this, &accept_special_token_paged](int32_t i, int32_t n_tokens, const llama_batch & batch_view) {
+                        server_scheduler::SamplingExecutor::propagate_parent_state(paged_requests);
 
-                    if (!server_scheduler::SamplingExecutor::can_sample_in_segment(req, i, n_tokens)) {
-                        continue;
-                    }
+                        for (auto & req : paged_requests) {
+                            if (req.phase == PAGED_REQUEST_PREFILLING ||
+                                req.phase == PAGED_REQUEST_DONE_PREFILL) {
+                                if (req.task->params.stream && req.task->params.return_progress) {
+                                    send_partial_response(req, {}, true);
+                                }
+                            }
 
-                    const auto prefill_action = server_scheduler::SamplingExecutor::prefill_action(req);
-                    if (prefill_action == server_scheduler::SamplingExecutor::PrefillAction::EmitEmbedding) {
-                        send_embedding(req, batch_view);
-                        req.release();
-                        req.i_batch = -1;
-                        continue;
-                    }
-                    if (prefill_action == server_scheduler::SamplingExecutor::PrefillAction::EmitRerank) {
-                        send_rerank(req, batch_view);
-                        req.release();
-                        req.i_batch = -1;
-                        continue;
-                    } else if (req.phase != PAGED_REQUEST_DECODING) {
-                        continue;
-                    }
+                            if (!server_scheduler::SamplingExecutor::can_sample_in_segment(req, i, n_tokens)) {
+                                continue;
+                            }
 
-                    const auto sample = server_scheduler::SamplingExecutor::sample_token(req, i);
-                    if (!sample.ok) {
-                        continue;
-                    }
-                    if (sample.first_token) {
-                        metrics.on_prompt_eval(req);
-                    }
+                            const auto prefill_action = server_scheduler::SamplingExecutor::prefill_action(req);
+                            if (prefill_action == server_scheduler::SamplingExecutor::PrefillAction::EmitEmbedding) {
+                                send_embedding(req, batch_view);
+                                req.release();
+                                req.i_batch = -1;
+                                continue;
+                            }
+                            if (prefill_action == server_scheduler::SamplingExecutor::PrefillAction::EmitRerank) {
+                                send_rerank(req, batch_view);
+                                req.release();
+                                req.i_batch = -1;
+                                continue;
+                            } else if (req.phase != PAGED_REQUEST_DECODING) {
+                                continue;
+                            }
 
-                    completion_token_output result;
-                    result.tok          = sample.token;
-                    result.text_to_send = common_token_to_piece(req.ctx, result.tok,
-                                             accept_special_token_paged(req, result.tok));
-                    result.prob         = 1.0f;
+                            const auto sample = server_scheduler::SamplingExecutor::sample_token(req, i);
+                            if (!sample.ok) {
+                                continue;
+                            }
+                            if (sample.first_token) {
+                                metrics.on_prompt_eval(req);
+                            }
 
-                    if (req.task->params.sampling.n_probs > 0) {
-                        populate_token_probs(req, result, req.task->params.post_sampling_probs,
-                                             params_base.special, sample.tok_idx);
-                    }
+                            completion_token_output result;
+                            result.tok          = sample.token;
+                            result.text_to_send = common_token_to_piece(req.ctx, result.tok,
+                                                     accept_special_token_paged(req, result.tok));
+                            result.prob         = 1.0f;
 
-                    if (!process_token(result, req)) {
-                        req.print_timings();
-                        send_final_response(req);
-                        metrics.on_prediction(req);
-                        req.release();
-                    }
-                }
+                            if (req.task->params.sampling.n_probs > 0) {
+                                populate_token_probs(req, result, req.task->params.post_sampling_probs,
+                                                     params_base.special, sample.tok_idx);
+                            }
 
-                // 4c. speculative decoding accept loop
-                server_scheduler::SpeculativeExecutor::run_accept_loop(
-                    paged_requests,
-                    params_base.special,
-                    [this](completion_token_output & result, paged_request_state & req) {
+                            if (!process_token(result, req)) {
+                                req.print_timings();
+                                send_final_response(req);
+                                metrics.on_prediction(req);
+                                req.release();
+                            }
+                        }
+                    },
+                    /*reqs=*/&paged_requests,
+                    /*allow_special=*/params_base.special,
+                    /*on_speculative_token=*/[this](completion_token_output & result, paged_request_state & req) {
                         return process_token(result, req);
                     },
-                    [this](paged_request_state & req) {
+                    /*on_speculative_finish=*/[this](paged_request_state & req) {
                         req.print_timings();
                         send_final_response(req);
                         metrics.on_prediction(req);
                         req.release();
-                    });
-            }
+                    },
+                });
 
             SRV_DBG("%s", "[paged] run completed\n");
             return; // <-- early return, skip slot-based path below

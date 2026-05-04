@@ -3,6 +3,7 @@
 #include "batch_planner.h"
 #include "prefill_policy.h"
 #include "scheduler_core.h"
+#include "step_executor.h"
 #include "llama.h"
 #include "mtmd.h"
 #include <functional>
@@ -104,6 +105,18 @@ struct PrefillRequestResult {
     bool checkpoint_created = false;
 };
 
+struct PrefillPassResult {
+    int32_t first_prefill_request_index = -1;
+    bool batch_full = false;
+};
+
+struct PrefillPassCallbacks {
+    std::function<void(RequestState &)> on_request_begin;
+    std::function<void(RequestState &)> on_request_prompt_done;
+    std::function<void(RequestState &)> on_request_progress;
+    PrefillRequestCallbacks request_callbacks;
+};
+
 struct PrefillInitDecision {
     bool ok = false;
     bool release_with_final = false;
@@ -119,6 +132,23 @@ struct PrefillCheckpointDecision {
     llama_pos pos_next = 0;
     bool forced_reset = false;
     bool restored = false;
+};
+
+struct DecodePassCallbacks {
+    std::function<void()> on_segment_decoded;
+    std::function<void(const char * error)> on_fatal_error;
+    std::function<bool(int32_t next_batch)> on_retry_kv_full;
+    std::function<void(int32_t i, int32_t n_tokens, const llama_batch & batch_view)> on_segment_sample;
+    std::vector<RequestState> * reqs = nullptr;
+    bool allow_special = false;
+    std::function<bool(completion_token_output &, RequestState &)> on_speculative_token;
+    std::function<void(RequestState &)> on_speculative_finish;
+};
+
+struct DecodePassResult {
+    bool fatal = false;
+    bool retried = false;
+    int32_t speculative_accept_loops = 0;
 };
 
 class PagedScheduler {
@@ -180,6 +210,19 @@ public:
             PrefillWorkCursor & cursor,
             const PrefillRequestParams & params,
             const PrefillRequestCallbacks & cbs);
+    static PrefillPassResult process_prefill_candidates(
+            std::vector<RequestState> & reqs,
+            const std::vector<size_t> & prefill_candidates,
+            llama_batch & batch,
+            PrefillWorkCursor & cursor,
+            const PrefillRequestParams & params,
+            const PrefillPassCallbacks & cbs);
+    static DecodePassResult process_decode_pass(
+            llama_context * ctx,
+            llama_batch & batch,
+            int32_t n_batch,
+            bool paged_scheduler,
+            const DecodePassCallbacks & cbs);
 
     TickOutcome tick(const PagedRuntime & runtime) const;
     PagedTickDecision tick(const PagedTickInput & in) const;
