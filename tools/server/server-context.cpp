@@ -3498,50 +3498,27 @@ private:
                     PGD_INF(req, "new prompt, n_ctx=%d, n_keep=%d, task.n_tokens=%d\n",
                             req.n_ctx, req.task->params.n_keep, req.task->n_tokens());
 
-                    int n_past = 0;
-
-                    if (input_tokens.empty()) {
+                    const auto init = server_scheduler::PagedScheduler::prepare_prefill_start(
+                        req, llama_get_memory(ctx) != nullptr);
+                    if (init.release_with_final) {
                         PGD_WRN(req, "%s", "empty prompt - releasing\n");
                         req.print_timings();
                         send_final_response(req);
                         req.release();
                         continue;
                     }
-
-                    if (req.task->need_logits() && !llama_get_memory(ctx)) {
-                        send_error(req, "no memory context for logits computation", ERROR_TYPE_SERVER);
+                    if (init.release_with_error) {
+                        send_error(req, init.error_message, init.error_kind);
                         req.release();
                         continue;
                     }
+                    GGML_ASSERT(init.ok);
+                    int n_past = init.n_past;
 
-                    if (req.task->n_tokens() >= req.n_ctx) {
-                        send_error(req,
-                                   string_format("request (%d tokens) exceeds context size (%d tokens)",
-                                                 req.task->n_tokens(), req.n_ctx),
-                                   ERROR_TYPE_EXCEED_CONTEXT_SIZE);
-                        req.release();
-                        continue;
-                    }
-
-                    if (req.task->params.cache_prompt) {
-                        n_past = req.prompt.tokens.get_common_prefix(input_tokens);
-
-                        if (req.alora_invocation_start > 0) {
-                            n_past = std::min(n_past, req.alora_invocation_start - 1);
-                        }
-
-                        // Early divergence tends to leave fragmented KV/cache metadata and can
-                        // poison subsequent generation. Prefer a hard reset in this case.
-                        if (req.prompt.n_tokens() > 0 &&
-                            n_past > 0 &&
-                            n_past < req.prompt.n_tokens() &&
-                            n_past < 64) {
-                            SRV_WRN("[paged] early divergence (n_past=%d < 64), forcing full reset for seq_id=%d\n",
-                                    n_past, req.seq_id);
-                            reset_paged_request_state(req, "early-divergence");
-                            n_past = 0;
-                        }
-                    } else {
+                    if (init.force_early_reset) {
+                        SRV_WRN("[paged] early divergence (n_past=%d < 64), forcing full reset for seq_id=%d\n",
+                                n_past, req.seq_id);
+                        reset_paged_request_state(req, "early-divergence");
                         n_past = 0;
                     }
 

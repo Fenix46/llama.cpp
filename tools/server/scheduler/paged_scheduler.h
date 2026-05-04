@@ -4,6 +4,7 @@
 #include "prefill_policy.h"
 #include "scheduler_core.h"
 #include "llama.h"
+#include <string>
 #include <unordered_set>
 
 namespace server_scheduler {
@@ -69,6 +70,16 @@ struct MtmdChunkApply {
     bool consumed = false;
 };
 
+struct PrefillInitDecision {
+    bool ok = false;
+    bool release_with_final = false;
+    bool release_with_error = false;
+    bool force_early_reset = false;
+    int32_t n_past = 0;
+    error_type error_kind = ERROR_TYPE_SERVER;
+    std::string error_message;
+};
+
 class PagedScheduler {
 public:
     static bool should_begin_prefill(const RequestState & req);
@@ -107,6 +118,7 @@ public:
             int32_t checkpoint_every_nt);
     static bool needs_mtmd_chunk(const RequestState & req);
     static MtmdChunkApply apply_mtmd_chunk(RequestState & req, size_t n_tokens_out);
+    static PrefillInitDecision prepare_prefill_start(const RequestState & req, bool has_memory_ctx);
 
     TickOutcome tick(const PagedRuntime & runtime) const;
     PagedTickDecision tick(const PagedTickInput & in) const;

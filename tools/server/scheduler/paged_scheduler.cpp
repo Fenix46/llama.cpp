@@ -185,6 +185,53 @@ MtmdChunkApply PagedScheduler::apply_mtmd_chunk(RequestState & req, size_t n_tok
     return out;
 }
 
+PrefillInitDecision PagedScheduler::prepare_prefill_start(const RequestState & req, bool has_memory_ctx) {
+    PrefillInitDecision out;
+    if (!req.task) {
+        out.release_with_error = true;
+        out.error_message = "missing task";
+        return out;
+    }
+
+    const auto & input_tokens = req.task->tokens;
+    if (input_tokens.empty()) {
+        out.release_with_final = true;
+        return out;
+    }
+
+    if (req.task->need_logits() && !has_memory_ctx) {
+        out.release_with_error = true;
+        out.error_message = "no memory context for logits computation";
+        return out;
+    }
+
+    if (req.task->n_tokens() >= req.n_ctx) {
+        out.release_with_error = true;
+        out.error_kind = ERROR_TYPE_EXCEED_CONTEXT_SIZE;
+        out.error_message = string_format(
+            "request (%d tokens) exceeds context size (%d tokens)",
+            req.task->n_tokens(), req.n_ctx);
+        return out;
+    }
+
+    if (req.task->params.cache_prompt) {
+        out.n_past = req.prompt.tokens.get_common_prefix(input_tokens);
+        if (req.alora_invocation_start > 0) {
+            out.n_past = std::min(out.n_past, req.alora_invocation_start - 1);
+        }
+        if (req.prompt.n_tokens() > 0 &&
+            out.n_past > 0 &&
+            out.n_past < req.prompt.n_tokens() &&
+            out.n_past < 64) {
+            out.force_early_reset = true;
+            out.n_past = 0;
+        }
+    }
+
+    out.ok = true;
+    return out;
+}
+
 bool PrefillWorkCursor::can_schedule_request() const {
     return prefill_added < prefill_total_budget;
 }
