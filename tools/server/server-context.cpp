@@ -3385,13 +3385,12 @@ private:
                     max_running = std::min(max_running, seq_max);
                 }
             }
-            const auto active_seq_vec = paged_core.schedule(
+            paged_core.schedule(
                 paged_requests,
                 std::max(1, max_running),
                 [this](const server_scheduler::RequestState & req) {
                     return req.task ? paged_admission_available(*req.task) : false;
                 });
-            (void) active_seq_vec;
             const auto active_seq_ids = paged_core.active_set();
 
             // 3. build batch
@@ -3413,7 +3412,6 @@ private:
                 /*active_seq_ids=*/&active_seq_ids,
                 /*n_batch=*/n_batch,
                 /*n_ubatch=*/n_ubatch,
-                /*decode_tokens_in_batch=*/0,
             });
             if (tick_decision.first_decode_request_index >= 0) {
                 req_batched = &paged_requests[(size_t) tick_decision.first_decode_request_index];

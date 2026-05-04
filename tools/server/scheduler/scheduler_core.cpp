@@ -43,7 +43,7 @@ const RequestState * SchedulerCore::find_request(const std::vector<RequestState>
     return nullptr;
 }
 
-std::vector<int32_t> SchedulerCore::schedule(
+void SchedulerCore::schedule(
         const std::vector<RequestState> & reqs,
         int32_t max_running,
         const std::function<bool(const RequestState &)> & can_admit) {
@@ -121,7 +121,7 @@ std::vector<int32_t> SchedulerCore::schedule(
         }
     }
 
-    return std::vector<int32_t>(running_.begin(), running_.end());
+    return;
 }
 
 bool SchedulerCore::is_active(int32_t seq_id) const {

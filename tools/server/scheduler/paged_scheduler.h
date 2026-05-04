@@ -21,7 +21,6 @@ struct PagedTickInput {
     const std::unordered_set<int32_t> * active_seq_ids = nullptr;
     int32_t n_batch = 0;
     int32_t n_ubatch = 0;
-    int32_t decode_tokens_in_batch = 0;
 };
 
 struct DecodeBatchResult {

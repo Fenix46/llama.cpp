@@ -16,7 +16,7 @@ public:
     void on_request_started(int32_t seq_id);
     void on_request_finished(int32_t seq_id);
 
-    std::vector<int32_t> schedule(
+    void schedule(
             const std::vector<RequestState> & reqs,
             int32_t max_running,
             const std::function<bool(const RequestState &)> & can_admit);
