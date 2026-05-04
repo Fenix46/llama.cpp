@@ -13,6 +13,7 @@
 #include "scheduler/paged_scheduler.h"
 #include "scheduler/reservation_model.h"
 #include "scheduler/sampling_executor.h"
+#include "scheduler/speculative_executor.h"
 #include "scheduler/step_executor.h"
 
 #include "build-info.h"
@@ -3891,77 +3892,26 @@ private:
 
                 // 4c. speculative decoding accept loop
                 for (auto & req : paged_requests) {
-                    if (req.phase != PAGED_REQUEST_DECODING ||
-                        !req.can_speculate() ||
-                        req.spec.spec_draft.empty()) {
+                    const auto spec = server_scheduler::SpeculativeExecutor::accept_draft(req);
+                    if (!spec.ready) {
                         continue;
                     }
 
-                    const size_t n_draft = req.spec.spec_draft.size();
-                    GGML_ASSERT(n_draft > 0);
-
-                    {
-                        // Paged scheduler: avoid CPU checkpoints/snapshots in speculative path.
-                        const bool use_ckpt = false;
-
-                        common_sampler_ptr smpl_save;
-                        if (use_ckpt) {
-                            smpl_save.reset(common_sampler_clone(req.smpl.get()));
-                        }
-
-                        GGML_ASSERT(req.spec.spec_i_batch.size() == n_draft + 1);
-                        auto accepted = common_sampler_sample_and_accept_n(
-                            req.smpl.get(), req.ctx, req.spec.spec_i_batch, req.spec.spec_draft);
-                        req.spec.spec_i_batch.clear();
-
-                        PGD_DBG(req, "spec: n_draft=%zu, accepted=%zu\n", req.spec.spec_draft.size(), accepted.size());
-                        GGML_ASSERT(accepted.size() >= 1);
-
-                        if (accepted.size() < req.spec.spec_draft.size() + 1) {
-                            if (use_ckpt) {
-                                req.spec.spec_draft = std::move(accepted);
-
-                                const auto & ckpt = req.spec.spec_ckpt;
-                                PGD_DBG(req, "restoring spec checkpoint (pos_min=%d, pos_max=%d, size=%zu)\n",
-                                        ckpt.pos_min, ckpt.pos_max, ckpt.size());
-
-                                const size_t n = llama_state_seq_set_data_ext(req.ctx, ckpt.data.data(),
-                                                                               ckpt.size(), req.seq_id,
-                                                                               LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                                if (n != ckpt.size()) {
-                                    GGML_ABORT("[paged] failed to restore spec checkpoint seq_id=%d", req.seq_id);
-                                }
-
-                                llama_kv_cache_rebuild_block_table(llama_get_memory(req.ctx), req.seq_id);
-                                llama_memory_seq_rm(llama_get_memory(req.ctx), req.seq_id, ckpt.pos_max + 1, -1);
-
-                                req.prompt.tokens.keep_first(ckpt.n_tokens);
-                                req.smpl = std::move(smpl_save);
-                                continue;
-                            }
-                            LOG_DBG("[paged] partial spec acceptance: %zu < %zu\n",
-                                    accepted.size(), req.spec.spec_draft.size());
-                        }
-
-                        common_speculative_accept(req.spec.spec.get(), accepted.size() - 1);
-                        req.spec.spec_draft = std::move(accepted);
-                    }
-
                     const int64_t t_current = ggml_time_us();
-                    const auto    ids       = std::move(req.spec.spec_draft);
+                    const auto &  ids       = spec.accepted_ids;
 
                     req.n_decoded += ids.size();
                     req.t_token_generation = std::max<int64_t>(1, t_current - req.t_start_generation) / 1e3;
 
                     req.spec.n_draft_accepted += ids.size() - 1;
-                    req.spec.n_draft_total    += n_draft;
+                    req.spec.n_draft_total    += spec.n_draft;
 
-                    req.prompt.tokens.keep_first(req.prompt.n_tokens() - n_draft);
+                    req.prompt.tokens.keep_first(req.prompt.n_tokens() - spec.n_draft);
                     req.prompt.tokens.insert({ids.begin(), ids.end() - 1});
 
                     req.sampled = ids.back();
                     PGD_DBG(req, "spec accepted: sampled=%d, ids.size=%zu, n_draft=%zu\n",
-                            req.sampled, ids.size(), n_draft);
+                            req.sampled, ids.size(), spec.n_draft);
 
                     llama_memory_seq_rm(llama_get_memory(req.ctx), req.seq_id,
                                         req.prompt.tokens.pos_next(), -1);
@@ -3983,7 +3933,7 @@ private:
                     }
 
                     PGD_DBG(req, "spec: accepted %d/%d, new n_tokens=%d\n",
-                            (int) ids.size() - 1, (int) n_draft, req.prompt.n_tokens());
+                            (int) ids.size() - 1, (int) spec.n_draft, req.prompt.n_tokens());
                 }
             }
 

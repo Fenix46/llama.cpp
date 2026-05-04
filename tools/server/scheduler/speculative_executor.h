@@ -1,10 +1,18 @@
 #pragma once
 
+#include "request_state.h"
+
 namespace server_scheduler {
+
+struct SpecAcceptResult {
+    bool ready = false;
+    size_t n_draft = 0;
+    std::vector<llama_token> accepted_ids;
+};
 
 class SpeculativeExecutor {
 public:
-    SpeculativeExecutor() = default;
+    static SpecAcceptResult accept_draft(RequestState & req);
 };
 
 } // namespace server_scheduler
