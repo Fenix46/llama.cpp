@@ -3416,6 +3416,24 @@ private:
             const auto blk_stats = server_scheduler::BlockManager::stats(paged_requests);
             const float kv_pressure_ratio = server_scheduler::BlockManager::pressure_ratio(blk_stats, paged_total_blocks_);
             const int32_t block_size_for_fit = paged_blocks_per_seq_ > 0 ? std::max(1, n_ctx_slot_ / paged_blocks_per_seq_) : 1;
+
+            // Count decode-phase requests to compute a decode-aware prefill cap.
+            // When decode requests are active, cap prefill chunks so they don't
+            // monopolize the GPU batch — matches vLLM long_prefill_token_threshold
+            // semantics. With N active decode sequences, each gets 1 token and
+            // the remaining budget is shared with prefill; cap prefill per-request
+            // to n_ubatch / (1 + n_decode_active) so decode latency stays bounded.
+            int32_t n_decode_active = 0;
+            for (const auto & req : paged_requests) {
+                if (req.phase == PAGED_REQUEST_DECODING) {
+                    n_decode_active++;
+                }
+            }
+            const int32_t eff_ubatch = n_ubatch > 0 ? n_ubatch : n_batch;
+            const int32_t prefill_threshold = n_decode_active > 0
+                ? std::max(64, eff_ubatch / (1 + n_decode_active))
+                : eff_ubatch;
+
             const auto schedule_decision = paged_core.schedule_tokens(server_scheduler::SchedulerCore::RuntimeSnapshot{
                 /*reqs=*/&paged_requests,
                 /*max_running=*/std::max(1, max_running),
@@ -3428,7 +3446,7 @@ private:
                 /*kv_active_requests=*/blk_stats.active_requests,
                 /*kv_pressure_ratio=*/kv_pressure_ratio,
                 /*max_num_scheduled_tokens=*/n_batch,
-                /*long_prefill_token_threshold=*/n_ubatch > 0 ? n_ubatch : n_batch,
+                /*long_prefill_token_threshold=*/prefill_threshold,
                 /*enable_chunked_prefill=*/true,
                 /*reserve_full_isl=*/params_base.paged_admission == "full-ctx",
                 /*can_admit=*/[this](const server_scheduler::RequestState & req) {
