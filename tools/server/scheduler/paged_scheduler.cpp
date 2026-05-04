@@ -260,12 +260,14 @@ PrefillInitDecision PagedScheduler::prepare_prefill_start(const RequestState & r
         if (req.alora_invocation_start > 0) {
             out.n_past = std::min(out.n_past, req.alora_invocation_start - 1);
         }
-        if (req.prompt.n_tokens() > 0 &&
-            out.n_past > 0 &&
-            out.n_past < req.prompt.n_tokens() &&
-            out.n_past < 64) {
+        // If n_past == 0 there is nothing cached to reuse; the KV sequence will
+        // be cleared naturally when prefill starts from position 0.  We do NOT
+        // apply any minimum-prefix threshold here: even a single cached token
+        // avoids one prefill step, and the cost of seq_rm (truncate tail) is
+        // negligible regardless of how short the common prefix is.  vLLM v1
+        // uses the same policy: any computed prefix length is kept as-is.
+        if (req.prompt.n_tokens() > 0 && out.n_past == 0) {
             out.force_early_reset = true;
-            out.n_past = 0;
         }
     }
 
