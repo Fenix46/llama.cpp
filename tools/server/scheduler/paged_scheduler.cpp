@@ -35,4 +35,22 @@ PagedTickDecision PagedScheduler::prepare_tick(
     return out;
 }
 
+DecodeBatchResult PagedScheduler::populate_decode_batch(
+        std::vector<RequestState> & reqs,
+        const std::vector<size_t> & decode_candidates,
+        llama_batch & batch) const {
+    DecodeBatchResult out;
+
+    for (const size_t idx : decode_candidates) {
+        auto & req = reqs[idx];
+        if (out.first_decode_request_index < 0) {
+            out.first_decode_request_index = (int32_t) idx;
+        }
+        req.update_batch(batch);
+    }
+
+    out.decode_tokens_in_batch = batch.n_tokens;
+    return out;
+}
+
 } // namespace server_scheduler

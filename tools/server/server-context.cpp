@@ -3392,17 +3392,13 @@ private:
                 /*decode_tokens_in_batch=*/0,
             });
             const auto & decode_candidates = decode_tick.decode_candidates;
-
-            // 3a. decode tokens from all actively-generating requests
-            for (const size_t idx : decode_candidates) {
-                auto & req = paged_requests[idx];
-                if (!req_batched) {
-                    req_batched = &req;
-                }
-                req.update_batch(batch);
+            const auto decode_batch = paged_sched.populate_decode_batch(
+                paged_requests, decode_candidates, batch);
+            if (decode_batch.first_decode_request_index >= 0) {
+                req_batched = &paged_requests[(size_t) decode_batch.first_decode_request_index];
             }
 
-            const int32_t decode_tokens_in_batch = batch.n_tokens;
+            const int32_t decode_tokens_in_batch = decode_batch.decode_tokens_in_batch;
             int32_t       prefill_budget         = std::max(0, n_batch - decode_tokens_in_batch);
             int32_t       prefill_added          = 0;
 

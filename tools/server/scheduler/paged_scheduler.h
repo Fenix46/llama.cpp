@@ -2,6 +2,7 @@
 
 #include "batch_planner.h"
 #include "prefill_policy.h"
+#include "llama.h"
 
 namespace server_scheduler {
 
@@ -19,6 +20,11 @@ struct PagedTickInput {
     int32_t decode_tokens_in_batch = 0;
 };
 
+struct DecodeBatchResult {
+    int32_t decode_tokens_in_batch = 0;
+    int32_t first_decode_request_index = -1;
+};
+
 class PagedScheduler {
 public:
     PagedTickDecision tick(const PagedTickInput & in) const;
@@ -29,6 +35,11 @@ public:
             int32_t n_batch,
             int32_t n_ubatch,
             int32_t decode_tokens_in_batch) const;
+
+    DecodeBatchResult populate_decode_batch(
+            std::vector<RequestState> & reqs,
+            const std::vector<size_t> & decode_candidates,
+            llama_batch & batch) const;
 
 private:
     BatchPlanner planner_;
