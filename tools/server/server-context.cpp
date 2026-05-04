@@ -3390,7 +3390,8 @@ private:
                 [this](const server_scheduler::RequestState & req) {
                     return req.task ? paged_admission_available(*req.task) : false;
                 });
-            std::unordered_set<int32_t> active_seq_ids(active_seq_vec.begin(), active_seq_vec.end());
+            (void) active_seq_vec;
+            const auto active_seq_ids = paged_core.active_set();
 
             // 3. build batch
             common_batch_clear(batch);

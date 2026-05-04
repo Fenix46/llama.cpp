@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -19,6 +20,7 @@ public:
             const std::vector<RequestState> & reqs,
             int32_t max_running,
             const std::function<bool(const RequestState &)> & can_admit);
+    std::unordered_set<int32_t> active_set() const;
 
     bool is_active(int32_t seq_id) const;
 
@@ -29,6 +31,7 @@ private:
     std::unordered_set<int32_t> running_set_;
 
     static bool contains_processing(const std::vector<RequestState> & reqs, int32_t seq_id);
+    static const RequestState * find_request(const std::vector<RequestState> & reqs, int32_t seq_id);
 };
 
 } // namespace server_scheduler

@@ -34,6 +34,15 @@ bool SchedulerCore::contains_processing(const std::vector<RequestState> & reqs, 
     return false;
 }
 
+const RequestState * SchedulerCore::find_request(const std::vector<RequestState> & reqs, int32_t seq_id) {
+    for (const auto & req : reqs) {
+        if (req.seq_id == seq_id && req.is_processing()) {
+            return &req;
+        }
+    }
+    return nullptr;
+}
+
 std::vector<int32_t> SchedulerCore::schedule(
         const std::vector<RequestState> & reqs,
         int32_t max_running,
@@ -64,13 +73,7 @@ std::vector<int32_t> SchedulerCore::schedule(
         waiting_.pop_front();
         waiting_set_.erase(seq_id);
 
-        const RequestState * req_match = nullptr;
-        for (const auto & req : reqs) {
-            if (req.seq_id == seq_id && req.is_processing()) {
-                req_match = &req;
-                break;
-            }
-        }
+        const RequestState * req_match = find_request(reqs, seq_id);
 
         if (req_match == nullptr) {
             continue;
@@ -89,8 +92,16 @@ std::vector<int32_t> SchedulerCore::schedule(
     // Minimal preemption policy: if waiting is non-empty and running is at
     // cap, rotate one running request back to waiting to avoid starvation.
     if (!waiting_.empty() && (int32_t) running_.size() >= max_running && !running_.empty()) {
-        const int32_t preempted = running_.front();
-        running_.pop_front();
+        auto preempt_it = running_.begin();
+        for (auto it = running_.begin(); it != running_.end(); ++it) {
+            const RequestState * req = find_request(reqs, *it);
+            if (req && req->phase != PAGED_REQUEST_DECODING) {
+                preempt_it = it;
+                break;
+            }
+        }
+        const int32_t preempted = *preempt_it;
+        running_.erase(preempt_it);
         running_set_.erase(preempted);
         waiting_.push_back(preempted);
         waiting_set_.insert(preempted);
@@ -99,13 +110,7 @@ std::vector<int32_t> SchedulerCore::schedule(
         waiting_.pop_front();
         waiting_set_.erase(candidate);
 
-        const RequestState * req_match = nullptr;
-        for (const auto & req : reqs) {
-            if (req.seq_id == candidate && req.is_processing()) {
-                req_match = &req;
-                break;
-            }
-        }
+        const RequestState * req_match = find_request(reqs, candidate);
 
         if (req_match && can_admit(*req_match)) {
             running_.push_back(candidate);
@@ -121,6 +126,10 @@ std::vector<int32_t> SchedulerCore::schedule(
 
 bool SchedulerCore::is_active(int32_t seq_id) const {
     return running_set_.count(seq_id) > 0;
+}
+
+std::unordered_set<int32_t> SchedulerCore::active_set() const {
+    return running_set_;
 }
 
 } // namespace server_scheduler
