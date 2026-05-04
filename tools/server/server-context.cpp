@@ -31,10 +31,13 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <memory>
 #include <filesystem>
 #include <utility>
+#include <strings.h>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -720,6 +723,7 @@ private:
     std::unique_ptr<kv_block_scheduler> kv_sched;
     server_scheduler::SchedulerCore paged_core;
     server_scheduler::PagedScheduler paged_sched;
+    bool paged_orchestrator_v2_ = true;
 
     // Experimental cross-slot KV prefix cache (--kv-prefix-cache).
     // Null when flag is off. Registered on slot release, invalidated on eviction.
@@ -735,6 +739,14 @@ private:
     std::set<std::string> model_tags;    // informational tags
 
     bool sleeping = false;
+
+    static bool env_enabled_default_true(const char * name) {
+        const char * v = std::getenv(name);
+        if (!v) {
+            return true;
+        }
+        return !(strcmp(v, "0") == 0 || strcasecmp(v, "false") == 0 || strcasecmp(v, "off") == 0);
+    }
 
     static double bytes_to_mib(size_t bytes) {
         return (double) bytes / 1024.0 / 1024.0;
@@ -924,6 +936,7 @@ private:
         SRV_INF("loading model '%s'\n", params.model.path.c_str());
 
         params_base = params;
+        paged_orchestrator_v2_ = env_enabled_default_true("LLAMA_SERVER_PAGED_ORCHESTRATOR_V2");
 
         llama_init = common_init_from_params(params_base);
 
@@ -3418,6 +3431,11 @@ private:
                 },
             });
             const auto & active_seq_ids = schedule_decision.active_seq_ids;
+            if (schedule_decision.deferred > 0) {
+                for (const auto & it : schedule_decision.deferred_reasons) {
+                    SRV_DBG("[paged-scheduler] deferred=%d reason=%s\n", it.second, it.first.c_str());
+                }
+            }
 
             paged_request_state * req_batched = nullptr;
             auto accept_special_token_paged = [&](const paged_request_state & req, llama_token token) {
@@ -3425,15 +3443,28 @@ private:
                     req.task->params.sampling.preserved_tokens.find(token) != req.task->params.sampling.preserved_tokens.end();
             };
 
-            const auto tick_outcome = paged_sched.tick(server_scheduler::PagedRuntime{
-                /*reqs=*/&paged_requests,
-                /*prefill_rr_cursor=*/&paged_prefill_rr_cursor,
-                /*batch=*/&batch,
-                /*active_seq_ids=*/&active_seq_ids,
-                /*n_batch=*/n_batch,
-                /*n_ubatch=*/n_ubatch,
-                /*schedule_decision=*/schedule_decision,
-            });
+            server_scheduler::TickOutcome tick_outcome;
+            if (paged_orchestrator_v2_) {
+                tick_outcome = paged_sched.tick(server_scheduler::PagedRuntime{
+                    /*reqs=*/&paged_requests,
+                    /*prefill_rr_cursor=*/&paged_prefill_rr_cursor,
+                    /*batch=*/&batch,
+                    /*active_seq_ids=*/&active_seq_ids,
+                    /*n_batch=*/n_batch,
+                    /*n_ubatch=*/n_ubatch,
+                    /*schedule_decision=*/schedule_decision,
+                });
+            } else {
+                tick_outcome.decision = paged_sched.tick(server_scheduler::PagedTickInput{
+                    /*reqs=*/&paged_requests,
+                    /*prefill_rr_cursor=*/&paged_prefill_rr_cursor,
+                    /*batch=*/&batch,
+                    /*active_seq_ids=*/&active_seq_ids,
+                    /*n_batch=*/n_batch,
+                    /*n_ubatch=*/n_ubatch,
+                });
+                tick_outcome.prefill_rows = tick_outcome.decision.prefill_candidates;
+            }
             const auto & tick_decision = tick_outcome.decision;
             if (tick_decision.first_decode_request_index >= 0) {
                 req_batched = &paged_requests[(size_t) tick_decision.first_decode_request_index];
