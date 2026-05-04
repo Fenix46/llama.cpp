@@ -325,6 +325,20 @@ PrefillCheckpointDecision PagedScheduler::restore_or_reset_checkpoint(
     return out;
 }
 
+int32_t PagedScheduler::adjust_n_past_for_prompt_logits(const RequestState & req, int32_t n_past) {
+    if (!req.task) {
+        return n_past;
+    }
+    if (n_past == req.task->n_tokens() && n_past > 0) {
+        return n_past - 1;
+    }
+    return n_past;
+}
+
+bool PagedScheduler::should_send_prefill_progress(const RequestState & req) {
+    return req.task && req.task->params.stream && req.task->params.return_progress;
+}
+
 bool PrefillWorkCursor::can_schedule_request() const {
     return prefill_added < prefill_total_budget;
 }

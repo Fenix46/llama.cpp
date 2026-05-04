@@ -3529,14 +3529,11 @@ private:
 
                     server_scheduler::PagedScheduler::prune_invalid_checkpoints(req, pos_next, checkpoints_enabled);
 
-                    // [TAG_PROMPT_LOGITS] need at least 1 token evaluated
-                    if (n_past == req.task->n_tokens() && n_past > 0) {
-                        n_past--;
-                    }
+                    n_past = server_scheduler::PagedScheduler::adjust_n_past_for_prompt_logits(req, n_past);
 
                     server_scheduler::PagedScheduler::begin_prefill(req, n_past, t_prefill_start);
 
-                    if (req.task->params.stream && req.task->params.return_progress) {
+                    if (server_scheduler::PagedScheduler::should_send_prefill_progress(req)) {
                         send_partial_response(req, {}, true);
                     }
                 }

@@ -135,6 +135,8 @@ public:
             bool checkpoints_enabled,
             int32_t n_swa,
             int32_t n_past);
+    static int32_t adjust_n_past_for_prompt_logits(const RequestState & req, int32_t n_past);
+    static bool should_send_prefill_progress(const RequestState & req);
 
     TickOutcome tick(const PagedRuntime & runtime) const;
     PagedTickDecision tick(const PagedTickInput & in) const;
