@@ -1,6 +1,7 @@
 #pragma once
 
 #include "request_state.h"
+#include <vector>
 
 namespace server_scheduler {
 
@@ -14,6 +15,10 @@ class SpeculativeExecutor {
 public:
     static SpecAcceptResult accept_draft(RequestState & req);
     static void apply_accepted_ids(RequestState & req, const SpecAcceptResult & spec, int64_t t_current_us);
+    static std::vector<completion_token_output> build_accepted_outputs(
+            const RequestState & req,
+            const SpecAcceptResult & spec,
+            bool allow_special);
 };
 
 } // namespace server_scheduler

@@ -52,4 +52,26 @@ void SpeculativeExecutor::apply_accepted_ids(RequestState & req, const SpecAccep
     llama_memory_seq_rm(llama_get_memory(req.ctx), req.seq_id, req.prompt.tokens.pos_next(), -1);
 }
 
+std::vector<completion_token_output> SpeculativeExecutor::build_accepted_outputs(
+        const RequestState & req,
+        const SpecAcceptResult & spec,
+        bool allow_special) {
+    std::vector<completion_token_output> out;
+    out.reserve(spec.accepted_ids.size());
+
+    const bool preserve_set = req.task && !req.task->params.sampling.preserved_tokens.empty();
+    for (const auto tok : spec.accepted_ids) {
+        const bool allow = allow_special ||
+            (preserve_set && req.task->params.sampling.preserved_tokens.find(tok) != req.task->params.sampling.preserved_tokens.end());
+
+        completion_token_output result;
+        result.tok = tok;
+        result.text_to_send = common_token_to_piece(req.ctx, tok, allow);
+        result.prob = 1.0f;
+        out.push_back(std::move(result));
+    }
+
+    return out;
+}
+
 } // namespace server_scheduler

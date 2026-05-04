@@ -3858,13 +3858,9 @@ private:
                     PGD_DBG(req, "spec accepted: sampled=%d, ids.size=%zu, n_draft=%zu\n",
                             req.sampled, ids.size(), spec.n_draft);
 
-                    for (size_t si = 0; si < ids.size(); ++si) {
-                        completion_token_output result;
-                        result.tok          = ids[si];
-                        result.text_to_send = common_token_to_piece(req.ctx, result.tok,
-                                                 accept_special_token_paged(req, result.tok));
-                        result.prob         = 1.0f;
-
+                    auto accepted_outputs = server_scheduler::SpeculativeExecutor::build_accepted_outputs(
+                        req, spec, params_base.special);
+                    for (auto & result : accepted_outputs) {
                         if (!process_token(result, req)) {
                             req.print_timings();
                             send_final_response(req);
