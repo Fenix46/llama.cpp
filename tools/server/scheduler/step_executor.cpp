@@ -59,4 +59,24 @@ DecodeRetDecision StepExecutor::classify_decode_ret(int32_t ret, int32_t cur_n_b
     return out;
 }
 
+int32_t StepExecutor::decode_segment(
+        llama_context * ctx,
+        const llama_batch & batch,
+        int32_t i,
+        int32_t n_tokens) {
+    return llama_decode(ctx, make_batch_view(batch, i, n_tokens));
+}
+
+llama_batch StepExecutor::make_batch_view(const llama_batch & batch, int32_t i, int32_t n_tokens) {
+    return llama_batch{
+        n_tokens,
+        batch.token    + i,
+        nullptr,
+        batch.pos      + i,
+        batch.n_seq_id + i,
+        batch.seq_id   + i,
+        batch.logits   + i,
+    };
+}
+
 } // namespace server_scheduler

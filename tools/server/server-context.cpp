@@ -3740,17 +3740,8 @@ private:
                     batch, i, cur_n_batch, params_base.scheduler == "paged");
                 const int32_t n_tokens = seg.n_tokens;
 
-                llama_batch batch_view = {
-                    n_tokens,
-                    batch.token    + i,
-                    nullptr,
-                    batch.pos      + i,
-                    batch.n_seq_id + i,
-                    batch.seq_id   + i,
-                    batch.logits   + i,
-                };
-
-                const int ret = llama_decode(ctx, batch_view);
+                const llama_batch batch_view = server_scheduler::StepExecutor::make_batch_view(batch, i, n_tokens);
+                const int ret = server_scheduler::StepExecutor::decode_segment(ctx, batch, i, n_tokens);
                 metrics.on_decoded(paged_requests);
 
                 if (kv_sched) {
