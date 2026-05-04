@@ -4,6 +4,7 @@
 #include "prefill_policy.h"
 #include "scheduler_core.h"
 #include "llama.h"
+#include <functional>
 #include <string>
 #include <unordered_set>
 
@@ -70,6 +71,11 @@ struct MtmdChunkApply {
     bool consumed = false;
 };
 
+struct MtmdAdvanceResult {
+    bool ok = true;
+    bool consumed_any = false;
+};
+
 struct PrefillInitDecision {
     bool ok = false;
     bool release_with_final = false;
@@ -125,6 +131,9 @@ public:
             int32_t checkpoint_every_nt);
     static bool needs_mtmd_chunk(const RequestState & req);
     static MtmdChunkApply apply_mtmd_chunk(RequestState & req, size_t n_tokens_out);
+    static MtmdAdvanceResult advance_mtmd_chunks(
+            RequestState & req,
+            const std::function<int32_t(size_t, llama_pos, size_t &)> & process_chunk);
     static PrefillInitDecision prepare_prefill_start(const RequestState & req, bool has_memory_ctx);
     static void prune_invalid_checkpoints(RequestState & req, llama_pos pos_next, bool checkpoints_enabled);
     static bool should_enable_checkpoints(const RequestState & req, int32_t n_swa, bool checkpoints_enabled);

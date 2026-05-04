@@ -182,6 +182,23 @@ MtmdChunkApply PagedScheduler::apply_mtmd_chunk(RequestState & req, size_t n_tok
     return out;
 }
 
+MtmdAdvanceResult PagedScheduler::advance_mtmd_chunks(
+        RequestState & req,
+        const std::function<int32_t(size_t, llama_pos, size_t &)> & process_chunk) {
+    MtmdAdvanceResult out;
+    while (needs_mtmd_chunk(req)) {
+        size_t n_tokens_out = 0;
+        const int32_t res = process_chunk(req.prompt.n_tokens(), req.prompt.tokens.pos_next(), n_tokens_out);
+        if (res != 0) {
+            out.ok = false;
+            return out;
+        }
+        auto applied = apply_mtmd_chunk(req, n_tokens_out);
+        out.consumed_any = out.consumed_any || applied.consumed;
+    }
+    return out;
+}
+
 PrefillInitDecision PagedScheduler::prepare_prefill_start(const RequestState & req, bool has_memory_ctx) {
     PrefillInitDecision out;
     if (!req.task) {

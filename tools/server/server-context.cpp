@@ -3564,18 +3564,20 @@ private:
                        prefill_cursor.can_append_token(batch.n_tokens, n_batch, req_prefill_added)) {
 
                     // handle multimodal chunks
-                    while (server_scheduler::PagedScheduler::needs_mtmd_chunk(req)) {
-                        size_t n_tokens_out = 0;
-                        int32_t res = input_tokens.process_chunk(ctx, mctx, req.prompt.n_tokens(),
-                                                                 req.prompt.tokens.pos_next(), req.seq_id, n_tokens_out);
-                        if (res != 0) {
-                            PGD_ERR(req, "failed to process image chunk, res=%d\n", res);
-                            send_error(req, "failed to process image", ERROR_TYPE_SERVER);
-                            req.release();
-                            request_released = true;
-                            break;
-                        }
-                        (void) server_scheduler::PagedScheduler::apply_mtmd_chunk(req, n_tokens_out);
+                    const auto mtmd = server_scheduler::PagedScheduler::advance_mtmd_chunks(
+                        req,
+                        [&](size_t prompt_n_tokens, llama_pos pos_next, size_t & n_tokens_out) {
+                            return input_tokens.process_chunk(
+                                ctx, mctx, prompt_n_tokens, pos_next, req.seq_id, n_tokens_out);
+                        });
+                    if (!mtmd.ok) {
+                        PGD_ERR(req, "%s", "failed to process image chunk");
+                        send_error(req, "failed to process image", ERROR_TYPE_SERVER);
+                        req.release();
+                        request_released = true;
+                        break;
+                    }
+                    if (mtmd.consumed_any) {
                         has_mtmd = true;
                     }
                     if (request_released) {
