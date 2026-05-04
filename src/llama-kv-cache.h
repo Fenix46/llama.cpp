@@ -341,6 +341,10 @@ private:
     mutable ggml_tensor *                 block_table_last_dst = nullptr;
     mutable uint32_t                      block_table_last_max_pages = 0;
     mutable uint32_t                      block_table_last_n_seqs = 0;
+    mutable std::vector<int32_t>          block_table_active_seq_ids;
+    mutable std::vector<int32_t>          block_table_last_active_seq_ids;
+    mutable std::vector<int32_t>          block_table_seq_to_compact;
+    mutable bool                          block_table_compact_ready = false;
 
     // Sync helpers — keep block_table consistent with cell mutations.
     // Called only from seq_rm / seq_cp / seq_keep / apply_ubatch / clear.
