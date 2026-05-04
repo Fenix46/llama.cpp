@@ -13,7 +13,12 @@ TickOutcome PagedScheduler::tick(const PagedRuntime & runtime) const {
     GGML_ASSERT(runtime.batch != nullptr);
 
     TickOutcome out;
-    out.decode_rows = planner_.collect_decode_candidates(*runtime.reqs, runtime.active_seq_ids);
+    if (!runtime.schedule_decision.request_plans.empty()) {
+        const auto plan = planner_.build_from_request_plans(*runtime.reqs, runtime.schedule_decision, *runtime.batch);
+        out.decode_rows = plan.decode_request_indices;
+    } else {
+        out.decode_rows = planner_.collect_decode_candidates(*runtime.reqs, runtime.active_seq_ids);
+    }
     const auto dec = populate_decode_batch(*runtime.reqs, out.decode_rows, *runtime.batch);
     out.decision = prepare_tick(
         *runtime.reqs,

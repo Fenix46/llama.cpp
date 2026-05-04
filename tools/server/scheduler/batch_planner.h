@@ -2,6 +2,8 @@
 
 #include "batch_plan.h"
 #include "request_state.h"
+#include "scheduler_core.h"
+#include "llama.h"
 
 #include <cstddef>
 #include <unordered_set>
@@ -18,6 +20,10 @@ public:
             const std::vector<RequestState> & reqs,
             size_t & rr_cursor,
             const std::unordered_set<int32_t> * active_seq_ids = nullptr) const;
+    BatchPlan build_from_request_plans(
+            const std::vector<RequestState> & reqs,
+            const SchedulerCore::ScheduleDecision & decision,
+            llama_batch & batch) const;
 };
 
 } // namespace server_scheduler
