@@ -259,6 +259,12 @@ SchedulerCore::ScheduleDecision SchedulerCore::schedule_tokens(const RuntimeSnap
         plan.scheduled_decode_tokens = req->phase == PAGED_REQUEST_DECODING || req->phase == PAGED_REQUEST_DONE_PREFILL ? std::min(1, scheduled) : 0;
         plan.scheduled_prefill_tokens = scheduled - plan.scheduled_decode_tokens;
         plan.lookahead_tokens = req->can_speculate() ? std::max(0, scheduled - plan.scheduled_decode_tokens) : 0;
+        if (plan.lookahead_tokens > 0 && !req->spec.spec_draft.empty()) {
+            const int32_t n = std::min<int32_t>(plan.lookahead_tokens, (int32_t) req->spec.spec_draft.size());
+            out.scheduled_spec_decode_tokens[seq_id] = std::vector<llama_token>(
+                req->spec.spec_draft.begin(),
+                req->spec.spec_draft.begin() + n);
+        }
         out.request_plans.push_back(plan);
         out.total_scheduled_tokens += scheduled;
         budget -= scheduled;

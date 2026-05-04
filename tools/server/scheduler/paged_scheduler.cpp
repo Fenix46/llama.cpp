@@ -550,12 +550,31 @@ DecodePassResult PagedScheduler::process_decode_pass(
             cbs.on_segment_sample(i, n_tokens, batch_view);
         }
         if (cbs.reqs != nullptr && cbs.on_speculative_token && cbs.on_speculative_finish) {
+            int32_t accepted_before = 0;
+            int32_t rejected_before = 0;
+            if (cbs.planned_spec_decode_tokens != nullptr) {
+                for (const auto & req : *cbs.reqs) {
+                    auto pit = cbs.planned_spec_decode_tokens->find(req.seq_id);
+                    if (pit != cbs.planned_spec_decode_tokens->end()) {
+                        accepted_before += (int32_t) pit->second.size();
+                    }
+                    rejected_before += (int32_t) req.spec.spec_draft.size();
+                }
+            }
             SpeculativeExecutor::run_accept_loop(
                 *cbs.reqs,
                 cbs.allow_special,
                 cbs.on_speculative_token,
                 cbs.on_speculative_finish);
             out.speculative_accept_loops++;
+            if (cbs.planned_spec_decode_tokens != nullptr) {
+                int32_t rejected_after = 0;
+                for (const auto & req : *cbs.reqs) {
+                    rejected_after += (int32_t) req.spec.spec_draft.size();
+                }
+                out.speculative_accepted_tokens += accepted_before;
+                out.speculative_rejected_tokens += std::max(0, rejected_before - rejected_after);
+            }
         }
     }
 

@@ -8,6 +8,7 @@
 #include "mtmd.h"
 #include <functional>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace server_scheduler {
@@ -143,12 +144,15 @@ struct DecodePassCallbacks {
     bool allow_special = false;
     std::function<bool(completion_token_output &, RequestState &)> on_speculative_token;
     std::function<void(RequestState &)> on_speculative_finish;
+    const std::unordered_map<int32_t, std::vector<llama_token>> * planned_spec_decode_tokens = nullptr;
 };
 
 struct DecodePassResult {
     bool fatal = false;
     bool retried = false;
     int32_t speculative_accept_loops = 0;
+    int32_t speculative_accepted_tokens = 0;
+    int32_t speculative_rejected_tokens = 0;
 };
 
 class PagedScheduler {

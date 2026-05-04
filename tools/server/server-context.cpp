@@ -3690,9 +3690,13 @@ private:
                         metrics.on_prediction(req);
                         req.release();
                     },
+                    /*planned_spec_decode_tokens=*/&schedule_decision.scheduled_spec_decode_tokens,
                 });
             if (decode_outcome.speculative_accept_loops > 0) {
                 SRV_DBG("[paged-stage] speculative_loops=%d\n", decode_outcome.speculative_accept_loops);
+                SRV_DBG("[paged-stage] speculative_accepted=%d speculative_rejected=%d\n",
+                        decode_outcome.speculative_accepted_tokens,
+                        decode_outcome.speculative_rejected_tokens);
             }
             if (decode_outcome.fatal) {
                 SRV_DBG("%s", "[paged-stage] decode fatal outcome reported by scheduler");
