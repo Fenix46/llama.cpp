@@ -66,6 +66,10 @@ public:
         bool reserve_full_isl = false;
         std::function<AdmissionEval(const RequestState &)> can_admit;
         std::function<bool(const RequestState &, int32_t)> can_fit_tokens;
+        // Called when the scheduler preempts a running request due to KV pressure.
+        // The callee must free KV blocks for seq_id so subsequent can_fit_tokens
+        // calls reflect the freed capacity. Optional: if null, no KV preemption.
+        std::function<void(int32_t /* seq_id */)> on_preempt_kv;
     };
 
     void on_request_started(int32_t seq_id);

@@ -3444,7 +3444,10 @@ private:
                         server_scheduler::SchedulerCore::normalize_reason(admission.reason),
                     };
                 },
-                /*can_fit_tokens=*/[this, blk_stats, block_size_for_fit](const server_scheduler::RequestState & req, int32_t delta_tokens) {
+                /*can_fit_tokens=*/[this, block_size_for_fit](const server_scheduler::RequestState & req, int32_t delta_tokens) {
+                    // Re-compute reserved_blocks live so preemption within the same
+                    // scheduling tick is reflected in subsequent fit checks.
+                    const auto live_stats = server_scheduler::BlockManager::stats(this->paged_requests);
                     const auto fit = server_scheduler::BlockManager::can_fit_tokens_delta(
                         req,
                         delta_tokens,
@@ -3452,9 +3455,20 @@ private:
                             /*max_model_len=*/n_ctx_slot_,
                             /*block_size=*/block_size_for_fit,
                             /*total_blocks=*/paged_total_blocks_,
-                            /*reserved_blocks=*/blk_stats.reserved_blocks,
+                            /*reserved_blocks=*/live_stats.reserved_blocks,
                         });
                     return fit.can_fit;
+                },
+                /*on_preempt_kv=*/[this](int32_t preempted_seq_id) {
+                    // Free KV blocks for the preempted sequence and reset its prompt
+                    // state so it will restart prefill from scratch (recompute strategy,
+                    // matching vLLM default preemption mode).
+                    paged_request_state * victim = get_paged_request_by_seq_id(preempted_seq_id);
+                    if (victim) {
+                        reset_paged_request_state(*victim, "kv-preemption");
+                        server_scheduler::BlockManager::release_blocks(*victim);
+                        PGD_WRN(*victim, "preempted by scheduler due to KV pressure, seq_id=%d\n", preempted_seq_id);
+                    }
                 },
             });
             const auto & active_seq_ids = schedule_decision.active_seq_ids;

@@ -248,9 +248,45 @@ SchedulerCore::ScheduleDecision SchedulerCore::schedule_tokens(const RuntimeSnap
         }
         int32_t scheduled = std::min(desired, budget);
         if (snapshot.can_fit_tokens && !snapshot.can_fit_tokens(*req, scheduled)) {
-            out.deferred++;
-            out.deferred_reasons["kv-pressure"]++;
-            continue;
+            // KV pressure: attempt to free space by preempting a lower-priority
+            // running request, then retry fit. This mirrors vLLM's preemption loop
+            // inside allocate_slots(): preempt victim → retry → admit or defer.
+            bool fit_after_preempt = false;
+            if (snapshot.on_preempt_kv) {
+                // Find lowest-priority victim among currently running requests.
+                // Prefer prefilling requests over decoding ones; never preempt self.
+                int32_t victim_seq_id = -1;
+                int victim_priority = 999;
+                for (const int32_t candidate : running_) {
+                    if (candidate == seq_id) {
+                        continue;
+                    }
+                    const RequestState * vreq = find_request(*snapshot.reqs, candidate);
+                    const int vp = phase_priority(vreq);
+                    if (vp < victim_priority) {
+                        victim_priority = vp;
+                        victim_seq_id = candidate;
+                    }
+                }
+                if (victim_seq_id >= 0) {
+                    // Evict victim from running to waiting and free its KV blocks.
+                    running_.erase(std::remove(running_.begin(), running_.end(), victim_seq_id), running_.end());
+                    running_set_.erase(victim_seq_id);
+                    waiting_.push_front(victim_seq_id);
+                    waiting_set_.insert(victim_seq_id);
+                    snapshot.on_preempt_kv(victim_seq_id);
+                    out.preempted++;
+                    out.preempted_seq_ids.push_back(victim_seq_id);
+                    out.preempted_reasons["kv-pressure"]++;
+                    // Retry fit after freeing victim's KV.
+                    fit_after_preempt = snapshot.can_fit_tokens(*req, scheduled);
+                }
+            }
+            if (!fit_after_preempt) {
+                out.deferred++;
+                out.deferred_reasons["kv-pressure"]++;
+                continue;
+            }
         }
 
         RequestTokenPlan plan;
