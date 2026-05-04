@@ -2861,7 +2861,8 @@ private:
     }
 
     server_scheduler::AdmissionDecision paged_admission_decision(const server_task & task) const {
-        const int32_t running = count_paged_active_requests();
+        const auto blk_stats = server_scheduler::BlockManager::stats(paged_requests);
+        const int32_t running = blk_stats.active_requests;
         auto decision = server_scheduler::paged_admission_available(
             task,
             params_base,
@@ -3424,9 +3425,17 @@ private:
                         return server_scheduler::SchedulerCore::AdmissionEval{ false, "no-task" };
                     }
                     const auto admission = paged_admission_decision(*req.task);
+                    std::string reason = admission.reason;
+                    if (!admission.accepted) {
+                        if (reason == "block-cap") {
+                            reason = "kv-pressure";
+                        } else if (reason != "request-cap" && reason != "kv-pressure") {
+                            reason = "policy-deferral";
+                        }
+                    }
                     return server_scheduler::SchedulerCore::AdmissionEval{
                         admission.accepted,
-                        admission.reason,
+                        reason,
                     };
                 },
             });
