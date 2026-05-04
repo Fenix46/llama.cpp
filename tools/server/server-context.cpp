@@ -3377,21 +3377,14 @@ private:
             const int32_t n_ubatch = llama_n_ubatch(ctx);
 
             paged_request_state * req_batched = nullptr;
+            server_scheduler::PagedScheduler paged_sched;
 
             auto accept_special_token_paged = [&](const paged_request_state & req, llama_token token) {
                 return params_base.special ||
                     req.task->params.sampling.preserved_tokens.find(token) != req.task->params.sampling.preserved_tokens.end();
             };
 
-            server_scheduler::PagedScheduler paged_sched;
-            const auto decode_tick = paged_sched.tick(server_scheduler::PagedTickInput{
-                /*reqs=*/&paged_requests,
-                /*prefill_rr_cursor=*/&paged_prefill_rr_cursor,
-                /*n_batch=*/n_batch,
-                /*n_ubatch=*/n_ubatch,
-                /*decode_tokens_in_batch=*/0,
-            });
-            const auto & decode_candidates = decode_tick.decode_candidates;
+            const auto decode_candidates = paged_sched.collect_decode_candidates(paged_requests);
             const auto decode_batch = paged_sched.populate_decode_batch(
                 paged_requests, decode_candidates, batch);
             if (decode_batch.first_decode_request_index >= 0) {

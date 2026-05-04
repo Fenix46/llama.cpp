@@ -4,6 +4,10 @@
 
 namespace server_scheduler {
 
+std::vector<size_t> PagedScheduler::collect_decode_candidates(const std::vector<RequestState> & reqs) const {
+    return planner_.collect_decode_candidates(reqs);
+}
+
 PagedTickDecision PagedScheduler::tick(const PagedTickInput & in) const {
     GGML_ASSERT(in.reqs != nullptr);
     GGML_ASSERT(in.prefill_rr_cursor != nullptr);
@@ -24,7 +28,6 @@ PagedTickDecision PagedScheduler::prepare_tick(
         int32_t decode_tokens_in_batch) const {
     PagedTickDecision out;
 
-    out.decode_candidates = planner_.collect_decode_candidates(reqs);
     out.prefill_candidates = planner_.collect_prefill_candidates(reqs, prefill_rr_cursor);
     out.budget = compute_prefill_budget(
         n_batch,

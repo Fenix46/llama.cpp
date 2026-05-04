@@ -7,7 +7,6 @@
 namespace server_scheduler {
 
 struct PagedTickDecision {
-    std::vector<size_t> decode_candidates;
     std::vector<size_t> prefill_candidates;
     PrefillBudgetDecision budget;
 };
@@ -27,6 +26,7 @@ struct DecodeBatchResult {
 
 class PagedScheduler {
 public:
+    std::vector<size_t> collect_decode_candidates(const std::vector<RequestState> & reqs) const;
     PagedTickDecision tick(const PagedTickInput & in) const;
 
     PagedTickDecision prepare_tick(
