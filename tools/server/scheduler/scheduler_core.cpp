@@ -68,6 +68,23 @@ static int phase_priority(const RequestState * req) {
     }
 }
 
+static int32_t request_desired_tokens(const RequestState & req) {
+    if (!req.task) {
+        return 0;
+    }
+    switch (req.phase) {
+        case PAGED_REQUEST_DECODING:
+            return 1;
+        case PAGED_REQUEST_STARTED:
+        case PAGED_REQUEST_PREFILLING:
+            return std::max(0, req.task->n_tokens() - req.prompt.n_tokens());
+        case PAGED_REQUEST_DONE_PREFILL:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
 SchedulerCore::ScheduleDecision SchedulerCore::schedule(
         const std::vector<RequestState> & reqs,
         int32_t max_running,
@@ -201,6 +218,52 @@ SchedulerCore::ScheduleDecision SchedulerCore::schedule(const RuntimeSnapshot & 
         snapshot.n_ubatch,
         snapshot.decode_tokens_in_batch,
         snapshot.n_prefill_candidates);
+    return out;
+}
+
+SchedulerCore::ScheduleDecision SchedulerCore::schedule_tokens(const RuntimeSnapshot & snapshot) {
+    auto out = schedule(snapshot);
+
+    int32_t budget = snapshot.max_num_scheduled_tokens > 0 ? snapshot.max_num_scheduled_tokens : snapshot.n_batch;
+    if (budget <= 0) {
+        budget = std::max(1, (int32_t) out.running_seq_ids.size());
+    }
+
+    for (const int32_t seq_id : out.running_seq_ids) {
+        if (budget <= 0) {
+            break;
+        }
+        const RequestState * req = find_request(*snapshot.reqs, seq_id);
+        if (!req) {
+            continue;
+        }
+        int32_t desired = request_desired_tokens(*req);
+        if (desired <= 0) {
+            continue;
+        }
+        if (snapshot.enable_chunked_prefill &&
+            (req->phase == PAGED_REQUEST_STARTED || req->phase == PAGED_REQUEST_PREFILLING) &&
+            snapshot.long_prefill_token_threshold > 0) {
+            desired = std::min(desired, snapshot.long_prefill_token_threshold);
+        }
+        int32_t scheduled = std::min(desired, budget);
+        if (snapshot.can_fit_tokens && !snapshot.can_fit_tokens(*req, scheduled)) {
+            out.deferred++;
+            out.deferred_reasons["kv-pressure"]++;
+            continue;
+        }
+
+        RequestTokenPlan plan;
+        plan.seq_id = seq_id;
+        plan.scheduled_tokens = scheduled;
+        plan.scheduled_decode_tokens = req->phase == PAGED_REQUEST_DECODING || req->phase == PAGED_REQUEST_DONE_PREFILL ? std::min(1, scheduled) : 0;
+        plan.scheduled_prefill_tokens = scheduled - plan.scheduled_decode_tokens;
+        plan.lookahead_tokens = req->can_speculate() ? std::max(0, scheduled - plan.scheduled_decode_tokens) : 0;
+        out.request_plans.push_back(plan);
+        out.total_scheduled_tokens += scheduled;
+        budget -= scheduled;
+    }
+    out.remaining_budget = budget;
     return out;
 }
 

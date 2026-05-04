@@ -3428,6 +3428,10 @@ private:
                 /*kv_reserved_blocks=*/blk_stats.reserved_blocks,
                 /*kv_active_requests=*/blk_stats.active_requests,
                 /*kv_pressure_ratio=*/kv_pressure_ratio,
+                /*max_num_scheduled_tokens=*/n_batch,
+                /*long_prefill_token_threshold=*/n_ubatch > 0 ? n_ubatch : n_batch,
+                /*enable_chunked_prefill=*/true,
+                /*reserve_full_isl=*/params_base.paged_admission == "full-ctx",
                 /*can_admit=*/[this](const server_scheduler::RequestState & req) {
                     if (!req.task) {
                         return server_scheduler::SchedulerCore::AdmissionEval{
@@ -3441,6 +3445,7 @@ private:
                         server_scheduler::SchedulerCore::normalize_reason(admission.reason),
                     };
                 },
+                /*can_fit_tokens=*/nullptr,
             });
             const auto & active_seq_ids = schedule_decision.active_seq_ids;
             if (schedule_decision.deferred > 0) {

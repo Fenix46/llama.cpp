@@ -2,6 +2,7 @@
 
 #include "prefill_policy.h"
 #include "request_state.h"
+#include "llama.h"
 
 #include <cstdint>
 #include <deque>
@@ -15,6 +16,16 @@ namespace server_scheduler {
 
 class SchedulerCore {
 public:
+    struct RequestTokenPlan {
+        int32_t seq_id = -1;
+        int32_t scheduled_tokens = 0;
+        int32_t scheduled_decode_tokens = 0;
+        int32_t scheduled_prefill_tokens = 0;
+        int32_t lookahead_tokens = 0;
+        bool is_newly_admitted = false;
+        bool is_resumed = false;
+    };
+
     struct AdmissionEval {
         bool accepted = false;
         std::string reason;
@@ -32,6 +43,10 @@ public:
         std::unordered_map<std::string, int32_t> preempted_reasons;
         int32_t decode_quota = 0;
         PrefillBudgetDecision budget;
+        std::vector<RequestTokenPlan> request_plans;
+        int32_t total_scheduled_tokens = 0;
+        int32_t remaining_budget = 0;
+        std::unordered_map<int32_t, std::vector<llama_token>> scheduled_spec_decode_tokens;
     };
 
     struct RuntimeSnapshot {
@@ -45,7 +60,12 @@ public:
         int32_t kv_reserved_blocks = 0;
         int32_t kv_active_requests = 0;
         float kv_pressure_ratio = 0.0f;
+        int32_t max_num_scheduled_tokens = 0;
+        int32_t long_prefill_token_threshold = 0;
+        bool enable_chunked_prefill = true;
+        bool reserve_full_isl = false;
         std::function<AdmissionEval(const RequestState &)> can_admit;
+        std::function<bool(const RequestState &, int32_t)> can_fit_tokens;
     };
 
     void on_request_started(int32_t seq_id);
@@ -56,6 +76,7 @@ public:
             int32_t max_running,
             const std::function<AdmissionEval(const RequestState &)> & can_admit);
     ScheduleDecision schedule(const RuntimeSnapshot & snapshot);
+    ScheduleDecision schedule_tokens(const RuntimeSnapshot & snapshot);
     std::unordered_set<int32_t> active_set() const;
     PrefillBudgetDecision compute_prefill_budget(
             int32_t n_batch,
