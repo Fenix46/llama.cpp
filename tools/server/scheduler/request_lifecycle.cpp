@@ -79,4 +79,36 @@ GroupPropagationResult propagate_parent_prefill(std::vector<RequestState> & reqs
     return out;
 }
 
+GroupState compute_group_state(const std::vector<RequestState> & reqs, int32_t parent_task_id) {
+    GroupState out;
+    out.parent_id = parent_task_id;
+
+    for (const auto & req : reqs) {
+        if (!req.task || req.task->id_parent != parent_task_id) {
+            continue;
+        }
+        out.expected_children++;
+        if (req.phase == PAGED_REQUEST_DONE_PREFILL || req.phase == PAGED_REQUEST_DECODING) {
+            out.activated_children++;
+        }
+        if (req.phase == PAGED_REQUEST_IDLE) {
+            out.finished_children++;
+        }
+    }
+
+    out.all_prefill_ready = out.expected_children > 0 && out.activated_children == out.expected_children;
+    out.all_finished = out.expected_children > 0 && out.finished_children == out.expected_children;
+    return out;
+}
+
+void on_child_finished(std::vector<RequestState> & reqs, int32_t child_task_id) {
+    for (auto & req : reqs) {
+        if (!req.task || req.task->id != child_task_id) {
+            continue;
+        }
+        (void) transition(req, RequestEvent::Release);
+        break;
+    }
+}
+
 } // namespace server_scheduler
