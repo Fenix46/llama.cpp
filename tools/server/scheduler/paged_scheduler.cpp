@@ -26,6 +26,31 @@ void PagedScheduler::mark_prompt_done(RequestState & req, llama_batch & batch) {
     req.init_sampler();
 }
 
+bool PagedScheduler::should_break_for_checkpoint(
+        const RequestState & req,
+        int32_t n_batch,
+        int32_t n_ubatch,
+        int32_t checkpoint_every_nt) {
+    int64_t last_checkpoint_nt = 0;
+    if (!req.prompt.checkpoints.empty()) {
+        last_checkpoint_nt = req.prompt.checkpoints.back().n_tokens;
+    }
+
+    const bool checkpoint_due = (req.prompt.n_tokens() - last_checkpoint_nt) >= checkpoint_every_nt;
+    if (!checkpoint_due || !req.task) {
+        return false;
+    }
+
+    const int checkpoint_offsets[] = {4 + n_ubatch, 4};
+    for (int offset : checkpoint_offsets) {
+        const int n_last = std::min(n_batch, offset);
+        if (req.task->n_tokens() == req.prompt.n_tokens() + n_last) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool PrefillWorkCursor::can_schedule_request() const {
     return prefill_added < prefill_total_budget;
 }

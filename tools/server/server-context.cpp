@@ -3645,28 +3645,9 @@ private:
                     req.n_prompt_tokens_processed++;
 
                     if (do_checkpoint) {
-                        int64_t last_checkpoint_nt = 0;
-                        if (!req.prompt.checkpoints.empty()) {
-                            last_checkpoint_nt = req.prompt.checkpoints.back().n_tokens;
-                        }
-
-                        const bool checkpoint_due =
-                                (req.prompt.n_tokens() - last_checkpoint_nt) >= params_base.checkpoint_every_nt;
-
-                        if (checkpoint_due) {
-                            const int checkpoint_offsets[] = {4 + n_ubatch, 4};
-
-                            bool should_break = false;
-                            for (int offset : checkpoint_offsets) {
-                                const int n_last = std::min(n_batch, offset);
-                                if (req.task->n_tokens() == req.prompt.n_tokens() + n_last) {
-                                    should_break = true;
-                                    break;
-                                }
-                            }
-                            if (should_break) {
-                                break;
-                            }
+                        if (server_scheduler::PagedScheduler::should_break_for_checkpoint(
+                                req, n_batch, n_ubatch, params_base.checkpoint_every_nt)) {
+                            break;
                         }
                     }
                 }

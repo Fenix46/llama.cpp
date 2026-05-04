@@ -44,6 +44,11 @@ public:
     static bool should_begin_prefill(const RequestState & req);
     static void begin_prefill(RequestState & req, int32_t n_past, int64_t t_start_process_prompt_us);
     static void mark_prompt_done(RequestState & req, llama_batch & batch);
+    static bool should_break_for_checkpoint(
+            const RequestState & req,
+            int32_t n_batch,
+            int32_t n_ubatch,
+            int32_t checkpoint_every_nt);
 
     PagedTickDecision tick(const PagedTickInput & in) const;
 
