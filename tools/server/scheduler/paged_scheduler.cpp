@@ -303,6 +303,13 @@ bool PagedScheduler::validate_prefill_truncate(llama_context * ctx, const Reques
         return false;
     }
     const llama_pos p0 = req.prompt.tokens.pos_next();
+    // If p0 == 0 the KV sequence is already empty; nothing to truncate.
+    // Calling seq_rm(seq_id, 0, -1) on an uninitialised or empty sequence
+    // can return false on hybrid (recurrent+attention) models even though
+    // there is nothing to remove — that would incorrectly trigger a hard reset.
+    if (p0 == 0) {
+        return true;
+    }
     return BlockManager::truncate_seq_tail(ctx, req.seq_id, p0);
 }
 
@@ -420,6 +427,13 @@ PrefillRequestResult PagedScheduler::process_prefill_request(
     }
 
     if (!validate_prefill_truncate(params.ctx, req)) {
+        // Truncation failure with p0 > 0: the KV cache backend does not support
+        // partial sequence removal (e.g. hybrid recurrent+attention models).
+        // A hard reset clears the cached prefix so prefill restarts from scratch.
+        // This is expected for recurrent/hybrid models; unexpected for pure attention.
+        const llama_pos p0_dbg = req.prompt.tokens.pos_next();
+        PGD_WRN(req, "truncate_seq_tail failed at pos %d, seq_rm_type=%d — forcing hard reset\n",
+                p0_dbg, (int) req.ctx_seq_rm_type);
         if (cbs.on_hard_reset) cbs.on_hard_reset(req, "truncate-failed");
     }
 
