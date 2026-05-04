@@ -86,6 +86,36 @@ std::vector<int32_t> SchedulerCore::schedule(
         running_set_.insert(seq_id);
     }
 
+    // Minimal preemption policy: if waiting is non-empty and running is at
+    // cap, rotate one running request back to waiting to avoid starvation.
+    if (!waiting_.empty() && (int32_t) running_.size() >= max_running && !running_.empty()) {
+        const int32_t preempted = running_.front();
+        running_.pop_front();
+        running_set_.erase(preempted);
+        waiting_.push_back(preempted);
+        waiting_set_.insert(preempted);
+
+        const int32_t candidate = waiting_.front();
+        waiting_.pop_front();
+        waiting_set_.erase(candidate);
+
+        const RequestState * req_match = nullptr;
+        for (const auto & req : reqs) {
+            if (req.seq_id == candidate && req.is_processing()) {
+                req_match = &req;
+                break;
+            }
+        }
+
+        if (req_match && can_admit(*req_match)) {
+            running_.push_back(candidate);
+            running_set_.insert(candidate);
+        } else {
+            waiting_.push_back(candidate);
+            waiting_set_.insert(candidate);
+        }
+    }
+
     return std::vector<int32_t>(running_.begin(), running_.end());
 }
 
