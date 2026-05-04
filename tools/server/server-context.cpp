@@ -3416,7 +3416,7 @@ private:
             const auto blk_stats = server_scheduler::BlockManager::stats(paged_requests);
             const float kv_pressure_ratio = server_scheduler::BlockManager::pressure_ratio(blk_stats, paged_total_blocks_);
             const int32_t block_size_for_fit = paged_blocks_per_seq_ > 0 ? std::max(1, n_ctx_slot_ / paged_blocks_per_seq_) : 1;
-            const auto schedule_decision = paged_core.schedule(server_scheduler::SchedulerCore::RuntimeSnapshot{
+            const auto schedule_decision = paged_core.schedule_tokens(server_scheduler::SchedulerCore::RuntimeSnapshot{
                 /*reqs=*/&paged_requests,
                 /*max_running=*/std::max(1, max_running),
                 /*n_batch=*/n_batch,
@@ -3458,6 +3458,11 @@ private:
                 },
             });
             const auto & active_seq_ids = schedule_decision.active_seq_ids;
+            SRV_DBG("[paged-scheduler] total_scheduled_tokens=%d remaining_budget=%d running=%zu waiting=%zu\n",
+                    schedule_decision.total_scheduled_tokens,
+                    schedule_decision.remaining_budget,
+                    schedule_decision.running_seq_ids.size(),
+                    schedule_decision.waiting_seq_ids.size());
             if (schedule_decision.deferred > 0) {
                 for (const auto & it : schedule_decision.deferred_reasons) {
                     SRV_DBG("[paged-scheduler] deferred=%d reason=%s\n", it.second, it.first.c_str());
@@ -3503,12 +3508,9 @@ private:
             }
 
             const int32_t decode_tokens_in_batch = tick_decision.decode_tokens_in_batch;
-            int32_t       prefill_budget         = std::max(0, n_batch - decode_tokens_in_batch);
-
-            SRV_DBG("[paged] decode_tokens=%d, prefill_budget=%d\n", decode_tokens_in_batch, prefill_budget);
+            SRV_DBG("[paged] decode_tokens=%d\n", decode_tokens_in_batch);
             const auto & prefill_candidates = tick_decision.prefill_candidates;
             const auto budget = tick_decision.budget;
-            prefill_budget = budget.prefill_total_budget;
             auto prefill_cursor = paged_sched.make_prefill_cursor(budget);
 
             const auto prefill_pass = server_scheduler::PagedScheduler::process_prefill_candidates(
