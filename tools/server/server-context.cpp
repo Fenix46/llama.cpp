@@ -719,6 +719,7 @@ private:
     // Null when flag is off; constructed after slots are initialised.
     std::unique_ptr<kv_block_scheduler> kv_sched;
     server_scheduler::SchedulerCore paged_core;
+    server_scheduler::PagedScheduler paged_sched;
 
     // Experimental cross-slot KV prefix cache (--kv-prefix-cache).
     // Null when flag is off. Registered on slot release, invalidated on eviction.
@@ -3400,8 +3401,6 @@ private:
             const int32_t n_ubatch = llama_n_ubatch(ctx);
 
             paged_request_state * req_batched = nullptr;
-            server_scheduler::PagedScheduler paged_sched;
-
             auto accept_special_token_paged = [&](const paged_request_state & req, llama_token token) {
                 return params_base.special ||
                     req.task->params.sampling.preserved_tokens.find(token) != req.task->params.sampling.preserved_tokens.end();
