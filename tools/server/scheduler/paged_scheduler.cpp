@@ -1,6 +1,20 @@
 #include "paged_scheduler.h"
 
+#include "common.h"
+
 namespace server_scheduler {
+
+PagedTickDecision PagedScheduler::tick(const PagedTickInput & in) const {
+    GGML_ASSERT(in.reqs != nullptr);
+    GGML_ASSERT(in.prefill_rr_cursor != nullptr);
+
+    return prepare_tick(
+        *in.reqs,
+        *in.prefill_rr_cursor,
+        in.n_batch,
+        in.n_ubatch,
+        in.decode_tokens_in_batch);
+}
 
 PagedTickDecision PagedScheduler::prepare_tick(
         const std::vector<RequestState> & reqs,

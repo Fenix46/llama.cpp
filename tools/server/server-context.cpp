@@ -3384,12 +3384,14 @@ private:
             };
 
             server_scheduler::PagedScheduler paged_sched;
-            const auto decode_candidates = paged_sched.prepare_tick(
-                paged_requests,
-                paged_prefill_rr_cursor,
-                n_batch,
-                n_ubatch,
-                /*decode_tokens_in_batch*/ 0).decode_candidates;
+            const auto decode_tick = paged_sched.tick(server_scheduler::PagedTickInput{
+                /*reqs=*/&paged_requests,
+                /*prefill_rr_cursor=*/&paged_prefill_rr_cursor,
+                /*n_batch=*/n_batch,
+                /*n_ubatch=*/n_ubatch,
+                /*decode_tokens_in_batch=*/0,
+            });
+            const auto & decode_candidates = decode_tick.decode_candidates;
 
             // 3a. decode tokens from all actively-generating requests
             for (const size_t idx : decode_candidates) {
@@ -3406,12 +3408,13 @@ private:
 
             SRV_DBG("[paged] decode_tokens=%d, prefill_budget=%d\n", decode_tokens_in_batch, prefill_budget);
 
-            const auto tick_decision = paged_sched.prepare_tick(
-                paged_requests,
-                paged_prefill_rr_cursor,
-                n_batch,
-                n_ubatch,
-                decode_tokens_in_batch);
+            const auto tick_decision = paged_sched.tick(server_scheduler::PagedTickInput{
+                /*reqs=*/&paged_requests,
+                /*prefill_rr_cursor=*/&paged_prefill_rr_cursor,
+                /*n_batch=*/n_batch,
+                /*n_ubatch=*/n_ubatch,
+                /*decode_tokens_in_batch=*/decode_tokens_in_batch,
+            });
             const auto & prefill_candidates = tick_decision.prefill_candidates;
             const auto budget = tick_decision.budget;
             prefill_budget = budget.prefill_total_budget;

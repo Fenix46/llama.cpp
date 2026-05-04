@@ -11,8 +11,18 @@ struct PagedTickDecision {
     PrefillBudgetDecision budget;
 };
 
+struct PagedTickInput {
+    const std::vector<RequestState> * reqs = nullptr;
+    size_t * prefill_rr_cursor = nullptr;
+    int32_t n_batch = 0;
+    int32_t n_ubatch = 0;
+    int32_t decode_tokens_in_batch = 0;
+};
+
 class PagedScheduler {
 public:
+    PagedTickDecision tick(const PagedTickInput & in) const;
+
     PagedTickDecision prepare_tick(
             const std::vector<RequestState> & reqs,
             size_t & prefill_rr_cursor,
