@@ -80,6 +80,13 @@ struct PrefillInitDecision {
     std::string error_message;
 };
 
+struct PrefillCheckpointDecision {
+    int32_t n_past = 0;
+    llama_pos pos_next = 0;
+    bool forced_reset = false;
+    bool restored = false;
+};
+
 class PagedScheduler {
 public:
     static bool should_begin_prefill(const RequestState & req);
@@ -122,6 +129,12 @@ public:
     static void prune_invalid_checkpoints(RequestState & req, llama_pos pos_next, bool checkpoints_enabled);
     static bool should_enable_checkpoints(const RequestState & req, int32_t n_swa, bool checkpoints_enabled);
     static bool validate_prefill_truncate(llama_context * ctx, const RequestState & req);
+    static PrefillCheckpointDecision restore_or_reset_checkpoint(
+            RequestState & req,
+            llama_context * ctx,
+            bool checkpoints_enabled,
+            int32_t n_swa,
+            int32_t n_past);
 
     TickOutcome tick(const PagedRuntime & runtime) const;
     PagedTickDecision tick(const PagedTickInput & in) const;

@@ -266,6 +266,65 @@ bool PagedScheduler::validate_prefill_truncate(llama_context * ctx, const Reques
     return BlockManager::truncate_seq_tail(ctx, req.seq_id, p0);
 }
 
+PrefillCheckpointDecision PagedScheduler::restore_or_reset_checkpoint(
+        RequestState & req,
+        llama_context * ctx,
+        bool checkpoints_enabled,
+        int32_t n_swa,
+        int32_t n_past) {
+    PrefillCheckpointDecision out;
+    out.n_past = n_past;
+    out.pos_next = req.prompt.tokens.pos_next(n_past);
+
+    if (!checkpoints_enabled || n_past <= 0 || n_past >= req.prompt.n_tokens() || !ctx) {
+        return out;
+    }
+
+    const auto pos_min_thold = std::max(0, out.pos_next - n_swa);
+    const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), req.seq_id);
+    GGML_ASSERT(!(pos_min == -1 && n_past > 0));
+
+    if (pos_min < pos_min_thold) {
+        return out;
+    }
+
+    const auto it = std::find_if(
+        req.prompt.checkpoints.rbegin(),
+        req.prompt.checkpoints.rend(),
+        [&](const auto & cur) {
+            if (cur.pos_max > out.pos_next) {
+                return false;
+            }
+            if (n_swa == 0) {
+                return cur.n_tokens > 0;
+            }
+            return cur.pos_min < pos_min_thold || cur.pos_min == 0;
+        });
+
+    bool do_reset = it == req.prompt.checkpoints.rend();
+    if (!do_reset) {
+        const size_t checkpoint_size = it->data.size();
+        const size_t n = llama_state_seq_set_data_ext(
+            ctx, it->data.data(), checkpoint_size, req.seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        if (n != checkpoint_size) {
+            do_reset = true;
+        } else {
+            BlockManager::rebuild_block_table(ctx, req.seq_id);
+            out.pos_next = std::min(out.pos_next, std::max(it->pos_min + 1, it->pos_max));
+            out.n_past = std::min(req.prompt.tokens.size_up_to_pos(out.pos_next), (size_t) it->n_tokens);
+            out.restored = true;
+        }
+    }
+
+    if (do_reset) {
+        out.pos_next = 0;
+        out.n_past = 0;
+        out.forced_reset = true;
+    }
+
+    return out;
+}
+
 bool PrefillWorkCursor::can_schedule_request() const {
     return prefill_added < prefill_total_budget;
 }

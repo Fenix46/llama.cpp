@@ -3522,70 +3522,10 @@ private:
                         n_past = 0;
                     }
 
-                    llama_pos pos_next = req.prompt.tokens.pos_next(n_past);
-                    const auto pos_min_thold = std::max(0, pos_next - n_swa);
-
-                    if (checkpoints_enabled && n_past > 0 && n_past < req.prompt.n_tokens()) {
-                        const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), req.seq_id);
-                        if (pos_min == -1) {
-                            PGD_ERR(req, "n_past = %d, prompt.tokens.size() = %d, seq_id = %d, pos_min = %d\n",
-                                    n_past, (int) req.prompt.tokens.size(), req.seq_id, pos_min);
-                            GGML_ABORT("pos_min == -1, but n_past > 0 - should not happen");
-                        }
-
-                        if (pos_min >= pos_min_thold) {
-                            PGD_WRN(req, "n_past = %d, prompt.tokens.size() = %d, seq_id = %d, pos_min = %d, n_swa = %d\n",
-                                    n_past, (int) req.prompt.tokens.size(), req.seq_id, pos_min, n_swa);
-
-                            const auto it = std::find_if(
-                                req.prompt.checkpoints.rbegin(),
-                                req.prompt.checkpoints.rend(),
-                                [&](const auto & cur) {
-                                    // Prefer the most recent checkpoint that does not go beyond current reuse
-                                    // boundary. This avoids restoring very old checkpoints that would lower
-                                    // pos_next and invalidate newer checkpoints.
-                                    if (cur.pos_max > pos_next) {
-                                        return false;
-                                    }
-
-                                    if (n_swa == 0) {
-                                        return cur.n_tokens > 0;
-                                    }
-
-                                    // For SWA/hybrid paths, additionally require positional compatibility.
-                                    return cur.pos_min < pos_min_thold || cur.pos_min == 0;
-                                }
-                            );
-
-                            bool do_reset = it == req.prompt.checkpoints.rend();
-
-                            if (!do_reset) {
-                                const size_t checkpoint_size = it->data.size();
-                                const size_t n = llama_state_seq_set_data_ext(ctx, it->data.data(), checkpoint_size, req.seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-
-                                if (n != checkpoint_size) {
-                                    PGD_ERR(req, "failed to restore context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                                            it->pos_min, it->pos_max, it->n_tokens, (float) checkpoint_size / 1024 / 1024);
-                                    do_reset = true;
-                                } else {
-                                    server_scheduler::BlockManager::rebuild_block_table(ctx, req.seq_id);
-                                    pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
-                                    n_past = std::min(req.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
-                                    PGD_WRN(req, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n",
-                                            it->pos_min, it->pos_max, it->n_tokens, n_past, (float) checkpoint_size / 1024 / 1024);
-                                }
-                            }
-
-                            if (do_reset) {
-                                PGD_WRN(req,
-                                        "forcing full prompt re-processing due to lack of cache data "
-                                        "(likely SWA or hybrid/recurrent memory): n_past=%d, pos_min_thold=%d, checkpoints=%zu\n",
-                                        n_past, pos_min_thold, req.prompt.checkpoints.size());
-                                pos_next = 0;
-                                n_past = 0;
-                            }
-                        }
-                    }
+                    const auto ckpt = server_scheduler::PagedScheduler::restore_or_reset_checkpoint(
+                        req, ctx, checkpoints_enabled, n_swa, n_past);
+                    n_past = ckpt.n_past;
+                    llama_pos pos_next = ckpt.pos_next;
 
                     server_scheduler::PagedScheduler::prune_invalid_checkpoints(req, pos_next, checkpoints_enabled);
 
