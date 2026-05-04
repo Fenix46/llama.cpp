@@ -700,6 +700,7 @@ private:
 
     int slots_debug = 0;
     int n_empty_consecutive = 0;
+    size_t paged_prefill_rr_cursor = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
@@ -3451,16 +3452,42 @@ private:
             SRV_DBG("[paged] decode_tokens=%d, prefill_budget=%d\n", decode_tokens_in_batch, prefill_budget);
 
             // 3b. prefill requests that still have prompt tokens left
-            for (auto & req : paged_requests) {
+            std::vector<size_t> prefill_candidates;
+            prefill_candidates.reserve(paged_requests.size());
+            for (size_t i = 0; i < paged_requests.size(); ++i) {
+                const auto & req = paged_requests[i];
                 if (req.phase != PAGED_REQUEST_STARTED && req.phase != PAGED_REQUEST_PREFILLING) {
                     continue;
                 }
                 if (req.phase == PAGED_REQUEST_WAIT_PARENT) {
                     continue;
                 }
+                prefill_candidates.push_back(i);
+            }
+
+            const int32_t n_prefill_candidates = (int32_t) prefill_candidates.size();
+            if (n_prefill_candidates > 0) {
+                const size_t rr_start = paged_prefill_rr_cursor % prefill_candidates.size();
+                std::rotate(prefill_candidates.begin(),
+                            prefill_candidates.begin() + rr_start,
+                            prefill_candidates.end());
+                paged_prefill_rr_cursor = rr_start + 1;
+            }
+
+            // Keep prefill preemptible: per-request token slice per tick.
+            // This prevents one long prompt from monopolizing update_slots() and
+            // delaying active decode streams for seconds.
+            const int32_t prefill_per_req_budget =
+                (decode_tokens_in_batch > 0 || n_prefill_candidates > 1)
+                    ? std::max<int32_t>(64, std::min<int32_t>(256, std::max<int32_t>(n_ubatch / 16, 64)))
+                    : prefill_budget;
+
+            for (size_t idx : prefill_candidates) {
+                auto & req = paged_requests[idx];
                 if (prefill_added >= prefill_budget) {
                     continue;
                 }
+                int32_t req_prefill_added = 0;
 
                 const auto & input_tokens = req.task->tokens;
 
@@ -3636,7 +3663,8 @@ private:
                 // fill batch with prompt tokens
                 while (req.prompt.n_tokens() < req.task->n_tokens() &&
                        batch.n_tokens < n_batch &&
-                       prefill_added < prefill_budget) {
+                       prefill_added < prefill_budget &&
+                       req_prefill_added < prefill_per_req_budget) {
 
                     // handle multimodal chunks
                     while (req.prompt.n_tokens() < req.task->n_tokens() &&
@@ -3669,6 +3697,7 @@ private:
 
                     common_batch_add(batch, cur_tok, req.prompt.tokens.pos_next(), { req.seq_id }, req.task->need_embd());
                     prefill_added++;
+                    req_prefill_added++;
                     req.prompt.tokens.push_back(cur_tok);
                     req.n_prompt_tokens_processed++;
 
