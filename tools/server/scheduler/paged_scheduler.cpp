@@ -232,6 +232,21 @@ PrefillInitDecision PagedScheduler::prepare_prefill_start(const RequestState & r
     return out;
 }
 
+void PagedScheduler::prune_invalid_checkpoints(RequestState & req, llama_pos pos_next, bool checkpoints_enabled) {
+    if (checkpoints_enabled) {
+        for (auto it = req.prompt.checkpoints.begin(); it != req.prompt.checkpoints.end();) {
+            const auto & cur = *it;
+            if (cur.pos_max > pos_next) {
+                it = req.prompt.checkpoints.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    } else if (!req.prompt.checkpoints.empty()) {
+        req.prompt.checkpoints.clear();
+    }
+}
+
 bool PrefillWorkCursor::can_schedule_request() const {
     return prefill_added < prefill_total_budget;
 }

@@ -119,6 +119,7 @@ public:
     static bool needs_mtmd_chunk(const RequestState & req);
     static MtmdChunkApply apply_mtmd_chunk(RequestState & req, size_t n_tokens_out);
     static PrefillInitDecision prepare_prefill_start(const RequestState & req, bool has_memory_ctx);
+    static void prune_invalid_checkpoints(RequestState & req, llama_pos pos_next, bool checkpoints_enabled);
 
     TickOutcome tick(const PagedRuntime & runtime) const;
     PagedTickDecision tick(const PagedTickInput & in) const;

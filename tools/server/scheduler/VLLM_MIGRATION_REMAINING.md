@@ -9,14 +9,30 @@ This document tracks what is still missing to complete the paged scheduler migra
 - `BlockManager` is partially centralized for paged KV operations.
 - `server-context.cpp` still contains a large inline paged prefill/decode orchestration block.
 
+## Validation (as of current branch head)
+
+- [x] Runtime-first scheduler contracts introduced (`RuntimeSnapshot`, `PagedRuntime`, `TickOutcome`).
+- [x] Internal phased dual-path gate present (`LLAMA_SERVER_PAGED_ORCHESTRATOR_V2`, default enabled).
+- [x] Deferred reason telemetry from scheduler decision wired in server logs.
+- [x] Multiple prefill policy chunks extracted from `server-context` to `PagedScheduler`:
+  - prefill-start validation + `n_past` policy
+  - prompt token append
+  - MTMD chunk helpers
+  - checkpoint break/progress/finalize checks
+- [x] Lifecycle transitions partially routed through `request_lifecycle`.
+- [~] BlockManager centralization in progress (core wrappers in place, full policy integration pending).
+- [ ] Full prefill orchestration extraction still incomplete.
+- [ ] Speculative path still post-pass (not first-class in planner).
+- [ ] Dedicated test additions listed below not yet implemented.
+
 ## Remaining Steps (Execution Order)
 
-## 1) Move the remaining prefill loop orchestration out of `server-context.cpp`
+## 1) Move the remaining prefill loop orchestration out of `server-context.cpp`  **[IN PROGRESS]**
 
 ### What is still inline
 - Checkpoint restore branch and checkpoint invalidation scans.
 - KV truncate + reset fallback policy wiring.
-- MTMD process-chunk call flow and request release/error behavior coupling.
+- MTMD process-chunk call flow and request release/error behavior coupling (partially extracted).
 - Batch-level control flow (`continue`, `break`, `goto next_req`) coordination.
 
 ### What to implement
@@ -37,11 +53,11 @@ This document tracks what is still missing to complete the paged scheduler migra
 ### Acceptance
 - Paged prefill section in `update_slots()` reduced to orchestration-only calls.
 
-## 2) Make `SchedulerCore` the single owner of tick policy decisions
+## 2) Make `SchedulerCore` the single owner of tick policy decisions  **[IN PROGRESS]**
 
 ### What is still split
-- Some budget/fairness control still computed or overridden in `PagedScheduler`.
-- `server-context` still computes and supplies policy context directly.
+- Some budget/fairness control is still computed or overridden in `PagedScheduler`.
+- `server-context` still builds parts of policy context directly before tick.
 
 ### What to implement
 - Introduce a single `RuntimeSnapshot` builder and call:
@@ -58,7 +74,7 @@ This document tracks what is still missing to complete the paged scheduler migra
 ### Acceptance
 - One policy source of truth per tick (`SchedulerCore`), no duplicated budget/admission logic.
 
-## 3) Complete BlockManager centralization for paged path
+## 3) Complete BlockManager centralization for paged path  **[IN PROGRESS]**
 
 ### What is still missing
 - Some paged lifecycle actions still call reset/clear flows from `server-context` orchestration logic.
@@ -77,7 +93,7 @@ This document tracks what is still missing to complete the paged scheduler migra
 ### Acceptance
 - No paged KV direct calls remain outside `BlockManager` for scheduler path.
 
-## 4) Centralize parent/child group lifecycle invariants
+## 4) Centralize parent/child group lifecycle invariants  **[IN PROGRESS]**
 
 ### What is still partial
 - Propagation exists but group-level accounting is still thin.
@@ -92,7 +108,7 @@ This document tracks what is still missing to complete the paged scheduler migra
 ### Acceptance
 - No manual parent/child phase writes outside lifecycle module for paged path.
 
-## 5) Make speculative path a first-class scheduled step
+## 5) Make speculative path a first-class scheduled step  **[NOT STARTED]**
 
 ### What is still partial
 - Speculative accept loop is modular but still a post-pass in the decode loop.
@@ -107,7 +123,7 @@ This document tracks what is still missing to complete the paged scheduler migra
 ### Acceptance
 - Speculative no longer treated as ad hoc post-pass; it is part of planned tick flow.
 
-## 6) Finish phased dual-path switch control
+## 6) Finish phased dual-path switch control  **[IN PROGRESS]**
 
 ### What is still missing
 - Internal gate exists, but migration completion criteria and default-flip procedure are not codified.
@@ -122,6 +138,16 @@ This document tracks what is still missing to complete the paged scheduler migra
 
 ### Acceptance
 - Controlled default flip with documented rollback path.
+
+## Recent Migration Commits (for traceability)
+
+- `f8602a647` runtime-based scheduler APIs + block policy context
+- `0c0fb2426` paged orchestrator v2 gate + reason telemetry
+- `dbe25550e` lifecycle transition routing
+- `c434c829c` prefill finalize extraction
+- `3c79edce9` prompt token append extraction
+- `69fb43fd6` MTMD helpers + schedule budget consumption in paged tick
+- `b56c5b0e4` prefill-start validation + `n_past` policy extraction
 
 ## Test Work Remaining
 

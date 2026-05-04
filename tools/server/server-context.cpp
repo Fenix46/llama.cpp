@@ -3587,20 +3587,7 @@ private:
                         }
                     }
 
-                    if (checkpoints_enabled) {
-                        for (auto it = req.prompt.checkpoints.begin(); it != req.prompt.checkpoints.end();) {
-                            const auto & cur = *it;
-                            if (cur.pos_max > pos_next) {
-                                PGD_WRN(req, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n",
-                                        cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.data.size() / 1024 / 1024);
-                                it = req.prompt.checkpoints.erase(it);
-                            } else {
-                                ++it;
-                            }
-                        }
-                    } else if (!req.prompt.checkpoints.empty()) {
-                        req.prompt.checkpoints.clear();
-                    }
+                    server_scheduler::PagedScheduler::prune_invalid_checkpoints(req, pos_next, checkpoints_enabled);
 
                     // [TAG_PROMPT_LOGITS] need at least 1 token evaluated
                     if (n_past == req.task->n_tokens() && n_past > 0) {
@@ -3629,6 +3616,7 @@ private:
 
                 bool has_mtmd = false;
 
+                bool request_released = false;
                 // fill batch with prompt tokens
                 while (req.prompt.n_tokens() < req.task->n_tokens() &&
                        prefill_cursor.can_append_token(batch.n_tokens, n_batch, req_prefill_added)) {
@@ -3642,10 +3630,14 @@ private:
                             PGD_ERR(req, "failed to process image chunk, res=%d\n", res);
                             send_error(req, "failed to process image", ERROR_TYPE_SERVER);
                             req.release();
-                            goto next_req;
+                            request_released = true;
+                            break;
                         }
                         (void) server_scheduler::PagedScheduler::apply_mtmd_chunk(req, n_tokens_out);
                         has_mtmd = true;
+                    }
+                    if (request_released) {
+                        break;
                     }
 
                     if (req.prompt.n_tokens() >= req.task->n_tokens()) {
@@ -3669,10 +3661,7 @@ private:
                     }
                 }
 
-                // done with this req for now (image error path jumps here)
-                next_req:;
-
-                if (!req.is_processing()) {
+                if (request_released || !req.is_processing()) {
                     continue;
                 }
 
