@@ -1,6 +1,7 @@
 #include "paged_scheduler.h"
 
 #include "common.h"
+#include "request_lifecycle.h"
 
 namespace server_scheduler {
 
@@ -32,14 +33,14 @@ bool PagedScheduler::should_begin_prefill(const RequestState & req) {
 void PagedScheduler::begin_prefill(RequestState & req, int32_t n_past, int64_t t_start_process_prompt_us) {
     req.t_start_process_prompt = t_start_process_prompt_us;
     req.t_start_generation = 0;
-    req.phase = PAGED_REQUEST_PREFILLING;
+    (void) transition(req, RequestEvent::BeginPrefill);
     req.n_prompt_tokens_cache = n_past;
     req.n_prompt_tokens_processed = 0;
     req.prompt.tokens.keep_first(n_past);
 }
 
 void PagedScheduler::mark_prompt_done(RequestState & req, llama_batch & batch) {
-    req.phase = PAGED_REQUEST_DONE_PREFILL;
+    (void) transition(req, RequestEvent::PromptDone);
     GGML_ASSERT(batch.n_tokens > 0);
     batch.logits[batch.n_tokens - 1] = true;
     req.n_decoded = 0;

@@ -12,7 +12,7 @@ bool SamplingExecutor::maybe_start_decoding(RequestState & req) {
         return false;
     }
 
-    req.phase = PAGED_REQUEST_DECODING;
+    (void) transition(req, RequestEvent::BeginDecode);
     if (req.can_speculate()) {
         common_speculative_begin(req.spec.spec.get(), req.prompt.tokens.get_text_tokens());
     }
