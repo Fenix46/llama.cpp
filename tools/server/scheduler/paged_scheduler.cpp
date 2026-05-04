@@ -22,6 +22,10 @@ TickOutcome PagedScheduler::tick(const PagedRuntime & runtime) const {
         runtime.active_seq_ids);
     out.decision.first_decode_request_index = dec.first_decode_request_index;
     out.decision.decode_tokens_in_batch = dec.decode_tokens_in_batch;
+    if (runtime.schedule_decision.budget.prefill_total_budget > 0 ||
+        runtime.schedule_decision.budget.prefill_per_request_budget > 0) {
+        out.decision.budget = runtime.schedule_decision.budget;
+    }
     out.prefill_rows = out.decision.prefill_candidates;
     return out;
 }
@@ -156,6 +160,28 @@ PromptAppendDecision PagedScheduler::append_prompt_token(
     if (do_checkpoint && should_break_for_checkpoint(req, n_batch, n_ubatch, checkpoint_every_nt)) {
         out.should_break = true;
     }
+    return out;
+}
+
+bool PagedScheduler::needs_mtmd_chunk(const RequestState & req) {
+    if (!req.task) {
+        return false;
+    }
+    if (req.prompt.n_tokens() >= req.task->n_tokens()) {
+        return false;
+    }
+    return req.task->tokens[req.prompt.n_tokens()] == LLAMA_TOKEN_NULL;
+}
+
+MtmdChunkApply PagedScheduler::apply_mtmd_chunk(RequestState & req, size_t n_tokens_out) {
+    MtmdChunkApply out;
+    if (!req.task || req.prompt.n_tokens() >= req.task->n_tokens()) {
+        return out;
+    }
+    req.n_prompt_tokens_processed += n_tokens_out;
+    const auto & chunk = req.task->tokens.find_chunk(req.prompt.n_tokens());
+    req.prompt.tokens.push_back(chunk.get());
+    out.consumed = true;
     return out;
 }
 

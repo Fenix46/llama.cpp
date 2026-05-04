@@ -3657,8 +3657,7 @@ private:
                        prefill_cursor.can_append_token(batch.n_tokens, n_batch, req_prefill_added)) {
 
                     // handle multimodal chunks
-                    while (req.prompt.n_tokens() < req.task->n_tokens() &&
-                           input_tokens[req.prompt.n_tokens()] == LLAMA_TOKEN_NULL) {
+                    while (server_scheduler::PagedScheduler::needs_mtmd_chunk(req)) {
                         size_t n_tokens_out = 0;
                         int32_t res = input_tokens.process_chunk(ctx, mctx, req.prompt.n_tokens(),
                                                                  req.prompt.tokens.pos_next(), req.seq_id, n_tokens_out);
@@ -3668,11 +3667,7 @@ private:
                             req.release();
                             goto next_req;
                         }
-                        req.n_prompt_tokens_processed += n_tokens_out;
-                        {
-                            const auto & chunk = input_tokens.find_chunk(req.prompt.n_tokens());
-                            req.prompt.tokens.push_back(chunk.get());
-                        }
+                        (void) server_scheduler::PagedScheduler::apply_mtmd_chunk(req, n_tokens_out);
                         has_mtmd = true;
                     }
 

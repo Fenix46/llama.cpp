@@ -65,6 +65,10 @@ struct PromptAppendDecision {
     bool should_break = false;
 };
 
+struct MtmdChunkApply {
+    bool consumed = false;
+};
+
 class PagedScheduler {
 public:
     static bool should_begin_prefill(const RequestState & req);
@@ -101,6 +105,8 @@ public:
             int32_t n_ubatch,
             bool do_checkpoint,
             int32_t checkpoint_every_nt);
+    static bool needs_mtmd_chunk(const RequestState & req);
+    static MtmdChunkApply apply_mtmd_chunk(RequestState & req, size_t n_tokens_out);
 
     TickOutcome tick(const PagedRuntime & runtime) const;
     PagedTickDecision tick(const PagedTickInput & in) const;
