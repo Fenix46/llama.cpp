@@ -60,6 +60,11 @@ struct PrefillFinalizeDecision {
     bool should_checkpoint = false;
 };
 
+struct PromptAppendDecision {
+    bool appended = false;
+    bool should_break = false;
+};
+
 class PagedScheduler {
 public:
     static bool should_begin_prefill(const RequestState & req);
@@ -87,6 +92,15 @@ public:
             int32_t checkpoint_every_nt,
             bool has_mtmd,
             llama_pos pos_min);
+    static PromptAppendDecision append_prompt_token(
+            RequestState & req,
+            llama_batch & batch,
+            PrefillWorkCursor & cursor,
+            int32_t & req_prefill_added,
+            int32_t n_batch,
+            int32_t n_ubatch,
+            bool do_checkpoint,
+            int32_t checkpoint_every_nt);
 
     TickOutcome tick(const PagedRuntime & runtime) const;
     PagedTickDecision tick(const PagedTickInput & in) const;

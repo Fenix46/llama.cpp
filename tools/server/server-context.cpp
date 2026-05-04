@@ -3680,21 +3680,20 @@ private:
                         break;
                     }
 
-                    llama_token cur_tok = input_tokens[req.prompt.n_tokens()];
-                    if (cur_tok == LLAMA_TOKEN_NULL) {
+                    const auto appended = server_scheduler::PagedScheduler::append_prompt_token(
+                        req,
+                        batch,
+                        prefill_cursor,
+                        req_prefill_added,
+                        n_batch,
+                        n_ubatch,
+                        do_checkpoint,
+                        params_base.checkpoint_every_nt);
+                    if (!appended.appended) {
                         break;
                     }
-
-                    common_batch_add(batch, cur_tok, req.prompt.tokens.pos_next(), { req.seq_id }, req.task->need_embd());
-                    prefill_cursor.on_token_appended(req_prefill_added);
-                    req.prompt.tokens.push_back(cur_tok);
-                    req.n_prompt_tokens_processed++;
-
-                    if (do_checkpoint) {
-                        if (server_scheduler::PagedScheduler::should_break_for_checkpoint(
-                                req, n_batch, n_ubatch, params_base.checkpoint_every_nt)) {
-                            break;
-                        }
+                    if (appended.should_break) {
+                        break;
                     }
                 }
 

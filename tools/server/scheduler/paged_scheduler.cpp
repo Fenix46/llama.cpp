@@ -122,6 +122,43 @@ PrefillFinalizeDecision PagedScheduler::finalize_prefill_step(
     return out;
 }
 
+PromptAppendDecision PagedScheduler::append_prompt_token(
+        RequestState & req,
+        llama_batch & batch,
+        PrefillWorkCursor & cursor,
+        int32_t & req_prefill_added,
+        int32_t n_batch,
+        int32_t n_ubatch,
+        bool do_checkpoint,
+        int32_t checkpoint_every_nt) {
+    PromptAppendDecision out;
+    if (!req.task) {
+        return out;
+    }
+    if (req.prompt.n_tokens() >= req.task->n_tokens()) {
+        return out;
+    }
+    if (!cursor.can_append_token(batch.n_tokens, n_batch, req_prefill_added)) {
+        return out;
+    }
+
+    llama_token cur_tok = req.task->tokens[req.prompt.n_tokens()];
+    if (cur_tok == LLAMA_TOKEN_NULL) {
+        return out;
+    }
+
+    common_batch_add(batch, cur_tok, req.prompt.tokens.pos_next(), { req.seq_id }, req.task->need_embd());
+    cursor.on_token_appended(req_prefill_added);
+    req.prompt.tokens.push_back(cur_tok);
+    req.n_prompt_tokens_processed++;
+    out.appended = true;
+
+    if (do_checkpoint && should_break_for_checkpoint(req, n_batch, n_ubatch, checkpoint_every_nt)) {
+        out.should_break = true;
+    }
+    return out;
+}
+
 bool PrefillWorkCursor::can_schedule_request() const {
     return prefill_added < prefill_total_budget;
 }
