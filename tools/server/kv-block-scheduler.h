@@ -35,6 +35,7 @@
 #include <cstdio>
 #include <memory>
 #include <string>
+#include <unordered_map>
 
 // -----------------------------------------------------------------------------
 // kv_block_scheduler_snapshot — point-in-time state capture
@@ -60,6 +61,15 @@ struct kv_block_scheduler_snapshot {
     uint64_t paged_cow_fallbacks = 0;
     uint64_t paged_cow_copy_us   = 0;
 
+    // scheduler decision metrics (per interval)
+    int32_t  scheduled_prefill_tokens = 0;
+    int32_t  scheduled_decode_tokens  = 0;
+    int32_t  deferred_count           = 0;
+    int32_t  preempted_count          = 0;
+    uint64_t truncate_failed_total    = 0;
+    std::unordered_map<std::string, int32_t> deferred_by_reason;
+    std::unordered_map<std::string, int32_t> preempted_by_reason;
+
     int64_t  t_snapshot_us   = 0;
 };
 
@@ -80,11 +90,18 @@ public:
     }
 
     // Call once per llama_decode() after metrics.on_decoded().
-    //   n_active_slots  — number of slots currently processing
-    //   n_prompt_tokens — prompt tokens processed in this decode bucket
-    //   t_prompt_ms     — cumulative prompt time this bucket (ms)
-    //   n_decode_tokens — decode tokens predicted this bucket
-    //   t_decode_ms     — cumulative decode time this bucket (ms)
+    //   n_active_slots          — number of slots currently processing
+    //   n_prompt_tokens         — prompt tokens processed in this decode bucket
+    //   t_prompt_ms             — cumulative prompt time this bucket (ms)
+    //   n_decode_tokens         — decode tokens predicted this bucket
+    //   t_decode_ms             — cumulative decode time this bucket (ms)
+    //   sched_prefill_tokens    — prefill tokens scheduled this tick
+    //   sched_decode_tokens     — decode tokens scheduled this tick
+    //   sched_deferred          — requests deferred this tick
+    //   sched_preempted         — requests preempted this tick
+    //   sched_deferred_reasons  — reason → count map for deferred reqs
+    //   sched_preempted_reasons — reason → count map for preempted reqs
+    //   truncate_failed         — truncate_seq_tail failures this tick
     void on_decoded(
             llama_context * ctx,
             int32_t  n_active_slots,
@@ -93,7 +110,14 @@ public:
             uint64_t n_prompt_tokens,
             double   t_prompt_ms,
             uint64_t n_decode_tokens,
-            double   t_decode_ms)
+            double   t_decode_ms,
+            int32_t  sched_prefill_tokens    = 0,
+            int32_t  sched_decode_tokens     = 0,
+            int32_t  sched_deferred          = 0,
+            int32_t  sched_preempted         = 0,
+            const std::unordered_map<std::string, int32_t> * sched_deferred_reasons  = nullptr,
+            const std::unordered_map<std::string, int32_t> * sched_preempted_reasons = nullptr,
+            uint64_t truncate_failed         = 0)
     {
         bucket_.n_active_slots    = n_active_slots;
         bucket_.n_total_slots     = n_total_slots;
@@ -103,6 +127,22 @@ public:
         bucket_.n_decode_tokens += n_decode_tokens;
         bucket_.t_decode_ms     += t_decode_ms;
         bucket_.n_calls++;
+
+        bucket_.sched_prefill_tokens   += sched_prefill_tokens;
+        bucket_.sched_decode_tokens    += sched_decode_tokens;
+        bucket_.sched_deferred         += sched_deferred;
+        bucket_.sched_preempted        += sched_preempted;
+        bucket_.truncate_failed_total  += truncate_failed;
+        if (sched_deferred_reasons) {
+            for (const auto & kv : *sched_deferred_reasons) {
+                bucket_.sched_deferred_reasons[kv.first] += kv.second;
+            }
+        }
+        if (sched_preempted_reasons) {
+            for (const auto & kv : *sched_preempted_reasons) {
+                bucket_.sched_preempted_reasons[kv.first] += kv.second;
+            }
+        }
 
         const int64_t now_us   = ggml_time_us();
         const int64_t elapsed  = now_us - t_last_print_us_;
@@ -135,6 +175,14 @@ private:
         double   t_decode_ms     = 0.0;
         uint64_t n_calls         = 0;
         int64_t  t_start_us      = 0;
+
+        int32_t  sched_prefill_tokens  = 0;
+        int32_t  sched_decode_tokens   = 0;
+        int32_t  sched_deferred        = 0;
+        int32_t  sched_preempted       = 0;
+        uint64_t truncate_failed_total = 0;
+        std::unordered_map<std::string, int32_t> sched_deferred_reasons;
+        std::unordered_map<std::string, int32_t> sched_preempted_reasons;
     };
 
     int32_t  n_total_slots_;
@@ -199,6 +247,15 @@ private:
             s.avg_decode_ms = bucket_.t_decode_ms / (double) bucket_.n_decode_tokens;
         }
 
+        // scheduler decision metrics
+        s.scheduled_prefill_tokens = bucket_.sched_prefill_tokens;
+        s.scheduled_decode_tokens  = bucket_.sched_decode_tokens;
+        s.deferred_count           = bucket_.sched_deferred;
+        s.preempted_count          = bucket_.sched_preempted;
+        s.truncate_failed_total    = bucket_.truncate_failed_total;
+        s.deferred_by_reason       = bucket_.sched_deferred_reasons;
+        s.preempted_by_reason      = bucket_.sched_preempted_reasons;
+
         return s;
     }
 
@@ -214,6 +271,18 @@ private:
                  used_w,          "####################",
                  BAR_W - used_w,  "...................." );
 
+        // build deferred/preempted reason strings
+        std::string deferred_str;
+        for (const auto & kv : s.deferred_by_reason) {
+            if (!deferred_str.empty()) deferred_str += ", ";
+            deferred_str += kv.first + ":" + std::to_string(kv.second);
+        }
+        std::string preempted_str;
+        for (const auto & kv : s.preempted_by_reason) {
+            if (!preempted_str.empty()) preempted_str += ", ";
+            preempted_str += kv.first + ":" + std::to_string(kv.second);
+        }
+
         LOG_INF(
             "\n"
             "┌─ KV Block Scheduler ─────────────────────────────────────\n"
@@ -225,6 +294,8 @@ private:
             "│  slots  : %d active / %d total\n"
             "│  toks/s : %.1f  (prompt+decode)\n"
             "│  prefill: %.3f ms/tok   decode: %.3f ms/tok\n"
+            "│  sched  : prefill=%d decode=%d deferred=%d preempted=%d trunc_fail=%llu\n"
+            "%s%s"
             "└───────────────────────────────────────────────────────────\n",
             bar, s.n_blocks_used, s.n_blocks_total, s.n_blocks_free, s.block_size,
             s.n_pages_mapped,
@@ -236,6 +307,11 @@ private:
             (unsigned long long) s.paged_cow_fallbacks,
             s.n_active_slots, s.n_total_slots,
             s.tokens_per_sec,
-            s.avg_prefill_ms, s.avg_decode_ms);
+            s.avg_prefill_ms, s.avg_decode_ms,
+            s.scheduled_prefill_tokens, s.scheduled_decode_tokens,
+            s.deferred_count, s.preempted_count,
+            (unsigned long long) s.truncate_failed_total,
+            deferred_str.empty()   ? "" : ("│  defer  : " + deferred_str + "\n").c_str(),
+            preempted_str.empty()  ? "" : ("│  preempt: " + preempted_str + "\n").c_str());
     }
 };

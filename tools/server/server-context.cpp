@@ -706,9 +706,10 @@ private:
     // cached slot init parameters (used for dynamic slot creation)
     int32_t n_ctx_slot_ = 0;
     common_context_seq_rm_type ctx_seq_rm_type_ = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
-    int32_t paged_blocks_per_seq_ = 0;
-    int32_t paged_max_full_ctx_concurrency_ = 0;
-    int32_t paged_total_blocks_ = 0;
+    int32_t  paged_blocks_per_seq_ = 0;
+    int32_t  paged_max_full_ctx_concurrency_ = 0;
+    int32_t  paged_total_blocks_ = 0;
+    uint64_t paged_truncate_failed_ = 0;  // truncate_seq_tail failures since last kv_sched tick
 
     int slots_debug = 0;
     int n_empty_consecutive = 0;
@@ -3584,6 +3585,9 @@ private:
                             r.release();
                         },
                         /*on_hard_reset=*/[this](paged_request_state & r, const char * reason) {
+                            if (reason && std::string_view(reason) == "truncate-failed") {
+                                ++paged_truncate_failed_;
+                            }
                             reset_paged_request_state(r, reason);
                         },
                         /*on_create_checkpoint=*/[this](paged_request_state & r, int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
@@ -3623,14 +3627,22 @@ private:
                 n_batch,
                 params_base.scheduler == "paged",
                 server_scheduler::DecodePassCallbacks{
-                    /*on_segment_decoded=*/[this]() {
+                    /*on_segment_decoded=*/[this, &schedule_decision]() {
                         metrics.on_decoded(paged_requests);
 
                         if (kv_sched) {
                             int32_t n_active = 0;
+                            int32_t sched_prefill_toks = 0;
+                            int32_t sched_decode_toks  = 0;
+                            for (const auto & plan : schedule_decision.request_plans) {
+                                sched_prefill_toks += plan.scheduled_prefill_tokens;
+                                sched_decode_toks  += plan.scheduled_decode_tokens;
+                            }
                             for (const auto & req : paged_requests) {
                                 if (req.is_processing()) { ++n_active; }
                             }
+                            const uint64_t trunc_fail = paged_truncate_failed_;
+                            paged_truncate_failed_ = 0;
                             kv_sched->on_decoded(
                                 ctx,
                                 n_active,
@@ -3639,7 +3651,14 @@ private:
                                 metrics.n_prompt_tokens_processed,
                                 (double) metrics.t_prompt_processing,
                                 metrics.n_tokens_predicted,
-                                (double) metrics.t_tokens_generation);
+                                (double) metrics.t_tokens_generation,
+                                sched_prefill_toks,
+                                sched_decode_toks,
+                                schedule_decision.deferred,
+                                schedule_decision.preempted,
+                                &schedule_decision.deferred_reasons,
+                                &schedule_decision.preempted_reasons,
+                                trunc_fail);
                         }
                     },
                     /*on_fatal_error=*/[this](const char * error) {
