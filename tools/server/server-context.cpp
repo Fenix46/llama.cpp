@@ -8,6 +8,9 @@
 #include "kv-block-scheduler.h"
 #include "kv-prefix-cache.h"
 #include "paged-request.h"
+#include "scheduler/admission_controller.h"
+#include "scheduler/prefill_policy.h"
+#include "scheduler/reservation_model.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -2818,87 +2821,36 @@ private:
     }
 
     int32_t paged_task_reserved_blocks(const server_task & task) const {
-        if (params_base.scheduler != "paged" || paged_blocks_per_seq_ <= 0) {
-            return 0;
-        }
-
-        const int32_t bs = (int32_t) params_base.kv_block_size;
-
-        if (params_base.paged_admission != "actual-len") {
-            return paged_blocks_per_seq_;
-        }
-
-        int32_t n_predict = 0;
-        if (task.need_sampling()) {
-            if (task.params.n_predict >= 0) {
-                n_predict = task.params.n_predict;
-            } else if (params_base.n_predict >= 0) {
-                n_predict = params_base.n_predict;
-            } else {
-                return paged_blocks_per_seq_;
-            }
-        }
-
-        const int32_t n_tokens = std::max<int32_t>(1, std::min<int32_t>(n_ctx_slot_, task.n_tokens() + n_predict));
-
-        return (n_tokens + bs - 1) / bs;
+        return server_scheduler::paged_task_reserved_blocks(task, params_base, paged_blocks_per_seq_, n_ctx_slot_);
     }
 
     int32_t paged_task_tree_reserved_blocks(const server_task & task) const {
-        int32_t n_blocks = paged_task_reserved_blocks(task);
-
-        for (const auto & child : task.child_tasks) {
-            n_blocks += paged_task_reserved_blocks(child);
-        }
-
-        return n_blocks;
+        return server_scheduler::paged_task_tree_reserved_blocks(task, params_base, paged_blocks_per_seq_, n_ctx_slot_);
     }
 
     int32_t count_paged_reserved_blocks() const {
-        int32_t n_blocks = 0;
-        for (const auto & req : paged_requests) {
-            if (req.is_processing()) {
-                n_blocks += req.reserved_blocks;
-            }
-        }
-        return n_blocks;
+        return server_scheduler::count_paged_reserved_blocks(paged_requests);
     }
 
     bool paged_admission_available(const server_task & task) const {
-        if (params_base.scheduler != "paged" || paged_max_full_ctx_concurrency_ <= 0) {
-            return true;
-        }
-
-        const int32_t seq_max = ctx ? (int32_t) llama_n_seq_max(ctx) : paged_max_full_ctx_concurrency_;
-        const int32_t cap     = params_base.paged_admission == "actual-len"
-            ? seq_max
-            : std::min(seq_max, paged_max_full_ctx_concurrency_);
         const int32_t running = count_paged_active_requests();
-        const size_t n_requests_needed = task.is_parent() ? 1 + task.child_tasks.size() : 1;
+        const auto decision = server_scheduler::paged_admission_available(
+            task,
+            params_base,
+            paged_requests,
+            ctx,
+            paged_max_full_ctx_concurrency_,
+            paged_total_blocks_,
+            paged_blocks_per_seq_,
+            n_ctx_slot_,
+            running);
 
-        if (running + (int32_t) n_requests_needed <= cap) {
-            if (params_base.paged_admission != "actual-len") {
-                return true;
-            }
-
-            const int32_t reserved = count_paged_reserved_blocks();
-            const int32_t needed   = paged_task_tree_reserved_blocks(task);
-            const int32_t free_blk = llama_kv_cache_n_free_blocks(llama_get_memory(ctx));
-
-            if (reserved + needed <= paged_total_blocks_) {
-                SRV_DBG("[paged-scheduler] admission accepted: reserved_blocks=%d, requested_blocks=%d, total_blocks=%d, free_blocks=%d, active_requests=%d, requested_requests=%zu\n",
-                        reserved, needed, paged_total_blocks_, free_blk, running, n_requests_needed);
-                return true;
-            }
-
-            SRV_DBG("[paged-scheduler] admission deferred: reserved_blocks=%d, requested_blocks=%d, total_blocks=%d, free_blocks=%d, active_requests=%d, requested_requests=%zu\n",
-                    reserved, needed, paged_total_blocks_, free_blk, running, n_requests_needed);
-            return false;
+        if (!decision.accepted) {
+            SRV_DBG("[paged-scheduler] admission deferred: reason=%s, active_requests=%d, policy=%s\n",
+                    decision.reason.c_str(), running, params_base.paged_admission.c_str());
         }
 
-        SRV_DBG("[paged-scheduler] admission deferred: active_requests=%d, requested_requests=%zu, cap=%d, blocks_per_seq=%d, policy=%s\n",
-                running, n_requests_needed, cap, paged_blocks_per_seq_, params_base.paged_admission.c_str());
-        return false;
+        return decision.accepted;
     }
 
     // launch multiple slots for parent + child tasks
@@ -3442,13 +3394,6 @@ private:
             int32_t       prefill_budget         = std::max(0, n_batch - decode_tokens_in_batch);
             int32_t       prefill_added          = 0;
 
-            if (decode_tokens_in_batch > 0 && prefill_budget > 0) {
-                const int32_t paged_prefill_slice = std::max<int32_t>(
-                    64,
-                    std::min<int32_t>(256, std::max<int32_t>(decode_tokens_in_batch * 32, n_ubatch / 16)));
-                prefill_budget = std::min(prefill_budget, paged_prefill_slice);
-            }
-
             SRV_DBG("[paged] decode_tokens=%d, prefill_budget=%d\n", decode_tokens_in_batch, prefill_budget);
 
             // 3b. prefill requests that still have prompt tokens left
@@ -3466,21 +3411,11 @@ private:
             }
 
             const int32_t n_prefill_candidates = (int32_t) prefill_candidates.size();
-            if (n_prefill_candidates > 0) {
-                const size_t rr_start = paged_prefill_rr_cursor % prefill_candidates.size();
-                std::rotate(prefill_candidates.begin(),
-                            prefill_candidates.begin() + rr_start,
-                            prefill_candidates.end());
-                paged_prefill_rr_cursor = rr_start + 1;
-            }
-
-            // Keep prefill preemptible: per-request token slice per tick.
-            // This prevents one long prompt from monopolizing update_slots() and
-            // delaying active decode streams for seconds.
-            const int32_t prefill_per_req_budget =
-                (decode_tokens_in_batch > 0 || n_prefill_candidates > 1)
-                    ? std::max<int32_t>(64, std::min<int32_t>(256, std::max<int32_t>(n_ubatch / 16, 64)))
-                    : prefill_budget;
+            server_scheduler::apply_round_robin(prefill_candidates, paged_prefill_rr_cursor);
+            const auto budget = server_scheduler::compute_prefill_budget(
+                n_batch, n_ubatch, decode_tokens_in_batch, n_prefill_candidates);
+            prefill_budget = budget.prefill_total_budget;
+            const int32_t prefill_per_req_budget = budget.prefill_per_request_budget;
 
             for (size_t idx : prefill_candidates) {
                 auto & req = paged_requests[idx];

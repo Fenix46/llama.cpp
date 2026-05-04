@@ -18,6 +18,40 @@ add_library(${TARGET} STATIC
     paged-request.h
     server-tools.cpp
     server-tools.h
+    scheduler/request_state.cpp
+    scheduler/request_state.h
+    scheduler/request_group.cpp
+    scheduler/request_group.h
+    scheduler/request_lifecycle.cpp
+    scheduler/request_lifecycle.h
+    scheduler/sched_policy.cpp
+    scheduler/sched_policy.h
+    scheduler/prefill_policy.cpp
+    scheduler/prefill_policy.h
+    scheduler/admission_controller.cpp
+    scheduler/admission_controller.h
+    scheduler/reservation_model.cpp
+    scheduler/reservation_model.h
+    scheduler/block_manager.cpp
+    scheduler/block_manager.h
+    scheduler/prefix_reuse_manager.cpp
+    scheduler/prefix_reuse_manager.h
+    scheduler/batch_plan.cpp
+    scheduler/batch_plan.h
+    scheduler/batch_planner.cpp
+    scheduler/batch_planner.h
+    scheduler/step_executor.cpp
+    scheduler/step_executor.h
+    scheduler/sampling_executor.cpp
+    scheduler/sampling_executor.h
+    scheduler/speculative_executor.cpp
+    scheduler/speculative_executor.h
+    scheduler/paged_scheduler.cpp
+    scheduler/paged_scheduler.h
+    scheduler/scheduler_metrics.cpp
+    scheduler/scheduler_metrics.h
+    scheduler/legacy_slot_adapter.cpp
+    scheduler/legacy_slot_adapter.h
 )
 
 if (BUILD_SHARED_LIBS)
