@@ -3603,16 +3603,12 @@ private:
 
                 // truncate any KV tokens beyond n_past
                 const llama_pos p0 = req.prompt.tokens.pos_next();
-                if (!server_scheduler::BlockManager::truncate_seq_tail(ctx, req.seq_id, p0)) {
+                if (!server_scheduler::PagedScheduler::validate_prefill_truncate(ctx, req)) {
                     PGD_WRN(req, "failed to truncate KV at pos %d - hard resetting\n", p0);
                     reset_paged_request_state(req, "truncate-failed");
                 }
 
-                bool do_checkpoint = checkpoints_enabled;
-                do_checkpoint = do_checkpoint && req.task->type == SERVER_TASK_TYPE_COMPLETION;
-                do_checkpoint = do_checkpoint && (
-                        (req.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) ||
-                        (n_swa > 0));
+                bool do_checkpoint = server_scheduler::PagedScheduler::should_enable_checkpoints(req, n_swa, checkpoints_enabled);
 
                 bool has_mtmd = false;
 

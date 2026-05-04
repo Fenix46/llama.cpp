@@ -1,5 +1,6 @@
 #include "paged_scheduler.h"
 
+#include "block_manager.h"
 #include "common.h"
 #include "request_lifecycle.h"
 
@@ -245,6 +246,24 @@ void PagedScheduler::prune_invalid_checkpoints(RequestState & req, llama_pos pos
     } else if (!req.prompt.checkpoints.empty()) {
         req.prompt.checkpoints.clear();
     }
+}
+
+bool PagedScheduler::should_enable_checkpoints(const RequestState & req, int32_t n_swa, bool checkpoints_enabled) {
+    if (!checkpoints_enabled || !req.task) {
+        return false;
+    }
+    if (req.task->type != SERVER_TASK_TYPE_COMPLETION) {
+        return false;
+    }
+    return (req.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) || (n_swa > 0);
+}
+
+bool PagedScheduler::validate_prefill_truncate(llama_context * ctx, const RequestState & req) {
+    if (!ctx) {
+        return false;
+    }
+    const llama_pos p0 = req.prompt.tokens.pos_next();
+    return BlockManager::truncate_seq_tail(ctx, req.seq_id, p0);
 }
 
 bool PrefillWorkCursor::can_schedule_request() const {
