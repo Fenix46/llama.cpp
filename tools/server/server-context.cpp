@@ -3702,6 +3702,7 @@ private:
                     },
                     /*planned_spec_decode_tokens=*/&schedule_decision.scheduled_spec_decode_tokens,
                 });
+            tick_outcome.decode_result = decode_outcome;
             if (decode_outcome.speculative_accept_loops > 0) {
                 SRV_DBG("[paged-stage] speculative_loops=%d\n", decode_outcome.speculative_accept_loops);
                 SRV_DBG("[paged-stage] speculative_accepted=%d speculative_rejected=%d\n",

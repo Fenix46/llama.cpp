@@ -1,7 +1,9 @@
 #pragma once
 
 #include "batch_planner.h"
+#include "batch_plan.h"
 #include "prefill_policy.h"
+#include "request_lifecycle.h"
 #include "scheduler_core.h"
 #include "step_executor.h"
 #include "llama.h"
@@ -28,12 +30,6 @@ struct PagedRuntime {
     int32_t n_batch = 0;
     int32_t n_ubatch = 0;
     SchedulerCore::ScheduleDecision schedule_decision;
-};
-
-struct TickOutcome {
-    PagedTickDecision decision;
-    std::vector<size_t> decode_rows;
-    std::vector<size_t> prefill_rows;
 };
 
 struct PagedTickInput {
@@ -153,6 +149,16 @@ struct DecodePassResult {
     int32_t speculative_accept_loops = 0;
     int32_t speculative_accepted_tokens = 0;
     int32_t speculative_rejected_tokens = 0;
+};
+
+struct TickOutcome {
+    PagedTickDecision decision;
+    std::vector<size_t> decode_rows;
+    std::vector<size_t> prefill_rows;
+    SchedulerCore::ScheduleDecision schedule;
+    BatchPlan batch_plan;
+    DecodePassResult decode_result;
+    GroupPropagationResult lifecycle_result;
 };
 
 class PagedScheduler {

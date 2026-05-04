@@ -13,9 +13,10 @@ TickOutcome PagedScheduler::tick(const PagedRuntime & runtime) const {
     GGML_ASSERT(runtime.batch != nullptr);
 
     TickOutcome out;
+    out.schedule = runtime.schedule_decision;
     if (!runtime.schedule_decision.request_plans.empty()) {
-        const auto plan = planner_.build_from_request_plans(*runtime.reqs, runtime.schedule_decision, *runtime.batch);
-        out.decode_rows = plan.decode_request_indices;
+        out.batch_plan = planner_.build_from_request_plans(*runtime.reqs, runtime.schedule_decision, *runtime.batch);
+        out.decode_rows = out.batch_plan.decode_request_indices;
     } else {
         out.decode_rows = planner_.collect_decode_candidates(*runtime.reqs, runtime.active_seq_ids);
     }
@@ -30,6 +31,24 @@ TickOutcome PagedScheduler::tick(const PagedRuntime & runtime) const {
     out.decision.first_decode_request_index = dec.first_decode_request_index;
     out.decision.decode_tokens_in_batch = dec.decode_tokens_in_batch;
     out.prefill_rows = out.decision.prefill_candidates;
+    if (out.batch_plan.rows.empty()) {
+        for (const auto idx : out.decode_rows) {
+            BatchPlanRow row;
+            row.seq_id = (*runtime.reqs)[idx].seq_id;
+            row.n_tokens = 1;
+            row.is_decode = true;
+            out.batch_plan.rows.push_back(row);
+            out.batch_plan.decode_request_indices.push_back(idx);
+        }
+        for (const auto idx : out.prefill_rows) {
+            BatchPlanRow row;
+            row.seq_id = (*runtime.reqs)[idx].seq_id;
+            row.n_tokens = 1;
+            row.is_prefill = true;
+            out.batch_plan.rows.push_back(row);
+            out.batch_plan.prefill_request_indices.push_back(idx);
+        }
+    }
     return out;
 }
 
