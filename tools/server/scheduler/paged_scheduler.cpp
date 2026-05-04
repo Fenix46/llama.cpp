@@ -23,10 +23,6 @@ TickOutcome PagedScheduler::tick(const PagedRuntime & runtime) const {
         runtime.active_seq_ids);
     out.decision.first_decode_request_index = dec.first_decode_request_index;
     out.decision.decode_tokens_in_batch = dec.decode_tokens_in_batch;
-    if (runtime.schedule_decision.budget.prefill_total_budget > 0 ||
-        runtime.schedule_decision.budget.prefill_per_request_budget > 0) {
-        out.decision.budget = runtime.schedule_decision.budget;
-    }
     out.prefill_rows = out.decision.prefill_candidates;
     return out;
 }
