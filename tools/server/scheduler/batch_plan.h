@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -13,6 +14,8 @@ struct BatchPlanRow {
 
 struct BatchPlan {
     std::vector<BatchPlanRow> rows;
+    std::vector<size_t> decode_request_indices;
+    std::vector<size_t> prefill_request_indices;
 };
 
 } // namespace server_scheduler

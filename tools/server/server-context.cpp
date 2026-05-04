@@ -10,6 +10,7 @@
 #include "paged-request.h"
 #include "scheduler/admission_controller.h"
 #include "scheduler/prefill_policy.h"
+#include "scheduler/paged_scheduler.h"
 #include "scheduler/reservation_model.h"
 
 #include "build-info.h"
@@ -3379,11 +3380,17 @@ private:
                     req.task->params.sampling.preserved_tokens.find(token) != req.task->params.sampling.preserved_tokens.end();
             };
 
+            server_scheduler::PagedScheduler paged_sched;
+            const auto decode_candidates = paged_sched.prepare_tick(
+                paged_requests,
+                paged_prefill_rr_cursor,
+                n_batch,
+                n_ubatch,
+                /*decode_tokens_in_batch*/ 0).decode_candidates;
+
             // 3a. decode tokens from all actively-generating requests
-            for (auto & req : paged_requests) {
-                if (req.phase != PAGED_REQUEST_DECODING) {
-                    continue;
-                }
+            for (const size_t idx : decode_candidates) {
+                auto & req = paged_requests[idx];
                 if (!req_batched) {
                     req_batched = &req;
                 }
@@ -3396,24 +3403,14 @@ private:
 
             SRV_DBG("[paged] decode_tokens=%d, prefill_budget=%d\n", decode_tokens_in_batch, prefill_budget);
 
-            // 3b. prefill requests that still have prompt tokens left
-            std::vector<size_t> prefill_candidates;
-            prefill_candidates.reserve(paged_requests.size());
-            for (size_t i = 0; i < paged_requests.size(); ++i) {
-                const auto & req = paged_requests[i];
-                if (req.phase != PAGED_REQUEST_STARTED && req.phase != PAGED_REQUEST_PREFILLING) {
-                    continue;
-                }
-                if (req.phase == PAGED_REQUEST_WAIT_PARENT) {
-                    continue;
-                }
-                prefill_candidates.push_back(i);
-            }
-
-            const int32_t n_prefill_candidates = (int32_t) prefill_candidates.size();
-            server_scheduler::apply_round_robin(prefill_candidates, paged_prefill_rr_cursor);
-            const auto budget = server_scheduler::compute_prefill_budget(
-                n_batch, n_ubatch, decode_tokens_in_batch, n_prefill_candidates);
+            const auto tick_decision = paged_sched.prepare_tick(
+                paged_requests,
+                paged_prefill_rr_cursor,
+                n_batch,
+                n_ubatch,
+                decode_tokens_in_batch);
+            const auto & prefill_candidates = tick_decision.prefill_candidates;
+            const auto budget = tick_decision.budget;
             prefill_budget = budget.prefill_total_budget;
             const int32_t prefill_per_req_budget = budget.prefill_per_request_budget;
 
