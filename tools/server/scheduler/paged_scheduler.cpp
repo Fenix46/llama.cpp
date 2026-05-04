@@ -35,7 +35,7 @@ PagedTickDecision PagedScheduler::prepare_tick(
     PagedTickDecision out;
 
     out.prefill_candidates = planner_.collect_prefill_candidates(reqs, prefill_rr_cursor, active_seq_ids);
-    out.budget = compute_prefill_budget(
+    out.budget = policy_core_.compute_prefill_budget(
         n_batch,
         n_ubatch,
         decode_tokens_in_batch,

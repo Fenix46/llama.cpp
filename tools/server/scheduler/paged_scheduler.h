@@ -2,6 +2,7 @@
 
 #include "batch_planner.h"
 #include "prefill_policy.h"
+#include "scheduler_core.h"
 #include "llama.h"
 #include <unordered_set>
 
@@ -47,6 +48,7 @@ public:
 
 private:
     BatchPlanner planner_;
+    SchedulerCore policy_core_;
 };
 
 } // namespace server_scheduler

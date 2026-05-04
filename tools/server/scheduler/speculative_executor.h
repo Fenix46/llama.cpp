@@ -1,6 +1,7 @@
 #pragma once
 
 #include "request_state.h"
+#include <functional>
 #include <vector>
 
 namespace server_scheduler {
@@ -19,6 +20,11 @@ public:
             const RequestState & req,
             const SpecAcceptResult & spec,
             bool allow_special);
+    static void run_accept_loop(
+            std::vector<RequestState> & reqs,
+            bool allow_special,
+            const std::function<bool(completion_token_output &, RequestState &)> & on_token,
+            const std::function<void(RequestState &)> & on_finish);
 };
 
 } // namespace server_scheduler

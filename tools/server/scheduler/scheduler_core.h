@@ -1,5 +1,6 @@
 #pragma once
 
+#include "prefill_policy.h"
 #include "request_state.h"
 
 #include <cstdint>
@@ -21,6 +22,11 @@ public:
             int32_t max_running,
             const std::function<bool(const RequestState &)> & can_admit);
     std::unordered_set<int32_t> active_set() const;
+    PrefillBudgetDecision compute_prefill_budget(
+            int32_t n_batch,
+            int32_t n_ubatch,
+            int32_t decode_tokens_in_batch,
+            int32_t n_prefill_candidates) const;
 
     bool is_active(int32_t seq_id) const;
 

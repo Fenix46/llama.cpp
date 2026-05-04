@@ -2839,7 +2839,7 @@ private:
     }
 
     int32_t count_paged_reserved_blocks() const {
-        return server_scheduler::count_paged_reserved_blocks(paged_requests);
+        return server_scheduler::BlockManager::total_reserved_blocks(paged_requests);
     }
 
     bool paged_admission_available(const server_task & task) const {
@@ -3864,35 +3864,18 @@ private:
                 }
 
                 // 4c. speculative decoding accept loop
-                for (auto & req : paged_requests) {
-                    const auto spec = server_scheduler::SpeculativeExecutor::accept_draft(req);
-                    if (!spec.ready) {
-                        continue;
-                    }
-
-                    const int64_t t_current = ggml_time_us();
-                    server_scheduler::SpeculativeExecutor::apply_accepted_ids(req, spec, t_current);
-                    const auto &  ids       = spec.accepted_ids;
-
-                    req.sampled = ids.back();
-                    PGD_DBG(req, "spec accepted: sampled=%d, ids.size=%zu, n_draft=%zu\n",
-                            req.sampled, ids.size(), spec.n_draft);
-
-                    auto accepted_outputs = server_scheduler::SpeculativeExecutor::build_accepted_outputs(
-                        req, spec, params_base.special);
-                    for (auto & result : accepted_outputs) {
-                        if (!process_token(result, req)) {
-                            req.print_timings();
-                            send_final_response(req);
-                            metrics.on_prediction(req);
-                            req.release();
-                            break;
-                        }
-                    }
-
-                    PGD_DBG(req, "spec: accepted %d/%d, new n_tokens=%d\n",
-                            (int) ids.size() - 1, (int) spec.n_draft, req.prompt.n_tokens());
-                }
+                server_scheduler::SpeculativeExecutor::run_accept_loop(
+                    paged_requests,
+                    params_base.special,
+                    [this](completion_token_output & result, paged_request_state & req) {
+                        return process_token(result, req);
+                    },
+                    [this](paged_request_state & req) {
+                        req.print_timings();
+                        send_final_response(req);
+                        metrics.on_prediction(req);
+                        req.release();
+                    });
             }
 
             SRV_DBG("%s", "[paged] run completed\n");

@@ -132,4 +132,13 @@ std::unordered_set<int32_t> SchedulerCore::active_set() const {
     return running_set_;
 }
 
+PrefillBudgetDecision SchedulerCore::compute_prefill_budget(
+        int32_t n_batch,
+        int32_t n_ubatch,
+        int32_t decode_tokens_in_batch,
+        int32_t n_prefill_candidates) const {
+    return server_scheduler::compute_prefill_budget(
+        n_batch, n_ubatch, decode_tokens_in_batch, n_prefill_candidates);
+}
+
 } // namespace server_scheduler

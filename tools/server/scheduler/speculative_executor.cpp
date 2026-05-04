@@ -74,4 +74,34 @@ std::vector<completion_token_output> SpeculativeExecutor::build_accepted_outputs
     return out;
 }
 
+void SpeculativeExecutor::run_accept_loop(
+        std::vector<RequestState> & reqs,
+        bool allow_special,
+        const std::function<bool(completion_token_output &, RequestState &)> & on_token,
+        const std::function<void(RequestState &)> & on_finish) {
+    for (auto & req : reqs) {
+        const auto spec = accept_draft(req);
+        if (!spec.ready) {
+            continue;
+        }
+
+        const int64_t t_current = ggml_time_us();
+        apply_accepted_ids(req, spec, t_current);
+        const auto & ids = spec.accepted_ids;
+
+        req.sampled = ids.back();
+        auto accepted_outputs = build_accepted_outputs(req, spec, allow_special);
+        bool done = false;
+        for (auto & result : accepted_outputs) {
+            if (!on_token(result, req)) {
+                done = true;
+                break;
+            }
+        }
+        if (done) {
+            on_finish(req);
+        }
+    }
+}
+
 } // namespace server_scheduler
