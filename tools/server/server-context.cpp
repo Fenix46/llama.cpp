@@ -3667,17 +3667,14 @@ private:
                             req.prompt.n_tokens(), batch.n_tokens);
                 } else {
                     if (do_checkpoint) {
-                        const int64_t n_tokens_processed = req.prompt.n_tokens() - n_tokens_cur;
-                        int64_t last_checkpoint_nt = 0;
-                        if (!req.prompt.checkpoints.empty()) {
-                            last_checkpoint_nt = req.prompt.checkpoints.back().n_tokens;
-                        }
-
-                        do_checkpoint = n_tokens_processed - last_checkpoint_nt >= params_base.checkpoint_every_nt;
+                        do_checkpoint = server_scheduler::PagedScheduler::should_checkpoint_progress(
+                                req, n_tokens_cur, params_base.checkpoint_every_nt);
 
                         if (do_checkpoint) {
                             PGD_INF(req, "%d tokens since last checkpoint at %d, creating new checkpoint during processing at position %d\n",
-                                    params_base.checkpoint_every_nt, (int) last_checkpoint_nt, req.prompt.n_tokens());
+                                    params_base.checkpoint_every_nt,
+                                    req.prompt.checkpoints.empty() ? 0 : (int) req.prompt.checkpoints.back().n_tokens,
+                                    req.prompt.n_tokens());
                         }
                     }
 
@@ -3688,9 +3685,8 @@ private:
                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), req.seq_id);
                 const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx), req.seq_id);
 
-                do_checkpoint = do_checkpoint && (pos_min >= 0 && req.prompt.n_tokens() >= 64);
-                do_checkpoint = do_checkpoint && !has_mtmd;
-                do_checkpoint = do_checkpoint && (req.prompt.checkpoints.empty() || req.prompt.n_tokens() - n_tokens_cur > req.prompt.checkpoints.back().n_tokens + 64);
+                do_checkpoint = do_checkpoint && server_scheduler::PagedScheduler::should_checkpoint_finalize(
+                        req, n_tokens_cur, has_mtmd, pos_min);
                 PGD_DBG(req, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
                 if (do_checkpoint) {

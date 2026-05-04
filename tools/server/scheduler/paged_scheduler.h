@@ -49,6 +49,15 @@ public:
             int32_t n_batch,
             int32_t n_ubatch,
             int32_t checkpoint_every_nt);
+    static bool should_checkpoint_progress(
+            const RequestState & req,
+            int64_t n_tokens_cur,
+            int32_t checkpoint_every_nt);
+    static bool should_checkpoint_finalize(
+            const RequestState & req,
+            int64_t n_tokens_cur,
+            bool has_mtmd,
+            llama_pos pos_min);
 
     PagedTickDecision tick(const PagedTickInput & in) const;
 

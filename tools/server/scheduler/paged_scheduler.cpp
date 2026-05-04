@@ -51,6 +51,32 @@ bool PagedScheduler::should_break_for_checkpoint(
     return false;
 }
 
+bool PagedScheduler::should_checkpoint_progress(
+        const RequestState & req,
+        int64_t n_tokens_cur,
+        int32_t checkpoint_every_nt) {
+    int64_t last_checkpoint_nt = 0;
+    if (!req.prompt.checkpoints.empty()) {
+        last_checkpoint_nt = req.prompt.checkpoints.back().n_tokens;
+    }
+    const int64_t n_tokens_processed = req.prompt.n_tokens() - n_tokens_cur;
+    return n_tokens_processed - last_checkpoint_nt >= checkpoint_every_nt;
+}
+
+bool PagedScheduler::should_checkpoint_finalize(
+        const RequestState & req,
+        int64_t n_tokens_cur,
+        bool has_mtmd,
+        llama_pos pos_min) {
+    if (pos_min < 0 || req.prompt.n_tokens() < 64 || has_mtmd) {
+        return false;
+    }
+    if (req.prompt.checkpoints.empty()) {
+        return true;
+    }
+    return req.prompt.n_tokens() - n_tokens_cur > req.prompt.checkpoints.back().n_tokens + 64;
+}
+
 bool PrefillWorkCursor::can_schedule_request() const {
     return prefill_added < prefill_total_budget;
 }
