@@ -14,6 +14,7 @@
 #include "scheduler/paged_scheduler.h"
 #include "scheduler/reservation_model.h"
 #include "scheduler/sampling_executor.h"
+#include "scheduler/scheduler_core.h"
 #include "scheduler/speculative_executor.h"
 #include "scheduler/step_executor.h"
 
@@ -717,6 +718,7 @@ private:
     // Experimental paged-KV block scheduler (--kv-block-scheduler).
     // Null when flag is off; constructed after slots are initialised.
     std::unique_ptr<kv_block_scheduler> kv_sched;
+    server_scheduler::SchedulerCore paged_core;
 
     // Experimental cross-slot KV prefix cache (--kv-prefix-cache).
     // Null when flag is off. Registered on slot release, invalidated on eviction.
@@ -2015,6 +2017,7 @@ private:
         req.drop_cache_on_release = false;
         req.callback_on_release = [this](int32_t sid) {
             register_paged_prefix_cache_on_release(sid);
+            paged_core.on_request_finished(sid);
         };
 
         try_apply_paged_prefix_cache(req, task);
@@ -2040,6 +2043,7 @@ private:
         n_empty_consecutive = 0;
         SRV_INF("[paged] launched request seq_id=%d, task=%d, is_child=%d\n",
                 req.seq_id, req.request_id, req.task->is_child() ? 1 : 0);
+        paged_core.on_request_started(req.seq_id);
         return true;
     }
 
@@ -3371,6 +3375,23 @@ private:
                 queue_tasks.post(std::move(task));
             }
 
+            int32_t max_running = paged_max_full_ctx_concurrency_ > 0 ? paged_max_full_ctx_concurrency_ : (int32_t) paged_requests.size();
+            if (ctx) {
+                const int32_t seq_max = (int32_t) llama_n_seq_max(ctx);
+                if (params_base.paged_admission == "actual-len") {
+                    max_running = seq_max;
+                } else {
+                    max_running = std::min(max_running, seq_max);
+                }
+            }
+            const auto active_seq_vec = paged_core.schedule(
+                paged_requests,
+                std::max(1, max_running),
+                [this](const server_scheduler::RequestState & req) {
+                    return req.task ? paged_admission_available(*req.task) : false;
+                });
+            std::unordered_set<int32_t> active_seq_ids(active_seq_vec.begin(), active_seq_vec.end());
+
             // 3. build batch
             common_batch_clear(batch);
 
@@ -3389,6 +3410,7 @@ private:
                 /*reqs=*/&paged_requests,
                 /*prefill_rr_cursor=*/&paged_prefill_rr_cursor,
                 /*batch=*/&batch,
+                /*active_seq_ids=*/&active_seq_ids,
                 /*n_batch=*/n_batch,
                 /*n_ubatch=*/n_ubatch,
                 /*decode_tokens_in_batch=*/0,

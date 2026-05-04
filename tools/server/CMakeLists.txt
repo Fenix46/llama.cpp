@@ -50,6 +50,8 @@ add_library(${TARGET} STATIC
     scheduler/paged_scheduler.h
     scheduler/scheduler_metrics.cpp
     scheduler/scheduler_metrics.h
+    scheduler/scheduler_core.cpp
+    scheduler/scheduler_core.h
     scheduler/legacy_slot_adapter.cpp
     scheduler/legacy_slot_adapter.h
 )

@@ -3,6 +3,7 @@
 #include "batch_planner.h"
 #include "prefill_policy.h"
 #include "llama.h"
+#include <unordered_set>
 
 namespace server_scheduler {
 
@@ -17,6 +18,7 @@ struct PagedTickInput {
     std::vector<RequestState> * reqs = nullptr;
     size_t * prefill_rr_cursor = nullptr;
     llama_batch * batch = nullptr;
+    const std::unordered_set<int32_t> * active_seq_ids = nullptr;
     int32_t n_batch = 0;
     int32_t n_ubatch = 0;
     int32_t decode_tokens_in_batch = 0;
@@ -36,7 +38,8 @@ public:
             size_t & prefill_rr_cursor,
             int32_t n_batch,
             int32_t n_ubatch,
-            int32_t decode_tokens_in_batch) const;
+            int32_t decode_tokens_in_batch,
+            const std::unordered_set<int32_t> * active_seq_ids = nullptr) const;
 
     DecodeBatchResult populate_decode_batch(
             std::vector<RequestState> & reqs,
