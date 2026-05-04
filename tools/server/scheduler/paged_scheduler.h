@@ -9,11 +9,14 @@ namespace server_scheduler {
 struct PagedTickDecision {
     std::vector<size_t> prefill_candidates;
     PrefillBudgetDecision budget;
+    int32_t first_decode_request_index = -1;
+    int32_t decode_tokens_in_batch = 0;
 };
 
 struct PagedTickInput {
-    const std::vector<RequestState> * reqs = nullptr;
+    std::vector<RequestState> * reqs = nullptr;
     size_t * prefill_rr_cursor = nullptr;
+    llama_batch * batch = nullptr;
     int32_t n_batch = 0;
     int32_t n_ubatch = 0;
     int32_t decode_tokens_in_batch = 0;
@@ -26,7 +29,6 @@ struct DecodeBatchResult {
 
 class PagedScheduler {
 public:
-    std::vector<size_t> collect_decode_candidates(const std::vector<RequestState> & reqs) const;
     PagedTickDecision tick(const PagedTickInput & in) const;
 
     PagedTickDecision prepare_tick(

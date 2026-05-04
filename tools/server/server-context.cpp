@@ -3384,26 +3384,23 @@ private:
                     req.task->params.sampling.preserved_tokens.find(token) != req.task->params.sampling.preserved_tokens.end();
             };
 
-            const auto decode_candidates = paged_sched.collect_decode_candidates(paged_requests);
-            const auto decode_batch = paged_sched.populate_decode_batch(
-                paged_requests, decode_candidates, batch);
-            if (decode_batch.first_decode_request_index >= 0) {
-                req_batched = &paged_requests[(size_t) decode_batch.first_decode_request_index];
+            const auto tick_decision = paged_sched.tick(server_scheduler::PagedTickInput{
+                /*reqs=*/&paged_requests,
+                /*prefill_rr_cursor=*/&paged_prefill_rr_cursor,
+                /*batch=*/&batch,
+                /*n_batch=*/n_batch,
+                /*n_ubatch=*/n_ubatch,
+                /*decode_tokens_in_batch=*/0,
+            });
+            if (tick_decision.first_decode_request_index >= 0) {
+                req_batched = &paged_requests[(size_t) tick_decision.first_decode_request_index];
             }
 
-            const int32_t decode_tokens_in_batch = decode_batch.decode_tokens_in_batch;
+            const int32_t decode_tokens_in_batch = tick_decision.decode_tokens_in_batch;
             int32_t       prefill_budget         = std::max(0, n_batch - decode_tokens_in_batch);
             int32_t       prefill_added          = 0;
 
             SRV_DBG("[paged] decode_tokens=%d, prefill_budget=%d\n", decode_tokens_in_batch, prefill_budget);
-
-            const auto tick_decision = paged_sched.tick(server_scheduler::PagedTickInput{
-                /*reqs=*/&paged_requests,
-                /*prefill_rr_cursor=*/&paged_prefill_rr_cursor,
-                /*n_batch=*/n_batch,
-                /*n_ubatch=*/n_ubatch,
-                /*decode_tokens_in_batch=*/decode_tokens_in_batch,
-            });
             const auto & prefill_candidates = tick_decision.prefill_candidates;
             const auto budget = tick_decision.budget;
             prefill_budget = budget.prefill_total_budget;
