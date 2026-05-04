@@ -3796,22 +3796,7 @@ private:
                 cur_n_batch = n_batch;
 
                 // 4a. handle parent→child KV copy for n_cmpl > 1
-                for (auto & req : paged_requests) {
-                    if (req.phase == PAGED_REQUEST_DONE_PREFILL && req.task->is_parent()) {
-                        std::vector<paged_request_state *> children;
-                        for (auto & other : paged_requests) {
-                            if (other.phase == PAGED_REQUEST_WAIT_PARENT &&
-                                req.task->id == other.task->id_parent) {
-                                children.push_back(&other);
-                            }
-                        }
-                        for (auto * child : children) {
-                            PGD_INF(req, "copying state to child seq_id=%d\n", child->seq_id);
-                            child->copy_state_from(req);
-                            child->phase = PAGED_REQUEST_DONE_PREFILL;
-                        }
-                    }
-                }
+                server_scheduler::SamplingExecutor::propagate_parent_state(paged_requests);
 
                 // 4b. send prompt-progress updates and do sampling
                 for (auto & req : paged_requests) {
