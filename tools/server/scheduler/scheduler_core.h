@@ -29,6 +29,7 @@ public:
         int32_t deferred = 0;
         int32_t preempted = 0;
         std::unordered_map<std::string, int32_t> deferred_reasons;
+        std::unordered_map<std::string, int32_t> preempted_reasons;
         int32_t decode_quota = 0;
         PrefillBudgetDecision budget;
     };
@@ -40,6 +41,10 @@ public:
         int32_t n_ubatch = 0;
         int32_t decode_tokens_in_batch = 0;
         int32_t n_prefill_candidates = 0;
+        int32_t kv_total_blocks = 0;
+        int32_t kv_reserved_blocks = 0;
+        int32_t kv_active_requests = 0;
+        float kv_pressure_ratio = 0.0f;
         std::function<AdmissionEval(const RequestState &)> can_admit;
     };
 
@@ -59,6 +64,7 @@ public:
             int32_t n_prefill_candidates) const;
 
     bool is_active(int32_t seq_id) const;
+    static std::string normalize_reason(const std::string & reason);
 
 private:
     std::deque<int32_t> waiting_;

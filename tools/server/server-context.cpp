@@ -3413,6 +3413,10 @@ private:
 
             const int32_t n_batch  = llama_n_batch(ctx);
             const int32_t n_ubatch = llama_n_ubatch(ctx);
+            const auto blk_stats = server_scheduler::BlockManager::stats(paged_requests);
+            const float kv_pressure_ratio = paged_total_blocks_ > 0
+                ? (float) blk_stats.reserved_blocks / (float) paged_total_blocks_
+                : 0.0f;
             const auto schedule_decision = paged_core.schedule(server_scheduler::SchedulerCore::RuntimeSnapshot{
                 /*reqs=*/&paged_requests,
                 /*max_running=*/std::max(1, max_running),
@@ -3420,6 +3424,10 @@ private:
                 /*n_ubatch=*/n_ubatch,
                 /*decode_tokens_in_batch=*/0,
                 /*n_prefill_candidates=*/(int32_t) paged_requests.size(),
+                /*kv_total_blocks=*/paged_total_blocks_,
+                /*kv_reserved_blocks=*/blk_stats.reserved_blocks,
+                /*kv_active_requests=*/blk_stats.active_requests,
+                /*kv_pressure_ratio=*/kv_pressure_ratio,
                 /*can_admit=*/[this](const server_scheduler::RequestState & req) {
                     if (!req.task) {
                         return server_scheduler::SchedulerCore::AdmissionEval{

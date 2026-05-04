@@ -4,6 +4,19 @@
 
 namespace server_scheduler {
 
+std::string SchedulerCore::normalize_reason(const std::string & reason) {
+    if (reason == "request-cap" || reason == "kv-pressure" || reason == "policy-deferral") {
+        return reason;
+    }
+    if (reason == "block-cap") {
+        return "kv-pressure";
+    }
+    if (reason.empty()) {
+        return "policy-deferral";
+    }
+    return "policy-deferral";
+}
+
 void SchedulerCore::on_request_started(int32_t seq_id) {
     if (seq_id < 0) {
         return;
@@ -101,7 +114,7 @@ SchedulerCore::ScheduleDecision SchedulerCore::schedule(
             waiting_.push_back(seq_id);
             waiting_set_.insert(seq_id);
             decision.deferred++;
-            decision.deferred_reasons[admission.reason.empty() ? "deferred" : admission.reason]++;
+            decision.deferred_reasons[normalize_reason(admission.reason)]++;
             break;
         }
 
@@ -128,6 +141,7 @@ SchedulerCore::ScheduleDecision SchedulerCore::schedule(
         waiting_set_.insert(preempted);
         decision.preempted++;
         decision.preempted_seq_ids.push_back(preempted);
+        decision.preempted_reasons["preempted-for-fairness"]++;
 
         const int32_t candidate = waiting_.front();
         waiting_.pop_front();
@@ -145,7 +159,7 @@ SchedulerCore::ScheduleDecision SchedulerCore::schedule(
                 waiting_.push_back(candidate);
                 waiting_set_.insert(candidate);
                 decision.deferred++;
-                decision.deferred_reasons[admission.reason.empty() ? "deferred" : admission.reason]++;
+                decision.deferred_reasons[normalize_reason(admission.reason)]++;
             }
         }
     }
@@ -160,7 +174,27 @@ SchedulerCore::ScheduleDecision SchedulerCore::schedule(const RuntimeSnapshot & 
     GGML_ASSERT(snapshot.reqs != nullptr);
     GGML_ASSERT(snapshot.can_admit);
 
-    auto out = schedule(*snapshot.reqs, snapshot.max_running, snapshot.can_admit);
+    int32_t eff_max_running = snapshot.max_running;
+    if (snapshot.kv_total_blocks > 0) {
+        const float pressure = snapshot.kv_pressure_ratio > 0.0f
+            ? snapshot.kv_pressure_ratio
+            : (float) snapshot.kv_reserved_blocks / (float) snapshot.kv_total_blocks;
+        if (pressure >= 0.95f && eff_max_running > 1) {
+            eff_max_running -= 1;
+        }
+    }
+
+    auto out = schedule(*snapshot.reqs, eff_max_running, snapshot.can_admit);
+
+    if (snapshot.kv_total_blocks > 0) {
+        const float pressure = snapshot.kv_pressure_ratio > 0.0f
+            ? snapshot.kv_pressure_ratio
+            : (float) snapshot.kv_reserved_blocks / (float) snapshot.kv_total_blocks;
+        if (pressure >= 0.95f && out.preempted > 0) {
+            out.preempted_reasons["kv-pressure"] += out.preempted;
+        }
+    }
+
     out.decode_quota = std::max(1, (int32_t) out.running_seq_ids.size());
     out.budget = compute_prefill_budget(
         snapshot.n_batch,

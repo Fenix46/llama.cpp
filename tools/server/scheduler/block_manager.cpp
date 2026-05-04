@@ -98,4 +98,18 @@ bool BlockManager::truncate_seq_tail(llama_context * ctx, int32_t seq_id, llama_
     return llama_memory_seq_rm(llama_get_memory(ctx), seq_id, from_pos, -1);
 }
 
+llama_pos BlockManager::seq_pos_min(llama_context * ctx, int32_t seq_id) {
+    if (!ctx) {
+        return -1;
+    }
+    return llama_memory_seq_pos_min(llama_get_memory(ctx), seq_id);
+}
+
+llama_pos BlockManager::seq_pos_max(llama_context * ctx, int32_t seq_id) {
+    if (!ctx) {
+        return -1;
+    }
+    return llama_memory_seq_pos_max(llama_get_memory(ctx), seq_id);
+}
+
 } // namespace server_scheduler

@@ -29,6 +29,8 @@ public:
     static bool copy_sequence(llama_context * ctx, int32_t src_seq_id, int32_t dst_seq_id);
     static void rebuild_block_table(llama_context * ctx, int32_t seq_id);
     static bool truncate_seq_tail(llama_context * ctx, int32_t seq_id, llama_pos from_pos);
+    static llama_pos seq_pos_min(llama_context * ctx, int32_t seq_id);
+    static llama_pos seq_pos_max(llama_context * ctx, int32_t seq_id);
 };
 
 } // namespace server_scheduler
