@@ -43,10 +43,11 @@ const RequestState * SchedulerCore::find_request(const std::vector<RequestState>
     return nullptr;
 }
 
-void SchedulerCore::schedule(
+SchedulerCore::ScheduleDecision SchedulerCore::schedule(
         const std::vector<RequestState> & reqs,
         int32_t max_running,
-        const std::function<bool(const RequestState &)> & can_admit) {
+        const std::function<AdmissionEval(const RequestState &)> & can_admit) {
+    ScheduleDecision decision;
     if (max_running <= 0) {
         max_running = 1;
     }
@@ -79,14 +80,18 @@ void SchedulerCore::schedule(
             continue;
         }
 
-        if (!can_admit(*req_match)) {
+        const auto admission = can_admit(*req_match);
+        if (!admission.accepted) {
             waiting_.push_back(seq_id);
             waiting_set_.insert(seq_id);
+            decision.deferred++;
+            decision.deferred_reasons[admission.reason.empty() ? "deferred" : admission.reason]++;
             break;
         }
 
         running_.push_back(seq_id);
         running_set_.insert(seq_id);
+        decision.admitted++;
     }
 
     // Minimal preemption policy: if waiting is non-empty and running is at
@@ -105,6 +110,7 @@ void SchedulerCore::schedule(
         running_set_.erase(preempted);
         waiting_.push_back(preempted);
         waiting_set_.insert(preempted);
+        decision.preempted++;
 
         const int32_t candidate = waiting_.front();
         waiting_.pop_front();
@@ -112,16 +118,23 @@ void SchedulerCore::schedule(
 
         const RequestState * req_match = find_request(reqs, candidate);
 
-        if (req_match && can_admit(*req_match)) {
-            running_.push_back(candidate);
-            running_set_.insert(candidate);
-        } else {
-            waiting_.push_back(candidate);
-            waiting_set_.insert(candidate);
+        if (req_match) {
+            const auto admission = can_admit(*req_match);
+            if (admission.accepted) {
+                running_.push_back(candidate);
+                running_set_.insert(candidate);
+                decision.admitted++;
+            } else {
+                waiting_.push_back(candidate);
+                waiting_set_.insert(candidate);
+                decision.deferred++;
+                decision.deferred_reasons[admission.reason.empty() ? "deferred" : admission.reason]++;
+            }
         }
     }
 
-    return;
+    decision.active_seq_ids = running_set_;
+    return decision;
 }
 
 bool SchedulerCore::is_active(int32_t seq_id) const {

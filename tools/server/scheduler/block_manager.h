@@ -11,6 +11,8 @@ public:
     static int32_t total_reserved_blocks(const std::vector<RequestState> & reqs);
     static bool evict_idle_request(std::vector<RequestState> & reqs, int64_t now_us, int64_t idle_thold_us);
 
+    static bool clear_sequence(llama_context * ctx, int32_t seq_id);
+    static bool copy_sequence(llama_context * ctx, int32_t src_seq_id, int32_t dst_seq_id);
     static void rebuild_block_table(llama_context * ctx, int32_t seq_id);
     static bool truncate_seq_tail(llama_context * ctx, int32_t seq_id, llama_pos from_pos);
 };

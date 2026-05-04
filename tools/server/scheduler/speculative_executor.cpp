@@ -1,5 +1,6 @@
 #include "speculative_executor.h"
 
+#include "block_manager.h"
 #include "speculative.h"
 
 #include <algorithm>
@@ -49,7 +50,7 @@ void SpeculativeExecutor::apply_accepted_ids(RequestState & req, const SpecAccep
     req.prompt.tokens.insert({ids.begin(), ids.end() - 1});
 
     req.sampled = ids.back();
-    llama_memory_seq_rm(llama_get_memory(req.ctx), req.seq_id, req.prompt.tokens.pos_next(), -1);
+    BlockManager::truncate_seq_tail(req.ctx, req.seq_id, req.prompt.tokens.pos_next());
 }
 
 std::vector<completion_token_output> SpeculativeExecutor::build_accepted_outputs(

@@ -4,6 +4,21 @@
 
 namespace server_scheduler {
 
+bool PrefillWorkCursor::can_schedule_request() const {
+    return prefill_added < prefill_total_budget;
+}
+
+bool PrefillWorkCursor::can_append_token(int32_t batch_tokens, int32_t n_batch, int32_t req_prefill_added) const {
+    return batch_tokens < n_batch &&
+        prefill_added < prefill_total_budget &&
+        req_prefill_added < prefill_per_request_budget;
+}
+
+void PrefillWorkCursor::on_token_appended(int32_t & req_prefill_added) {
+    ++prefill_added;
+    ++req_prefill_added;
+}
+
 PagedTickDecision PagedScheduler::tick(const PagedTickInput & in) const {
     GGML_ASSERT(in.reqs != nullptr);
     GGML_ASSERT(in.prefill_rr_cursor != nullptr);
@@ -60,6 +75,13 @@ DecodeBatchResult PagedScheduler::populate_decode_batch(
 
     out.decode_tokens_in_batch = batch.n_tokens;
     return out;
+}
+
+PrefillWorkCursor PagedScheduler::make_prefill_cursor(const PrefillBudgetDecision & budget) const {
+    PrefillWorkCursor cur;
+    cur.prefill_total_budget = budget.prefill_total_budget;
+    cur.prefill_per_request_budget = budget.prefill_per_request_budget;
+    return cur;
 }
 
 } // namespace server_scheduler

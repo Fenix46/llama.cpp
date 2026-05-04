@@ -1695,7 +1695,7 @@ private:
                 SRV_WRN("[paged] purging idle req seq_id=%d with %zu tokens\n", req.seq_id, req.prompt.tokens.size());
                 if (req.seq_id >= 0) {
                     prefix_cache_invalidate(req.seq_id);
-                    llama_memory_seq_rm(llama_get_memory(ctx), req.seq_id, -1, -1);
+                    server_scheduler::BlockManager::clear_sequence(ctx, req.seq_id);
                     paged_seq_leases.release_uncached(req.seq_id);
                     req.seq_id = -1;
                 }
@@ -1732,7 +1732,7 @@ private:
     void reset_paged_request_state(paged_request_state & req, const char * reason) {
         if (req.seq_id >= 0) {
             prefix_cache_invalidate(req.seq_id);
-            (void) llama_memory_seq_rm(llama_get_memory(ctx), req.seq_id, -1, -1);
+            (void) server_scheduler::BlockManager::clear_sequence(ctx, req.seq_id);
             assert_paged_seq_cleared(req);
         }
 
@@ -1767,7 +1767,7 @@ private:
                 reset_paged_request_state(*req, "release-uncached");
             } else if (seq_id >= 0) {
                 prefix_cache_invalidate(seq_id);
-                (void) llama_memory_seq_rm(llama_get_memory(ctx), seq_id, -1, -1);
+                (void) server_scheduler::BlockManager::clear_sequence(ctx, seq_id);
                 server_scheduler::BlockManager::rebuild_block_table(ctx, seq_id);
                 GGML_ASSERT(llama_memory_seq_pos_min(llama_get_memory(ctx), seq_id) == -1);
                 GGML_ASSERT(llama_memory_seq_pos_max(llama_get_memory(ctx), seq_id) == -1);
@@ -1812,12 +1812,8 @@ private:
 
         reset_paged_request_state(req, "prefix-reuse");
 
-        llama_memory_seq_cp(
-            llama_get_memory(ctx),
-            donor->seq_id,
-            req.seq_id,
-            0,
-            (llama_pos) res.n_cached_tokens);
+        server_scheduler::BlockManager::copy_sequence(ctx, donor->seq_id, req.seq_id);
+        server_scheduler::BlockManager::truncate_seq_tail(ctx, req.seq_id, (llama_pos) res.n_cached_tokens);
         prefix_cache_->record_reuse(res.n_cached_tokens);
 
         const auto & donor_toks = donor->prompt.tokens.get_tokens();
@@ -1970,7 +1966,7 @@ private:
             if (!are_lora_equal(task_loras, req.lora)) {
                 if (lora_should_clear_cache(req.lora, task_loras)) {
                     prefix_cache_invalidate(req.seq_id);
-                    llama_memory_seq_rm(llama_get_memory(ctx), req.seq_id, -1, -1);
+                    server_scheduler::BlockManager::clear_sequence(ctx, req.seq_id);
                     req.prompt.tokens.clear();
                     req.prompt.checkpoints.clear();
                 }
@@ -2842,9 +2838,9 @@ private:
         return server_scheduler::BlockManager::total_reserved_blocks(paged_requests);
     }
 
-    bool paged_admission_available(const server_task & task) const {
+    server_scheduler::AdmissionDecision paged_admission_decision(const server_task & task) const {
         const int32_t running = count_paged_active_requests();
-        const auto decision = server_scheduler::paged_admission_available(
+        auto decision = server_scheduler::paged_admission_available(
             task,
             params_base,
             paged_requests,
@@ -2860,7 +2856,11 @@ private:
                     decision.reason.c_str(), running, params_base.paged_admission.c_str());
         }
 
-        return decision.accepted;
+        return decision;
+    }
+
+    bool paged_admission_available(const server_task & task) const {
+        return paged_admission_decision(task).accepted;
     }
 
     // launch multiple slots for parent + child tasks
@@ -3385,13 +3385,20 @@ private:
                     max_running = std::min(max_running, seq_max);
                 }
             }
-            paged_core.schedule(
+            const auto schedule_decision = paged_core.schedule(
                 paged_requests,
                 std::max(1, max_running),
                 [this](const server_scheduler::RequestState & req) {
-                    return req.task ? paged_admission_available(*req.task) : false;
+                    if (!req.task) {
+                        return server_scheduler::SchedulerCore::AdmissionEval{ false, "no-task" };
+                    }
+                    const auto admission = paged_admission_decision(*req.task);
+                    return server_scheduler::SchedulerCore::AdmissionEval{
+                        admission.accepted,
+                        admission.reason,
+                    };
                 });
-            const auto active_seq_ids = paged_core.active_set();
+            const auto & active_seq_ids = schedule_decision.active_seq_ids;
 
             // 3. build batch
             common_batch_clear(batch);
@@ -3419,17 +3426,16 @@ private:
 
             const int32_t decode_tokens_in_batch = tick_decision.decode_tokens_in_batch;
             int32_t       prefill_budget         = std::max(0, n_batch - decode_tokens_in_batch);
-            int32_t       prefill_added          = 0;
 
             SRV_DBG("[paged] decode_tokens=%d, prefill_budget=%d\n", decode_tokens_in_batch, prefill_budget);
             const auto & prefill_candidates = tick_decision.prefill_candidates;
             const auto budget = tick_decision.budget;
             prefill_budget = budget.prefill_total_budget;
-            const int32_t prefill_per_req_budget = budget.prefill_per_request_budget;
+            auto prefill_cursor = paged_sched.make_prefill_cursor(budget);
 
             for (size_t idx : prefill_candidates) {
                 auto & req = paged_requests[idx];
-                if (prefill_added >= prefill_budget) {
+                if (!prefill_cursor.can_schedule_request()) {
                     continue;
                 }
                 int32_t req_prefill_added = 0;
@@ -3607,9 +3613,7 @@ private:
 
                 // fill batch with prompt tokens
                 while (req.prompt.n_tokens() < req.task->n_tokens() &&
-                       batch.n_tokens < n_batch &&
-                       prefill_added < prefill_budget &&
-                       req_prefill_added < prefill_per_req_budget) {
+                       prefill_cursor.can_append_token(batch.n_tokens, n_batch, req_prefill_added)) {
 
                     // handle multimodal chunks
                     while (req.prompt.n_tokens() < req.task->n_tokens() &&
@@ -3641,8 +3645,7 @@ private:
                     }
 
                     common_batch_add(batch, cur_tok, req.prompt.tokens.pos_next(), { req.seq_id }, req.task->need_embd());
-                    prefill_added++;
-                    req_prefill_added++;
+                    prefill_cursor.on_token_appended(req_prefill_added);
                     req.prompt.tokens.push_back(cur_tok);
                     req.n_prompt_tokens_processed++;
 

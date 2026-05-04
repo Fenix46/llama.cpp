@@ -29,6 +29,16 @@ struct DecodeBatchResult {
     int32_t first_decode_request_index = -1;
 };
 
+struct PrefillWorkCursor {
+    int32_t prefill_total_budget = 0;
+    int32_t prefill_per_request_budget = 0;
+    int32_t prefill_added = 0;
+
+    bool can_schedule_request() const;
+    bool can_append_token(int32_t batch_tokens, int32_t n_batch, int32_t req_prefill_added) const;
+    void on_token_appended(int32_t & req_prefill_added);
+};
+
 class PagedScheduler {
 public:
     PagedTickDecision tick(const PagedTickInput & in) const;
@@ -45,6 +55,7 @@ public:
             std::vector<RequestState> & reqs,
             const std::vector<size_t> & decode_candidates,
             llama_batch & batch) const;
+    PrefillWorkCursor make_prefill_cursor(const PrefillBudgetDecision & budget) const;
 
 private:
     BatchPlanner planner_;

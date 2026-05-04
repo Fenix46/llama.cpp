@@ -16,10 +16,10 @@ SchedulePolicyDecision SchedPolicy::compute(const SchedulePolicyInput & in) cons
         }
     }
 
-    core.schedule(*in.reqs, in.max_running, in.can_admit);
+    const auto decision = core.schedule(*in.reqs, in.max_running, in.can_admit);
 
     SchedulePolicyDecision out;
-    out.active_seq_ids = core.active_set();
+    out.active_seq_ids = decision.active_seq_ids;
     out.budget = compute_prefill_budget(
         in.n_batch, in.n_ubatch, in.decode_tokens_in_batch, in.n_prefill_candidates);
     return out;

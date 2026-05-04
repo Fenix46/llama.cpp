@@ -48,6 +48,22 @@ bool BlockManager::evict_idle_request(std::vector<RequestState> & reqs, int64_t 
     return false;
 }
 
+bool BlockManager::clear_sequence(llama_context * ctx, int32_t seq_id) {
+    if (!ctx) {
+        return false;
+    }
+    return llama_memory_seq_rm(llama_get_memory(ctx), seq_id, -1, -1);
+}
+
+bool BlockManager::copy_sequence(llama_context * ctx, int32_t src_seq_id, int32_t dst_seq_id) {
+    if (!ctx) {
+        return false;
+    }
+    clear_sequence(ctx, dst_seq_id);
+    llama_memory_seq_cp(llama_get_memory(ctx), src_seq_id, dst_seq_id, -1, -1);
+    return true;
+}
+
 void BlockManager::rebuild_block_table(llama_context * ctx, int32_t seq_id) {
     if (!ctx) {
         return;

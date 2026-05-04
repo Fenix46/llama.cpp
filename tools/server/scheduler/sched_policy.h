@@ -2,6 +2,7 @@
 
 #include "prefill_policy.h"
 #include "request_state.h"
+#include "scheduler_core.h"
 
 #include <cstdint>
 #include <functional>
@@ -19,7 +20,7 @@ struct SchedulePolicyInput {
     int32_t n_ubatch = 0;
     int32_t decode_tokens_in_batch = 0;
     int32_t n_prefill_candidates = 0;
-    std::function<bool(const RequestState &)> can_admit;
+    std::function<SchedulerCore::AdmissionEval(const RequestState &)> can_admit;
 };
 
 struct SchedulePolicyDecision {
