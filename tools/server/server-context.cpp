@@ -3796,7 +3796,7 @@ private:
                         }
                     }
 
-                    if (req.i_batch < (int) i || req.i_batch >= (int) (i + n_tokens)) {
+                    if (!server_scheduler::SamplingExecutor::can_sample_in_segment(req, i, n_tokens)) {
                         continue;
                     }
 
@@ -3816,32 +3816,23 @@ private:
                         continue;
                     }
 
-                    if (req.can_speculate() && !req.spec.spec_draft.empty()) {
-                        continue; // sampled via speculative path below
+                    const auto sample = server_scheduler::SamplingExecutor::sample_token(req, i);
+                    if (!sample.ok) {
+                        continue;
                     }
-
-                    const int tok_idx = req.i_batch - i;
-
-                    llama_token id = common_sampler_sample(req.smpl.get(), req.ctx, tok_idx);
-                    req.i_batch = -1;
-                    common_sampler_accept(req.smpl.get(), id, true);
-
-                    const int64_t t_current = ggml_time_us();
-                    const int32_t n_before = req.n_decoded;
-                    server_scheduler::SamplingExecutor::on_sampled_token(req, t_current);
-                    if (n_before == 0 && req.n_decoded == 1) {
+                    if (sample.first_token) {
                         metrics.on_prompt_eval(req);
                     }
 
                     completion_token_output result;
-                    result.tok          = id;
+                    result.tok          = sample.token;
                     result.text_to_send = common_token_to_piece(req.ctx, result.tok,
                                              accept_special_token_paged(req, result.tok));
                     result.prob         = 1.0f;
 
                     if (req.task->params.sampling.n_probs > 0) {
                         populate_token_probs(req, result, req.task->params.post_sampling_probs,
-                                             params_base.special, tok_idx);
+                                             params_base.special, sample.tok_idx);
                     }
 
                     if (!process_token(result, req)) {

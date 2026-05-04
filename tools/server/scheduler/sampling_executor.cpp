@@ -33,6 +33,34 @@ SamplingExecutor::PrefillAction SamplingExecutor::prefill_action(RequestState & 
     return maybe_start_decoding(req) ? PrefillAction::EnterDecoding : PrefillAction::None;
 }
 
+bool SamplingExecutor::can_sample_in_segment(const RequestState & req, int32_t i, int32_t n_tokens) {
+    return req.i_batch >= i && req.i_batch < i + n_tokens;
+}
+
+SamplingExecutor::SampleDecision SamplingExecutor::sample_token(RequestState & req, int32_t i) {
+    SampleDecision out;
+    if (req.phase != PAGED_REQUEST_DECODING) {
+        return out;
+    }
+    if (req.can_speculate() && !req.spec.spec_draft.empty()) {
+        return out;
+    }
+
+    const int tok_idx = req.i_batch - i;
+    llama_token id = common_sampler_sample(req.smpl.get(), req.ctx, tok_idx);
+    req.i_batch = -1;
+    common_sampler_accept(req.smpl.get(), id, true);
+
+    const int32_t n_before = req.n_decoded;
+    on_sampled_token(req, ggml_time_us());
+
+    out.ok = true;
+    out.tok_idx = tok_idx;
+    out.token = id;
+    out.first_token = (n_before == 0 && req.n_decoded == 1);
+    return out;
+}
+
 void SamplingExecutor::on_sampled_token(RequestState & req, int64_t t_current_us) {
     req.n_decoded += 1;
 
