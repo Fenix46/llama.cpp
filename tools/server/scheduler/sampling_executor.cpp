@@ -74,7 +74,7 @@ void SamplingExecutor::on_sampled_token(RequestState & req, int64_t t_current_us
 }
 
 void SamplingExecutor::propagate_parent_state(std::vector<RequestState> & reqs) {
-    propagate_parent_prefill(reqs);
+    (void) propagate_parent_prefill(reqs);
 }
 
 } // namespace server_scheduler

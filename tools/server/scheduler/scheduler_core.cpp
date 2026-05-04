@@ -127,6 +127,7 @@ SchedulerCore::ScheduleDecision SchedulerCore::schedule(
         waiting_.push_back(preempted);
         waiting_set_.insert(preempted);
         decision.preempted++;
+        decision.preempted_seq_ids.push_back(preempted);
 
         const int32_t candidate = waiting_.front();
         waiting_.pop_front();
@@ -150,7 +151,23 @@ SchedulerCore::ScheduleDecision SchedulerCore::schedule(
     }
 
     decision.active_seq_ids = running_set_;
+    decision.running_seq_ids.assign(running_.begin(), running_.end());
+    decision.waiting_seq_ids.assign(waiting_.begin(), waiting_.end());
     return decision;
+}
+
+SchedulerCore::ScheduleDecision SchedulerCore::schedule(const RuntimeSnapshot & snapshot) {
+    GGML_ASSERT(snapshot.reqs != nullptr);
+    GGML_ASSERT(snapshot.can_admit);
+
+    auto out = schedule(*snapshot.reqs, snapshot.max_running, snapshot.can_admit);
+    out.decode_quota = std::max(1, (int32_t) out.running_seq_ids.size());
+    out.budget = compute_prefill_budget(
+        snapshot.n_batch,
+        snapshot.n_ubatch,
+        snapshot.decode_tokens_in_batch,
+        snapshot.n_prefill_candidates);
+    return out;
 }
 
 bool SchedulerCore::is_active(int32_t seq_id) const {

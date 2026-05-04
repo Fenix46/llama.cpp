@@ -15,6 +15,22 @@ struct PagedTickDecision {
     int32_t decode_tokens_in_batch = 0;
 };
 
+struct PagedRuntime {
+    std::vector<RequestState> * reqs = nullptr;
+    size_t * prefill_rr_cursor = nullptr;
+    llama_batch * batch = nullptr;
+    const std::unordered_set<int32_t> * active_seq_ids = nullptr;
+    int32_t n_batch = 0;
+    int32_t n_ubatch = 0;
+    SchedulerCore::ScheduleDecision schedule_decision;
+};
+
+struct TickOutcome {
+    PagedTickDecision decision;
+    std::vector<size_t> decode_rows;
+    std::vector<size_t> prefill_rows;
+};
+
 struct PagedTickInput {
     std::vector<RequestState> * reqs = nullptr;
     size_t * prefill_rr_cursor = nullptr;
@@ -59,6 +75,7 @@ public:
             bool has_mtmd,
             llama_pos pos_min);
 
+    TickOutcome tick(const PagedRuntime & runtime) const;
     PagedTickDecision tick(const PagedTickInput & in) const;
 
     PagedTickDecision prepare_tick(

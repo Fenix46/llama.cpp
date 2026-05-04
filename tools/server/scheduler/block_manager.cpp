@@ -48,6 +48,26 @@ bool BlockManager::evict_idle_request(std::vector<RequestState> & reqs, int64_t 
     return false;
 }
 
+bool BlockManager::evict(const PolicyContext & ctx) {
+    if (ctx.reqs == nullptr) {
+        return false;
+    }
+    return evict_idle_request(*ctx.reqs, ctx.now_us, ctx.idle_threshold_us);
+}
+
+BlockManager::Stats BlockManager::stats(const std::vector<RequestState> & reqs) {
+    Stats out;
+    for (const auto & req : reqs) {
+        if (req.is_processing()) {
+            out.active_requests++;
+            out.reserved_blocks += req.reserved_blocks;
+        } else if (req.prompt.n_tokens() > 0) {
+            out.cached_idle_requests++;
+        }
+    }
+    return out;
+}
+
 bool BlockManager::clear_sequence(llama_context * ctx, int32_t seq_id) {
     if (!ctx) {
         return false;

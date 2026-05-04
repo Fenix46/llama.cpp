@@ -35,11 +35,13 @@ bool transition(RequestState & req, RequestEvent ev) {
     return false;
 }
 
-void propagate_parent_prefill(std::vector<RequestState> & reqs) {
+GroupPropagationResult propagate_parent_prefill(std::vector<RequestState> & reqs) {
+    GroupPropagationResult out;
     for (auto & req : reqs) {
         if (req.phase != PAGED_REQUEST_DONE_PREFILL || !req.task || !req.task->is_parent()) {
             continue;
         }
+        out.parents_processed++;
 
         for (auto & child : reqs) {
             if (child.phase == PAGED_REQUEST_WAIT_PARENT &&
@@ -47,9 +49,11 @@ void propagate_parent_prefill(std::vector<RequestState> & reqs) {
                 req.task->id == child.task->id_parent) {
                 child.copy_state_from(req);
                 child.phase = PAGED_REQUEST_DONE_PREFILL;
+                out.children_activated++;
             }
         }
     }
+    return out;
 }
 
 } // namespace server_scheduler

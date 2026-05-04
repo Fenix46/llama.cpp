@@ -1687,12 +1687,21 @@ private:
         if (!params_base.kv_unified) {
             return false;
         }
+        const bool evicted = server_scheduler::BlockManager::evict(
+            server_scheduler::BlockManager::PolicyContext{
+                /*reqs=*/&paged_requests,
+                /*now_us=*/ggml_time_us(),
+                /*idle_threshold_us=*/0,
+            });
+        if (!evicted) {
+            return false;
+        }
         for (auto & req : paged_requests) {
             if (req.is_processing()) {
                 continue;
             }
-            if (req.prompt.n_tokens() > 0) {
-                SRV_WRN("[paged] purging idle req seq_id=%d with %zu tokens\n", req.seq_id, req.prompt.tokens.size());
+            if (req.prompt.n_tokens() == 0 && req.seq_id >= 0) {
+                SRV_WRN("[paged] purging idle req seq_id=%d\n", req.seq_id);
                 if (req.seq_id >= 0) {
                     prefix_cache_invalidate(req.seq_id);
                     server_scheduler::BlockManager::clear_sequence(ctx, req.seq_id);
@@ -1704,7 +1713,7 @@ private:
                 return true;
             }
         }
-        return false;
+        return true;
     }
 
     paged_request_state * get_paged_request_by_seq_id(int32_t seq_id) {
@@ -3385,10 +3394,19 @@ private:
                     max_running = std::min(max_running, seq_max);
                 }
             }
-            const auto schedule_decision = paged_core.schedule(
-                paged_requests,
-                std::max(1, max_running),
-                [this](const server_scheduler::RequestState & req) {
+            // 3. build batch
+            common_batch_clear(batch);
+
+            const int32_t n_batch  = llama_n_batch(ctx);
+            const int32_t n_ubatch = llama_n_ubatch(ctx);
+            const auto schedule_decision = paged_core.schedule(server_scheduler::SchedulerCore::RuntimeSnapshot{
+                /*reqs=*/&paged_requests,
+                /*max_running=*/std::max(1, max_running),
+                /*n_batch=*/n_batch,
+                /*n_ubatch=*/n_ubatch,
+                /*decode_tokens_in_batch=*/0,
+                /*n_prefill_candidates=*/(int32_t) paged_requests.size(),
+                /*can_admit=*/[this](const server_scheduler::RequestState & req) {
                     if (!req.task) {
                         return server_scheduler::SchedulerCore::AdmissionEval{ false, "no-task" };
                     }
@@ -3397,14 +3415,9 @@ private:
                         admission.accepted,
                         admission.reason,
                     };
-                });
+                },
+            });
             const auto & active_seq_ids = schedule_decision.active_seq_ids;
-
-            // 3. build batch
-            common_batch_clear(batch);
-
-            const int32_t n_batch  = llama_n_batch(ctx);
-            const int32_t n_ubatch = llama_n_ubatch(ctx);
 
             paged_request_state * req_batched = nullptr;
             auto accept_special_token_paged = [&](const paged_request_state & req, llama_token token) {
@@ -3412,14 +3425,16 @@ private:
                     req.task->params.sampling.preserved_tokens.find(token) != req.task->params.sampling.preserved_tokens.end();
             };
 
-            const auto tick_decision = paged_sched.tick(server_scheduler::PagedTickInput{
+            const auto tick_outcome = paged_sched.tick(server_scheduler::PagedRuntime{
                 /*reqs=*/&paged_requests,
                 /*prefill_rr_cursor=*/&paged_prefill_rr_cursor,
                 /*batch=*/&batch,
                 /*active_seq_ids=*/&active_seq_ids,
                 /*n_batch=*/n_batch,
                 /*n_ubatch=*/n_ubatch,
+                /*schedule_decision=*/schedule_decision,
             });
+            const auto & tick_decision = tick_outcome.decision;
             if (tick_decision.first_decode_request_index >= 0) {
                 req_batched = &paged_requests[(size_t) tick_decision.first_decode_request_index];
             }

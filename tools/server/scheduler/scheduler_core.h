@@ -22,10 +22,25 @@ public:
 
     struct ScheduleDecision {
         std::unordered_set<int32_t> active_seq_ids;
+        std::vector<int32_t> running_seq_ids;
+        std::vector<int32_t> waiting_seq_ids;
+        std::vector<int32_t> preempted_seq_ids;
         int32_t admitted = 0;
         int32_t deferred = 0;
         int32_t preempted = 0;
         std::unordered_map<std::string, int32_t> deferred_reasons;
+        int32_t decode_quota = 0;
+        PrefillBudgetDecision budget;
+    };
+
+    struct RuntimeSnapshot {
+        const std::vector<RequestState> * reqs = nullptr;
+        int32_t max_running = 1;
+        int32_t n_batch = 0;
+        int32_t n_ubatch = 0;
+        int32_t decode_tokens_in_batch = 0;
+        int32_t n_prefill_candidates = 0;
+        std::function<AdmissionEval(const RequestState &)> can_admit;
     };
 
     void on_request_started(int32_t seq_id);
@@ -35,6 +50,7 @@ public:
             const std::vector<RequestState> & reqs,
             int32_t max_running,
             const std::function<AdmissionEval(const RequestState &)> & can_admit);
+    ScheduleDecision schedule(const RuntimeSnapshot & snapshot);
     std::unordered_set<int32_t> active_set() const;
     PrefillBudgetDecision compute_prefill_budget(
             int32_t n_batch,

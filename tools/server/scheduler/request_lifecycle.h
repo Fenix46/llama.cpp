@@ -14,6 +14,12 @@ enum class RequestEvent {
 };
 
 bool transition(RequestState & req, RequestEvent ev);
-void propagate_parent_prefill(std::vector<RequestState> & reqs);
+
+struct GroupPropagationResult {
+    int32_t parents_processed = 0;
+    int32_t children_activated = 0;
+};
+
+GroupPropagationResult propagate_parent_prefill(std::vector<RequestState> & reqs);
 
 } // namespace server_scheduler

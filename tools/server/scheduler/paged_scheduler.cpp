@@ -4,6 +4,27 @@
 
 namespace server_scheduler {
 
+TickOutcome PagedScheduler::tick(const PagedRuntime & runtime) const {
+    GGML_ASSERT(runtime.reqs != nullptr);
+    GGML_ASSERT(runtime.prefill_rr_cursor != nullptr);
+    GGML_ASSERT(runtime.batch != nullptr);
+
+    TickOutcome out;
+    out.decode_rows = planner_.collect_decode_candidates(*runtime.reqs, runtime.active_seq_ids);
+    const auto dec = populate_decode_batch(*runtime.reqs, out.decode_rows, *runtime.batch);
+    out.decision = prepare_tick(
+        *runtime.reqs,
+        *runtime.prefill_rr_cursor,
+        runtime.n_batch,
+        runtime.n_ubatch,
+        dec.decode_tokens_in_batch,
+        runtime.active_seq_ids);
+    out.decision.first_decode_request_index = dec.first_decode_request_index;
+    out.decision.decode_tokens_in_batch = dec.decode_tokens_in_batch;
+    out.prefill_rows = out.decision.prefill_candidates;
+    return out;
+}
+
 bool PagedScheduler::should_begin_prefill(const RequestState & req) {
     return req.phase == PAGED_REQUEST_STARTED;
 }
@@ -98,19 +119,16 @@ PagedTickDecision PagedScheduler::tick(const PagedTickInput & in) const {
     GGML_ASSERT(in.batch != nullptr);
     auto & reqs = *in.reqs;
 
-    std::vector<size_t> decode_candidates = planner_.collect_decode_candidates(reqs, in.active_seq_ids);
-    DecodeBatchResult dec = populate_decode_batch(reqs, decode_candidates, *in.batch);
-
-    PagedTickDecision out = prepare_tick(
-        reqs,
-        *in.prefill_rr_cursor,
-        in.n_batch,
-        in.n_ubatch,
-        dec.decode_tokens_in_batch,
-        in.active_seq_ids);
-    out.first_decode_request_index = dec.first_decode_request_index;
-    out.decode_tokens_in_batch = dec.decode_tokens_in_batch;
-    return out;
+    auto out = tick(PagedRuntime{
+        /*reqs=*/&reqs,
+        /*prefill_rr_cursor=*/in.prefill_rr_cursor,
+        /*batch=*/in.batch,
+        /*active_seq_ids=*/in.active_seq_ids,
+        /*n_batch=*/in.n_batch,
+        /*n_ubatch=*/in.n_ubatch,
+        /*schedule_decision=*/{},
+    });
+    return out.decision;
 }
 
 PagedTickDecision PagedScheduler::prepare_tick(
