@@ -41,15 +41,18 @@
 // kv_block_scheduler_snapshot — point-in-time state capture
 // -----------------------------------------------------------------------------
 struct kv_block_scheduler_snapshot {
-    uint32_t n_blocks_total  = 0;
-    uint32_t n_blocks_used   = 0;
-    uint32_t n_blocks_free   = 0;
-    uint32_t block_size      = 0;
-    size_t   n_pages_mapped  = 0;
-    float    fragmentation   = 0.0f;
+    uint32_t n_blocks_total           = 0;
+    uint32_t n_blocks_used            = 0;
+    uint32_t n_blocks_free            = 0;
+    uint32_t block_size               = 0;
+    size_t   n_pages_mapped           = 0;
+    float    fragmentation            = 0.0f;  // free/total (utilization inverse)
+    float    true_fragmentation       = 0.0f;  // wasted_reservation / total
+    int32_t  n_blocks_actually_used   = 0;     // ceil(prompt_tokens / block_size) per active req
+    int32_t  n_blocks_wasted_reserved = 0;     // reserved - actually_used (over-reservation)
 
-    int32_t  n_active_slots  = 0;
-    int32_t  n_total_slots   = 0;
+    int32_t  n_active_slots    = 0;
+    int32_t  n_total_slots     = 0;
     int32_t  n_reserved_blocks = 0;
 
     double   tokens_per_sec  = 0.0;
@@ -102,6 +105,7 @@ public:
     //   sched_deferred_reasons  — reason → count map for deferred reqs
     //   sched_preempted_reasons — reason → count map for preempted reqs
     //   truncate_failed         — truncate_seq_tail failures this tick
+    //   n_actually_used_blocks  — blocks with actual KV data (vs reserved)
     void on_decoded(
             llama_context * ctx,
             int32_t  n_active_slots,
@@ -117,7 +121,8 @@ public:
             int32_t  sched_preempted         = 0,
             const std::unordered_map<std::string, int32_t> * sched_deferred_reasons  = nullptr,
             const std::unordered_map<std::string, int32_t> * sched_preempted_reasons = nullptr,
-            uint64_t truncate_failed         = 0)
+            uint64_t truncate_failed         = 0,
+            int32_t  n_actually_used_blocks  = 0)
     {
         bucket_.n_active_slots    = n_active_slots;
         bucket_.n_total_slots     = n_total_slots;
@@ -128,11 +133,12 @@ public:
         bucket_.t_decode_ms     += t_decode_ms;
         bucket_.n_calls++;
 
-        bucket_.sched_prefill_tokens   += sched_prefill_tokens;
-        bucket_.sched_decode_tokens    += sched_decode_tokens;
-        bucket_.sched_deferred         += sched_deferred;
-        bucket_.sched_preempted        += sched_preempted;
-        bucket_.truncate_failed_total  += truncate_failed;
+        bucket_.sched_prefill_tokens    += sched_prefill_tokens;
+        bucket_.sched_decode_tokens     += sched_decode_tokens;
+        bucket_.sched_deferred          += sched_deferred;
+        bucket_.sched_preempted         += sched_preempted;
+        bucket_.truncate_failed_total   += truncate_failed;
+        bucket_.n_actually_used_blocks   = n_actually_used_blocks;  // last value (instantaneous)
         if (sched_deferred_reasons) {
             for (const auto & kv : *sched_deferred_reasons) {
                 bucket_.sched_deferred_reasons[kv.first] += kv.second;
@@ -181,6 +187,7 @@ private:
         int32_t  sched_deferred        = 0;
         int32_t  sched_preempted       = 0;
         uint64_t truncate_failed_total = 0;
+        int32_t  n_actually_used_blocks = 0;
         std::unordered_map<std::string, int32_t> sched_deferred_reasons;
         std::unordered_map<std::string, int32_t> sched_preempted_reasons;
     };
@@ -256,6 +263,13 @@ private:
         s.deferred_by_reason       = bucket_.sched_deferred_reasons;
         s.preempted_by_reason      = bucket_.sched_preempted_reasons;
 
+        // fragmentation metrics
+        s.n_blocks_actually_used   = bucket_.n_actually_used_blocks;
+        s.n_blocks_wasted_reserved = std::max(0, s.n_reserved_blocks - s.n_blocks_actually_used);
+        if (s.n_blocks_total > 0) {
+            s.true_fragmentation = (float) s.n_blocks_wasted_reserved / (float) s.n_blocks_total;
+        }
+
         return s;
     }
 
@@ -288,8 +302,8 @@ private:
             "┌─ KV Block Scheduler ─────────────────────────────────────\n"
             "│  blocks : %s  %u / %u  (%u free, size=%u cells)\n"
             "│  pages  : %zu entries in block table\n"
-            "│  reserv : %d blocks held by active requests\n"
-            "│  frag   : %.1f%%  (free / total blocks)\n"
+            "│  reserv : %d blocks held  actual=%d used  wasted=%d\n"
+            "│  frag   : util=%.1f%%  over-reserv=%.1f%%\n"
             "│  cow    : %llu blocks, %.2f MiB, %.3f ms copy, %llu fallbacks\n"
             "│  slots  : %d active / %d total\n"
             "│  toks/s : %.1f  (prompt+decode)\n"
@@ -299,8 +313,8 @@ private:
             "└───────────────────────────────────────────────────────────\n",
             bar, s.n_blocks_used, s.n_blocks_total, s.n_blocks_free, s.block_size,
             s.n_pages_mapped,
-            s.n_reserved_blocks,
-            s.fragmentation * 100.0f,
+            s.n_reserved_blocks, s.n_blocks_actually_used, s.n_blocks_wasted_reserved,
+            s.fragmentation * 100.0f, s.true_fragmentation * 100.0f,
             (unsigned long long) s.paged_cow_blocks,
             (double) s.paged_cow_bytes / 1024.0 / 1024.0,
             (double) s.paged_cow_copy_us / 1000.0,

@@ -3643,6 +3643,8 @@ private:
                             }
                             const uint64_t trunc_fail = paged_truncate_failed_;
                             paged_truncate_failed_ = 0;
+                            const auto blk_stats_now = server_scheduler::BlockManager::stats(
+                                paged_requests, (int32_t) params_base.kv_block_size);
                             kv_sched->on_decoded(
                                 ctx,
                                 n_active,
@@ -3658,7 +3660,8 @@ private:
                                 schedule_decision.preempted,
                                 &schedule_decision.deferred_reasons,
                                 &schedule_decision.preempted_reasons,
-                                trunc_fail);
+                                trunc_fail,
+                                blk_stats_now.actually_used_blocks);
                         }
                     },
                     /*on_fatal_error=*/[this](const char * error) {

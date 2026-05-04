@@ -55,12 +55,17 @@ bool BlockManager::evict(const PolicyContext & ctx) {
     return evict_idle_request(*ctx.reqs, ctx.now_us, ctx.idle_threshold_us);
 }
 
-BlockManager::Stats BlockManager::stats(const std::vector<RequestState> & reqs) {
+BlockManager::Stats BlockManager::stats(const std::vector<RequestState> & reqs, int32_t block_size) {
     Stats out;
+    const int32_t bs = std::max(1, block_size);
     for (const auto & req : reqs) {
         if (req.is_processing()) {
             out.active_requests++;
             out.reserved_blocks += req.reserved_blocks;
+            const int32_t n_toks = req.prompt.n_tokens();
+            if (n_toks > 0) {
+                out.actually_used_blocks += (n_toks + bs - 1) / bs;
+            }
         } else if (req.prompt.n_tokens() > 0) {
             out.cached_idle_requests++;
         }

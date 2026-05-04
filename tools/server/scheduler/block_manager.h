@@ -14,9 +14,10 @@ public:
     };
 
     struct Stats {
-        int32_t reserved_blocks = 0;
-        int32_t active_requests = 0;
-        int32_t cached_idle_requests = 0;
+        int32_t reserved_blocks       = 0;
+        int32_t actually_used_blocks  = 0;  // ceil(prompt_tokens / block_size) for active reqs
+        int32_t active_requests       = 0;
+        int32_t cached_idle_requests  = 0;
     };
 
     struct FitContext {
@@ -37,7 +38,7 @@ public:
     static int32_t total_reserved_blocks(const std::vector<RequestState> & reqs);
     static bool evict_idle_request(std::vector<RequestState> & reqs, int64_t now_us, int64_t idle_thold_us);
     static bool evict(const PolicyContext & ctx);
-    static Stats stats(const std::vector<RequestState> & reqs);
+    static Stats stats(const std::vector<RequestState> & reqs, int32_t block_size = 1);
     static FitDecision can_fit_request_full(const RequestState & req, const FitContext & ctx);
     static FitDecision can_fit_tokens_delta(const RequestState & req, int32_t delta_tokens, const FitContext & ctx);
     static float pressure_ratio(const Stats & stats, int32_t total_blocks);
