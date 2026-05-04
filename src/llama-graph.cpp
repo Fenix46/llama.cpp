@@ -450,16 +450,16 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
 
     mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
 
+    if (self_block_table && self_block_table->buffer) {
+        mctx->set_input_block_table(self_block_table);
+    }
+
     if (self_seq_ids_q && self_seq_ids_q->buffer) {
         mctx->set_input_seq_ids_q(self_seq_ids_q, ubatch);
     }
 
     if (self_page_limits_q && self_page_limits_q->buffer) {
         mctx->set_input_page_limits_q(self_page_limits_q, ubatch);
-    }
-
-    if (self_block_table && self_block_table->buffer) {
-        mctx->set_input_block_table(self_block_table);
     }
 
     if (self_k_rot) {
@@ -515,14 +515,14 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
 
     mctx->get_base()->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
 
+    if (self_block_table && self_block_table->buffer) {
+        mctx->get_base()->set_input_block_table(self_block_table);
+    }
     if (self_seq_ids_q && self_seq_ids_q->buffer) {
         mctx->get_base()->set_input_seq_ids_q(self_seq_ids_q, ubatch);
     }
     if (self_page_limits_q && self_page_limits_q->buffer) {
         mctx->get_base()->set_input_page_limits_q(self_page_limits_q, ubatch);
-    }
-    if (self_block_table && self_block_table->buffer) {
-        mctx->get_base()->set_input_block_table(self_block_table);
     }
 
     mctx->get_swa()->set_input_k_idxs(self_k_idxs_swa, ubatch);
@@ -530,14 +530,14 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
 
     mctx->get_swa()->set_input_kq_mask(self_kq_mask_swa, ubatch, cparams.causal_attn);
 
+    if (self_block_table_swa && self_block_table_swa->buffer) {
+        mctx->get_swa()->set_input_block_table(self_block_table_swa);
+    }
     if (self_seq_ids_q_swa && self_seq_ids_q_swa->buffer) {
         mctx->get_swa()->set_input_seq_ids_q(self_seq_ids_q_swa, ubatch);
     }
     if (self_page_limits_q_swa && self_page_limits_q_swa->buffer) {
         mctx->get_swa()->set_input_page_limits_q(self_page_limits_q_swa, ubatch);
-    }
-    if (self_block_table_swa && self_block_table_swa->buffer) {
-        mctx->get_swa()->set_input_block_table(self_block_table_swa);
     }
 
     if (self_k_rot) {
@@ -618,16 +618,16 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
 
     mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
 
+    if (inp_attn->self_block_table && inp_attn->self_block_table->buffer) {
+        mctx->get_attn()->set_input_block_table(inp_attn->self_block_table);
+    }
+
     if (inp_attn->self_seq_ids_q && inp_attn->self_seq_ids_q->buffer) {
         mctx->get_attn()->set_input_seq_ids_q(inp_attn->self_seq_ids_q, ubatch);
     }
 
     if (inp_attn->self_page_limits_q && inp_attn->self_page_limits_q->buffer) {
         mctx->get_attn()->set_input_page_limits_q(inp_attn->self_page_limits_q, ubatch);
-    }
-
-    if (inp_attn->self_block_table && inp_attn->self_block_table->buffer) {
-        mctx->get_attn()->set_input_block_table(inp_attn->self_block_table);
     }
 
     if (inp_attn->self_k_rot) {
@@ -730,14 +730,14 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
 
         attn_ctx->get_base()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
 
+        if (inp_attn->self_block_table && inp_attn->self_block_table->buffer) {
+            attn_ctx->get_base()->set_input_block_table(inp_attn->self_block_table);
+        }
         if (inp_attn->self_seq_ids_q && inp_attn->self_seq_ids_q->buffer) {
             attn_ctx->get_base()->set_input_seq_ids_q(inp_attn->self_seq_ids_q, ubatch);
         }
         if (inp_attn->self_page_limits_q && inp_attn->self_page_limits_q->buffer) {
             attn_ctx->get_base()->set_input_page_limits_q(inp_attn->self_page_limits_q, ubatch);
-        }
-        if (inp_attn->self_block_table && inp_attn->self_block_table->buffer) {
-            attn_ctx->get_base()->set_input_block_table(inp_attn->self_block_table);
         }
     }
 
@@ -748,14 +748,14 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
 
         attn_ctx->get_swa()->set_input_kq_mask(inp_attn->self_kq_mask_swa, ubatch, cparams.causal_attn);
 
+        if (inp_attn->self_block_table_swa && inp_attn->self_block_table_swa->buffer) {
+            attn_ctx->get_swa()->set_input_block_table(inp_attn->self_block_table_swa);
+        }
         if (inp_attn->self_seq_ids_q_swa && inp_attn->self_seq_ids_q_swa->buffer) {
             attn_ctx->get_swa()->set_input_seq_ids_q(inp_attn->self_seq_ids_q_swa, ubatch);
         }
         if (inp_attn->self_page_limits_q_swa && inp_attn->self_page_limits_q_swa->buffer) {
             attn_ctx->get_swa()->set_input_page_limits_q(inp_attn->self_page_limits_q_swa, ubatch);
-        }
-        if (inp_attn->self_block_table_swa && inp_attn->self_block_table_swa->buffer) {
-            attn_ctx->get_swa()->set_input_block_table(inp_attn->self_block_table_swa);
         }
     }
 
