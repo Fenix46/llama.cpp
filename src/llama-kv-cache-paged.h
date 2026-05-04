@@ -383,21 +383,6 @@ public:
     // Number of live (seq, page) → block mappings.
     size_t size() const { return n_entries; }
 
-    // One plus the highest logical page that currently has a mapped block
-    // across all sequences. Returns 0 when the table is empty.
-    uint32_t max_mapped_page_plus1() const {
-        uint32_t max_page_p1 = 0;
-        for (const auto & pages : seq_pages) {
-            for (uint32_t page = (uint32_t) pages.size(); page > 0; --page) {
-                if (pages[page - 1] != LLAMA_KV_BLOCK_ID_NONE) {
-                    max_page_p1 = std::max(max_page_p1, page);
-                    break;
-                }
-            }
-        }
-        return max_page_p1;
-    }
-
     // Compute the logical page index for a given token position.
     static uint32_t logical_page(llama_pos pos, uint32_t block_size) {
         return (uint32_t) pos / block_size;

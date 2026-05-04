@@ -2039,10 +2039,8 @@ ggml_tensor * llama_kv_cache::build_input_block_table(ggml_context * ctx) const 
         return nullptr;
     }
 
-    // Keep block-table tensors compact: only materialize the logical-page
-    // range that is actually mapped right now. This avoids rebuilding and
-    // copying a full-KV-pool-width table every decode tick.
-    const uint32_t max_pages = std::max<uint32_t>(1u, block_table.max_mapped_page_plus1());
+    const uint32_t bs         = block_size;
+    const uint32_t max_pages  = (get_size() + bs - 1) / bs;
 
     ggml_tensor * bt = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, max_pages, n_seq_max);
     ggml_set_input(bt);
