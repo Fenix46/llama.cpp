@@ -99,6 +99,29 @@ bool PagedScheduler::should_checkpoint_finalize(
     return req.prompt.n_tokens() - n_tokens_cur > req.prompt.checkpoints.back().n_tokens + 64;
 }
 
+PrefillFinalizeDecision PagedScheduler::finalize_prefill_step(
+        RequestState & req,
+        llama_batch & batch,
+        int64_t n_tokens_cur,
+        bool do_checkpoint,
+        int32_t checkpoint_every_nt,
+        bool has_mtmd,
+        llama_pos pos_min) {
+    PrefillFinalizeDecision out;
+    out.prompt_done = req.task && req.prompt.n_tokens() == req.task->n_tokens();
+    if (out.prompt_done) {
+        mark_prompt_done(req, batch);
+        return out;
+    }
+
+    if (do_checkpoint) {
+        do_checkpoint = should_checkpoint_progress(req, n_tokens_cur, checkpoint_every_nt);
+    }
+    out.should_checkpoint = do_checkpoint &&
+        should_checkpoint_finalize(req, n_tokens_cur, has_mtmd, pos_min);
+    return out;
+}
+
 bool PrefillWorkCursor::can_schedule_request() const {
     return prefill_added < prefill_total_budget;
 }

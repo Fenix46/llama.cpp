@@ -55,6 +55,11 @@ struct PrefillWorkCursor {
     void on_token_appended(int32_t & req_prefill_added);
 };
 
+struct PrefillFinalizeDecision {
+    bool prompt_done = false;
+    bool should_checkpoint = false;
+};
+
 class PagedScheduler {
 public:
     static bool should_begin_prefill(const RequestState & req);
@@ -72,6 +77,14 @@ public:
     static bool should_checkpoint_finalize(
             const RequestState & req,
             int64_t n_tokens_cur,
+            bool has_mtmd,
+            llama_pos pos_min);
+    static PrefillFinalizeDecision finalize_prefill_step(
+            RequestState & req,
+            llama_batch & batch,
+            int64_t n_tokens_cur,
+            bool do_checkpoint,
+            int32_t checkpoint_every_nt,
             bool has_mtmd,
             llama_pos pos_min);
 

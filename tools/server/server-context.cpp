@@ -3706,33 +3706,26 @@ private:
                 }
 
                 const auto n_tokens_cur = batch.n_tokens - n_tokens_prev;
+                const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), req.seq_id);
+                const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx), req.seq_id);
+                const auto prefill_finalize = server_scheduler::PagedScheduler::finalize_prefill_step(
+                        req,
+                        batch,
+                        n_tokens_cur,
+                        do_checkpoint,
+                        params_base.checkpoint_every_nt,
+                        has_mtmd,
+                        pos_min);
+                do_checkpoint = prefill_finalize.should_checkpoint;
 
-                if (req.prompt.n_tokens() == req.task->n_tokens()) {
-                    server_scheduler::PagedScheduler::mark_prompt_done(req, batch);
+                if (prefill_finalize.prompt_done) {
                     PGD_INF(req, "prompt done, n_tokens=%d, batch.n_tokens=%d\n",
                             req.prompt.n_tokens(), batch.n_tokens);
                 } else {
-                    if (do_checkpoint) {
-                        do_checkpoint = server_scheduler::PagedScheduler::should_checkpoint_progress(
-                                req, n_tokens_cur, params_base.checkpoint_every_nt);
-
-                        if (do_checkpoint) {
-                            PGD_INF(req, "%d tokens since last checkpoint at %d, creating new checkpoint during processing at position %d\n",
-                                    params_base.checkpoint_every_nt,
-                                    req.prompt.checkpoints.empty() ? 0 : (int) req.prompt.checkpoints.back().n_tokens,
-                                    req.prompt.n_tokens());
-                        }
-                    }
-
                     PGD_INF(req, "prefill progress, n_tokens=%d/%d\n",
                             req.prompt.n_tokens(), req.task->n_tokens());
                 }
 
-                const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), req.seq_id);
-                const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx), req.seq_id);
-
-                do_checkpoint = do_checkpoint && server_scheduler::PagedScheduler::should_checkpoint_finalize(
-                        req, n_tokens_cur, has_mtmd, pos_min);
                 PGD_DBG(req, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
                 if (do_checkpoint) {
