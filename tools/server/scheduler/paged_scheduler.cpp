@@ -112,6 +112,7 @@ PrefillFinalizeDecision PagedScheduler::finalize_prefill_step(
     out.prompt_done = req.task && req.prompt.n_tokens() == req.task->n_tokens();
     if (out.prompt_done) {
         mark_prompt_done(req, batch);
+        out.should_log_progress = false;
         return out;
     }
 
@@ -120,6 +121,7 @@ PrefillFinalizeDecision PagedScheduler::finalize_prefill_step(
     }
     out.should_checkpoint = do_checkpoint &&
         should_checkpoint_finalize(req, n_tokens_cur, has_mtmd, pos_min);
+    out.should_log_progress = true;
     return out;
 }
 

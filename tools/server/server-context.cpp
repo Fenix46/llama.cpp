@@ -3625,7 +3625,7 @@ private:
                 if (prefill_finalize.prompt_done) {
                     PGD_INF(req, "prompt done, n_tokens=%d, batch.n_tokens=%d\n",
                             req.prompt.n_tokens(), batch.n_tokens);
-                } else {
+                } else if (prefill_finalize.should_log_progress) {
                     PGD_INF(req, "prefill progress, n_tokens=%d/%d\n",
                             req.prompt.n_tokens(), req.task->n_tokens());
                 }

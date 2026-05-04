@@ -60,6 +60,7 @@ struct PrefillWorkCursor {
 struct PrefillFinalizeDecision {
     bool prompt_done = false;
     bool should_checkpoint = false;
+    bool should_log_progress = false;
 };
 
 struct PromptAppendDecision {
