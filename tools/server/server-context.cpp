@@ -3808,22 +3808,18 @@ private:
                         continue;
                     }
 
-                    if (req.phase == PAGED_REQUEST_DONE_PREFILL) {
-                        if (req.task->type == SERVER_TASK_TYPE_EMBEDDING) {
-                            send_embedding(req, batch_view);
-                            req.release();
-                            req.i_batch = -1;
-                            continue;
-                        }
-                        if (req.task->type == SERVER_TASK_TYPE_RERANK) {
-                            send_rerank(req, batch_view);
-                            req.release();
-                            req.i_batch = -1;
-                            continue;
-                        }
-
-                        GGML_ASSERT(req.task->need_sampling());
-                        server_scheduler::SamplingExecutor::maybe_start_decoding(req);
+                    const auto prefill_action = server_scheduler::SamplingExecutor::prefill_action(req);
+                    if (prefill_action == server_scheduler::SamplingExecutor::PrefillAction::EmitEmbedding) {
+                        send_embedding(req, batch_view);
+                        req.release();
+                        req.i_batch = -1;
+                        continue;
+                    }
+                    if (prefill_action == server_scheduler::SamplingExecutor::PrefillAction::EmitRerank) {
+                        send_rerank(req, batch_view);
+                        req.release();
+                        req.i_batch = -1;
+                        continue;
                     } else if (req.phase != PAGED_REQUEST_DECODING) {
                         continue;
                     }
@@ -3872,23 +3868,12 @@ private:
                     }
 
                     const int64_t t_current = ggml_time_us();
+                    server_scheduler::SpeculativeExecutor::apply_accepted_ids(req, spec, t_current);
                     const auto &  ids       = spec.accepted_ids;
-
-                    req.n_decoded += ids.size();
-                    req.t_token_generation = std::max<int64_t>(1, t_current - req.t_start_generation) / 1e3;
-
-                    req.spec.n_draft_accepted += ids.size() - 1;
-                    req.spec.n_draft_total    += spec.n_draft;
-
-                    req.prompt.tokens.keep_first(req.prompt.n_tokens() - spec.n_draft);
-                    req.prompt.tokens.insert({ids.begin(), ids.end() - 1});
 
                     req.sampled = ids.back();
                     PGD_DBG(req, "spec accepted: sampled=%d, ids.size=%zu, n_draft=%zu\n",
                             req.sampled, ids.size(), spec.n_draft);
-
-                    llama_memory_seq_rm(llama_get_memory(req.ctx), req.seq_id,
-                                        req.prompt.tokens.pos_next(), -1);
 
                     for (size_t si = 0; si < ids.size(); ++si) {
                         completion_token_output result;

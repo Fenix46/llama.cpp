@@ -13,6 +13,7 @@ struct SpecAcceptResult {
 class SpeculativeExecutor {
 public:
     static SpecAcceptResult accept_draft(RequestState & req);
+    static void apply_accepted_ids(RequestState & req, const SpecAcceptResult & spec, int64_t t_current_us);
 };
 
 } // namespace server_scheduler

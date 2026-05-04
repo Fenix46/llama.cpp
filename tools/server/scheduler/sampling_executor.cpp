@@ -18,6 +18,21 @@ bool SamplingExecutor::maybe_start_decoding(RequestState & req) {
     return true;
 }
 
+SamplingExecutor::PrefillAction SamplingExecutor::prefill_action(RequestState & req) {
+    if (req.phase != PAGED_REQUEST_DONE_PREFILL || !req.task) {
+        return PrefillAction::None;
+    }
+
+    if (req.task->type == SERVER_TASK_TYPE_EMBEDDING) {
+        return PrefillAction::EmitEmbedding;
+    }
+    if (req.task->type == SERVER_TASK_TYPE_RERANK) {
+        return PrefillAction::EmitRerank;
+    }
+
+    return maybe_start_decoding(req) ? PrefillAction::EnterDecoding : PrefillAction::None;
+}
+
 void SamplingExecutor::on_sampled_token(RequestState & req, int64_t t_current_us) {
     req.n_decoded += 1;
 
