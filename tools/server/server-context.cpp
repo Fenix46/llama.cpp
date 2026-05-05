@@ -1805,7 +1805,7 @@ private:
             "prefix_cache=%d cache_ram_mib=%d\n",
             seq_id,
             (void *) req,
-            req ? (void *) req->task.get() : nullptr,
+            req ? (const void *) req->task.get() : nullptr,
             can_cache ? 1 : 0,
             req ? (req->drop_cache_on_release ? 1 : 0) : -1,
             (req && req->task) ? (req->task->params.cache_prompt ? 1 : 0) : -1,
