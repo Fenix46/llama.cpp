@@ -319,6 +319,12 @@ struct paged_request_state {
 
         if (spec.spec_draft.empty()) {
             i_batch = batch.n_tokens;
+            PGD_WRN(*this, "[paged-update-batch] seq=%d i_batch=%d sampled=%d pos_next=%d batch_before=%d logits=1\n",
+                    seq_id,
+                    batch.n_tokens,
+                    sampled,
+                    prompt.tokens.pos_next(),
+                    batch.n_tokens);
 
             common_batch_add(batch, sampled, prompt.tokens.pos_next(), { seq_id }, true);
 
