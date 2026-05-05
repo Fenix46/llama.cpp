@@ -547,10 +547,22 @@ DecodePassResult PagedScheduler::process_decode_pass(
     DecodePassResult out;
     int32_t i_next = 0;
     int32_t cur_n_batch = n_batch;
+    int32_t decode_segments = 0;
+    int32_t decode_tokens_total = 0;
 
     for (int32_t i = 0; i < batch.n_tokens; i = i_next) {
         const auto seg = StepExecutor::select_decode_segment(batch, i, cur_n_batch, paged_scheduler);
         const int32_t n_tokens = seg.n_tokens;
+        SRV_WRN("[paged-decode-seg] batch_total=%d i=%d n_tokens=%d seq_first=%d pos_first=%d logits_first=%d paged=%d\n",
+            batch.n_tokens,
+            i,
+            n_tokens,
+            batch.n_seq_id[i] > 0 ? batch.seq_id[i][0] : -1,
+            batch.pos[i],
+            batch.logits[i] ? 1 : 0,
+            paged_scheduler ? 1 : 0);
+        decode_segments++;
+        decode_tokens_total += n_tokens;
 
         const llama_batch batch_view = StepExecutor::make_batch_view(batch, i, n_tokens);
         const int ret = StepExecutor::decode_segment(ctx, batch, i, n_tokens);
@@ -612,6 +624,11 @@ DecodePassResult PagedScheduler::process_decode_pass(
             }
         }
     }
+
+    SRV_WRN("[paged-decode-pass] batch_total=%d segments=%d decoded=%d\n",
+        batch.n_tokens,
+        decode_segments,
+        decode_tokens_total);
 
     return out;
 }
