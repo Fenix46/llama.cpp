@@ -3551,6 +3551,18 @@ private:
             const auto & prefill_candidates = tick_decision.prefill_candidates;
             const auto budget = tick_decision.budget;
             auto prefill_cursor = paged_sched.make_prefill_cursor(budget);
+            int32_t sched_decode_toks_tick = 0;
+            int32_t sched_prefill_toks_tick = 0;
+            for (const auto & plan : schedule_decision.request_plans) {
+                sched_decode_toks_tick += plan.scheduled_decode_tokens;
+                sched_prefill_toks_tick += plan.scheduled_prefill_tokens;
+            }
+            // Enforce token-plan budget at execution time: prevents oversized
+            // prefill bursts from monopolizing the batch when decode is active.
+            if (sched_prefill_toks_tick >= 0) {
+                prefill_cursor.prefill_total_budget = std::min(prefill_cursor.prefill_total_budget, sched_prefill_toks_tick);
+                prefill_cursor.prefill_per_request_budget = std::min(prefill_cursor.prefill_per_request_budget, prefill_threshold);
+            }
 
             const auto prefill_pass = server_scheduler::PagedScheduler::process_prefill_candidates(
                 paged_requests,
@@ -3613,8 +3625,8 @@ private:
                 int32_t active_reqs = 0;
                 int32_t decode_ready_reqs = 0;
                 int32_t prefill_ready_reqs = 0;
-                int32_t decode_tokens_scheduled = 0;
-                int32_t prefill_tokens_scheduled = 0;
+                const int32_t decode_tokens_scheduled = sched_decode_toks_tick;
+                const int32_t prefill_tokens_scheduled = sched_prefill_toks_tick;
 
                 for (const auto & req : paged_requests) {
                     if (!req.is_processing()) {
@@ -3627,11 +3639,6 @@ private:
                     if (req.phase == PAGED_REQUEST_STARTED || req.phase == PAGED_REQUEST_PREFILLING) {
                         ++prefill_ready_reqs;
                     }
-                }
-
-                for (const auto & plan : schedule_decision.request_plans) {
-                    decode_tokens_scheduled += plan.scheduled_decode_tokens;
-                    prefill_tokens_scheduled += plan.scheduled_prefill_tokens;
                 }
 
                 SRV_WRN("[paged-sched] active=%d decode_ready=%d prefill_ready=%d decode_sched=%d prefill_sched=%d prefill_cap=%d batch=%d n_decode_rows=%zu n_prefill_rows=%zu\n",
