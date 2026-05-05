@@ -553,14 +553,22 @@ DecodePassResult PagedScheduler::process_decode_pass(
     for (int32_t i = 0; i < batch.n_tokens; i = i_next) {
         const auto seg = StepExecutor::select_decode_segment(batch, i, cur_n_batch, paged_scheduler);
         const int32_t n_tokens = seg.n_tokens;
-        SRV_WRN("[paged-decode-seg] batch_total=%d i=%d n_tokens=%d seq_first=%d pos_first=%d logits_first=%d paged=%d\n",
+        SRV_WRN("[paged-decode-seg] batch_total=%d i=%d n_tokens=%d paged=%d\n",
             batch.n_tokens,
             i,
             n_tokens,
-            batch.n_seq_id[i] > 0 ? batch.seq_id[i][0] : -1,
-            batch.pos[i],
-            batch.logits[i] ? 1 : 0,
             paged_scheduler ? 1 : 0);
+        for (int32_t j = 0; j < n_tokens; ++j) {
+            const int32_t idx = i + j;
+            SRV_WRN("[paged-decode-row] local=%d global=%d token=%d pos=%d n_seq_id=%d seq0=%d logits=%d\n",
+                j,
+                idx,
+                batch.token[idx],
+                batch.pos[idx],
+                batch.n_seq_id[idx],
+                batch.n_seq_id[idx] > 0 ? batch.seq_id[idx][0] : -1,
+                batch.logits[idx] ? 1 : 0);
+        }
         decode_segments++;
         decode_tokens_total += n_tokens;
 
