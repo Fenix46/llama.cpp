@@ -319,6 +319,11 @@ struct paged_request_state {
         }
 
         if (spec.spec_draft.empty()) {
+            if (sampled == LLAMA_TOKEN_NULL) {
+                PGD_ERR(*this, "attempted update_batch with invalid sampled token, phase=%d i_batch=%d prompt_tokens=%zu\n",
+                        phase, i_batch, prompt.tokens.size());
+                GGML_ABORT("paged update_batch called without sampled token");
+            }
             i_batch = batch.n_tokens;
             if (std::getenv("LLAMA_PAGED_TRACE")) {
                 PGD_WRN(*this, "[paged-update-batch] seq=%d i_batch=%d sampled=%d pos_next=%d batch_before=%d logits=1\n",

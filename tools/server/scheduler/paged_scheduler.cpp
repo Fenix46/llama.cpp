@@ -735,6 +735,8 @@ DecodeBatchResult PagedScheduler::populate_decode_batch(
 
     for (const size_t idx : decode_candidates) {
         auto & req = reqs[idx];
+        GGML_ASSERT(req.phase == PAGED_REQUEST_DECODING);
+        GGML_ASSERT(req.sampled != LLAMA_TOKEN_NULL);
         if (out.first_decode_request_index < 0) {
             out.first_decode_request_index = (int32_t) idx;
         }

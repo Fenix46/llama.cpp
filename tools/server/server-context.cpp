@@ -3568,7 +3568,7 @@ private:
                     continue;
                 }
                 ++active_reqs_tick;
-                if (req.phase == PAGED_REQUEST_DECODING || req.phase == PAGED_REQUEST_DONE_PREFILL) {
+                if (req.phase == PAGED_REQUEST_DECODING) {
                     ++decode_ready_reqs_tick;
                 }
                 if (req.phase == PAGED_REQUEST_STARTED || req.phase == PAGED_REQUEST_PREFILLING) {
@@ -3689,6 +3689,70 @@ private:
                 n_empty_consecutive = 0;
             }
 
+            auto on_segment_sample_paged = [this, &accept_special_token_paged](int32_t i, int32_t n_tokens, const llama_batch & batch_view) {
+                const auto group_state = server_scheduler::SamplingExecutor::propagate_parent_state(paged_requests);
+                if (group_state.children_activated > 0) {
+                    SRV_DBG("[paged-lifecycle] children_activated=%d groups_ready=%d\n",
+                            group_state.children_activated,
+                            group_state.groups_ready);
+                }
+
+                for (auto & req : paged_requests) {
+                    if (req.phase == PAGED_REQUEST_PREFILLING ||
+                        req.phase == PAGED_REQUEST_DONE_PREFILL) {
+                        if (req.task->params.stream && req.task->params.return_progress) {
+                            send_partial_response(req, {}, true);
+                        }
+                    }
+
+                    if (!server_scheduler::SamplingExecutor::can_sample_in_segment(req, i, n_tokens)) {
+                        continue;
+                    }
+
+                    const auto prefill_action = server_scheduler::SamplingExecutor::prefill_action(req);
+                    if (prefill_action == server_scheduler::SamplingExecutor::PrefillAction::EmitEmbedding) {
+                        send_embedding(req, batch_view);
+                        req.release();
+                        req.i_batch = -1;
+                        continue;
+                    }
+                    if (prefill_action == server_scheduler::SamplingExecutor::PrefillAction::EmitRerank) {
+                        send_rerank(req, batch_view);
+                        req.release();
+                        req.i_batch = -1;
+                        continue;
+                    } else if (req.phase != PAGED_REQUEST_DECODING) {
+                        continue;
+                    }
+
+                    const auto sample = server_scheduler::SamplingExecutor::sample_token(req, i);
+                    if (!sample.ok) {
+                        continue;
+                    }
+                    if (sample.first_token) {
+                        metrics.on_prompt_eval(req);
+                    }
+
+                    completion_token_output result;
+                    result.tok          = sample.token;
+                    result.text_to_send = common_token_to_piece(req.ctx, result.tok,
+                                             accept_special_token_paged(req, result.tok));
+                    result.prob         = 1.0f;
+
+                    if (req.task->params.sampling.n_probs > 0) {
+                        populate_token_probs(req, result, req.task->params.post_sampling_probs,
+                                             params_base.special, sample.tok_idx);
+                    }
+
+                    if (!process_token(result, req)) {
+                        req.print_timings();
+                        send_final_response(req);
+                        metrics.on_prediction(req);
+                        req.release();
+                    }
+                }
+            };
+
             // 4. llama_decode loop (owned by paged scheduler with server-context callbacks)
             auto decode_outcome = server_scheduler::PagedScheduler::process_decode_pass(
                 ctx,
@@ -3751,69 +3815,7 @@ private:
                         SRV_WRN("[paged] KV full, retrying batch size=%d\n", local_batch);
                         return local_batch > 0;
                     },
-                    /*on_segment_sample=*/[this, &accept_special_token_paged](int32_t i, int32_t n_tokens, const llama_batch & batch_view) {
-                        const auto group_state = server_scheduler::SamplingExecutor::propagate_parent_state(paged_requests);
-                        if (group_state.children_activated > 0) {
-                            SRV_DBG("[paged-lifecycle] children_activated=%d groups_ready=%d\n",
-                                    group_state.children_activated,
-                                    group_state.groups_ready);
-                        }
-
-                        for (auto & req : paged_requests) {
-                            if (req.phase == PAGED_REQUEST_PREFILLING ||
-                                req.phase == PAGED_REQUEST_DONE_PREFILL) {
-                                if (req.task->params.stream && req.task->params.return_progress) {
-                                    send_partial_response(req, {}, true);
-                                }
-                            }
-
-                            if (!server_scheduler::SamplingExecutor::can_sample_in_segment(req, i, n_tokens)) {
-                                continue;
-                            }
-
-                            const auto prefill_action = server_scheduler::SamplingExecutor::prefill_action(req);
-                            if (prefill_action == server_scheduler::SamplingExecutor::PrefillAction::EmitEmbedding) {
-                                send_embedding(req, batch_view);
-                                req.release();
-                                req.i_batch = -1;
-                                continue;
-                            }
-                            if (prefill_action == server_scheduler::SamplingExecutor::PrefillAction::EmitRerank) {
-                                send_rerank(req, batch_view);
-                                req.release();
-                                req.i_batch = -1;
-                                continue;
-                            } else if (req.phase != PAGED_REQUEST_DECODING) {
-                                continue;
-                            }
-
-                            const auto sample = server_scheduler::SamplingExecutor::sample_token(req, i);
-                            if (!sample.ok) {
-                                continue;
-                            }
-                            if (sample.first_token) {
-                                metrics.on_prompt_eval(req);
-                            }
-
-                            completion_token_output result;
-                            result.tok          = sample.token;
-                            result.text_to_send = common_token_to_piece(req.ctx, result.tok,
-                                                     accept_special_token_paged(req, result.tok));
-                            result.prob         = 1.0f;
-
-                            if (req.task->params.sampling.n_probs > 0) {
-                                populate_token_probs(req, result, req.task->params.post_sampling_probs,
-                                                     params_base.special, sample.tok_idx);
-                            }
-
-                            if (!process_token(result, req)) {
-                                req.print_timings();
-                                send_final_response(req);
-                                metrics.on_prediction(req);
-                                req.release();
-                            }
-                        }
-                    },
+                    /*on_segment_sample=*/on_segment_sample_paged,
                     /*reqs=*/&paged_requests,
                     /*allow_special=*/params_base.special,
                     /*on_speculative_token=*/[this](completion_token_output & result, paged_request_state & req) {
@@ -3829,6 +3831,16 @@ private:
                 });
 
             if (split_mixed_batch && !decode_outcome.fatal && sched_prefill_toks_tick > 0) {
+                const int32_t executed_decode_tokens = batch.n_tokens;
+                const int32_t executed_prefill_tokens = 0;
+                GGML_ASSERT(executed_prefill_tokens == 0);
+                GGML_ASSERT(batch.n_tokens == executed_decode_tokens);
+                if (std::getenv("LLAMA_PAGED_SCHED_TRACE")) {
+                    SRV_WRN("[paged-sched-phase] phase=decode_only planned_decode=%d planned_prefill=%d executed_decode=%d executed_prefill=%d batch=%d\n",
+                            sched_decode_toks_tick, sched_prefill_toks_tick,
+                            executed_decode_tokens, executed_prefill_tokens, batch.n_tokens);
+                }
+
                 common_batch_clear(batch);
                 auto prefill_cursor_phase_b = paged_sched.make_prefill_cursor(budget);
                 prefill_cursor_phase_b.prefill_total_budget = std::min(prefill_cursor_phase_b.prefill_total_budget, sched_prefill_toks_tick);
@@ -3888,6 +3900,16 @@ private:
                     });
 
                 if (batch.n_tokens > 0) {
+                    const int32_t executed_decode_tokens = 0;
+                    const int32_t executed_prefill_tokens = batch.n_tokens;
+                    GGML_ASSERT(executed_decode_tokens == 0);
+                    GGML_ASSERT(batch.n_tokens == executed_prefill_tokens);
+                    if (std::getenv("LLAMA_PAGED_SCHED_TRACE")) {
+                        SRV_WRN("[paged-sched-phase] phase=prefill_only planned_decode=%d planned_prefill=%d executed_decode=%d executed_prefill=%d batch=%d\n",
+                                0, sched_prefill_toks_tick,
+                                executed_decode_tokens, executed_prefill_tokens, batch.n_tokens);
+                    }
+
                     const auto prefill_decode_outcome = server_scheduler::PagedScheduler::process_decode_pass(
                         ctx,
                         batch,
@@ -3913,7 +3935,7 @@ private:
                                 SRV_WRN("[paged] KV full, retrying batch size=%d\n", local_batch);
                                 return local_batch > 0;
                             },
-                            /*on_segment_sample=*/{},
+                            /*on_segment_sample=*/on_segment_sample_paged,
                             /*reqs=*/&paged_requests,
                             /*allow_special=*/params_base.special,
                             /*on_speculative_token=*/{},

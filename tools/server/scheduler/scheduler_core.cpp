@@ -79,7 +79,7 @@ static int32_t request_desired_tokens(const RequestState & req) {
         case PAGED_REQUEST_PREFILLING:
             return std::max(0, req.task->n_tokens() - req.prompt.n_tokens());
         case PAGED_REQUEST_DONE_PREFILL:
-            return 1;
+            return 0;
         default:
             return 0;
     }
@@ -284,7 +284,7 @@ SchedulerCore::ScheduleDecision SchedulerCore::schedule_tokens(const RuntimeSnap
         if (!req) {
             continue;
         }
-        const bool decode_ready = req->phase == PAGED_REQUEST_DECODING || req->phase == PAGED_REQUEST_DONE_PREFILL;
+        const bool decode_ready = req->phase == PAGED_REQUEST_DECODING;
         if (!decode_ready) {
             continue;
         }

@@ -83,7 +83,7 @@ BatchPlan BatchPlanner::build_from_request_plans(
         BatchPlanRow row;
         row.seq_id = plan.seq_id;
         row.n_tokens = plan.scheduled_tokens;
-        row.is_decode = plan.scheduled_decode_tokens > 0;
+        row.is_decode = plan.scheduled_decode_tokens > 0 && it->phase == PAGED_REQUEST_DECODING;
         row.is_prefill = plan.scheduled_prefill_tokens > 0;
         row.mark_logits_last = row.is_decode || row.is_prefill;
         out.rows.push_back(row);
