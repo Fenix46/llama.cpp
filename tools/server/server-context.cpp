@@ -3418,15 +3418,17 @@ private:
             const float kv_pressure_ratio = server_scheduler::BlockManager::pressure_ratio(blk_stats, paged_total_blocks_);
             const int32_t block_size_for_fit = paged_blocks_per_seq_ > 0 ? std::max(1, n_ctx_slot_ / paged_blocks_per_seq_) : 1;
 
-            // Count decode-ready requests to apply an adaptive prefill cap.
-            // Decode-active ticks get a small prefill chunk; idle-decode ticks
-            // allow larger prefill chunks for throughput.
+            // Count decode-ready requests and derive scheduling policy knobs.
             int32_t n_decode_active = 0;
             for (const auto & req : paged_requests) {
-                if (req.phase == PAGED_REQUEST_DECODING || req.phase == PAGED_REQUEST_DONE_PREFILL) {
+                if (req.phase == PAGED_REQUEST_DECODING) {
                     n_decode_active++;
                 }
             }
+            auto env_str = [](const char * name, const char * def) {
+                const char * v = std::getenv(name);
+                return (v && *v) ? std::string(v) : std::string(def);
+            };
             auto env_i32 = [](const char * name, int32_t def) {
                 const char * v = std::getenv(name);
                 if (!v || !*v) {
@@ -3435,8 +3437,24 @@ private:
                 const int32_t parsed = atoi(v);
                 return parsed > 0 ? parsed : def;
             };
-            const int32_t prefill_chunk_active_decode = env_i32("LLAMA_PAGED_PREFILL_CHUNK_ACTIVE_DECODE", 256);
-            const int32_t prefill_chunk_idle = env_i32("LLAMA_PAGED_PREFILL_CHUNK_IDLE", 2048);
+
+            const std::string sched_policy = env_str("LLAMA_PAGED_SCHED_POLICY", "latency");
+            const bool policy_latency = sched_policy == "latency";
+            const bool policy_balanced = sched_policy == "balanced";
+
+            const int32_t short_prefill_threshold = env_i32("LLAMA_PAGED_SHORT_PREFILL_THRESHOLD", 512);
+            const int32_t prefill_chunk_idle_latency = env_i32("LLAMA_PAGED_PREFILL_CHUNK_IDLE_LATENCY", 256);
+            const int32_t prefill_chunk_active_decode = env_i32("LLAMA_PAGED_PREFILL_CHUNK_ACTIVE_DECODE", 128);
+            const int32_t prefill_chunk_short = env_i32("LLAMA_PAGED_PREFILL_CHUNK_SHORT", 512);
+            const int32_t prefill_chunk_long = env_i32("LLAMA_PAGED_PREFILL_CHUNK_LONG", 128);
+            const int32_t prefill_chunk_idle = env_i32("LLAMA_PAGED_PREFILL_CHUNK_IDLE", policy_latency ? prefill_chunk_idle_latency : 2048);
+            const int32_t max_batched_tokens_latency = env_i32("LLAMA_PAGED_MAX_NUM_BATCHED_TOKENS_LATENCY", 512);
+            const int32_t max_batched_tokens_throughput = env_i32("LLAMA_PAGED_MAX_NUM_BATCHED_TOKENS_THROUGHPUT", n_batch);
+
+            const int32_t max_num_scheduled_tokens = policy_latency
+                ? std::min(n_batch, max_batched_tokens_latency)
+                : (policy_balanced ? std::min(n_batch, std::max(512, n_batch/2)) : std::min(n_batch, max_batched_tokens_throughput));
+
             const int32_t prefill_threshold = n_decode_active > 0
                 ? prefill_chunk_active_decode
                 : prefill_chunk_idle;
@@ -3452,7 +3470,7 @@ private:
                 /*kv_reserved_blocks=*/blk_stats.reserved_blocks,
                 /*kv_active_requests=*/blk_stats.active_requests,
                 /*kv_pressure_ratio=*/kv_pressure_ratio,
-                /*max_num_scheduled_tokens=*/n_batch,
+                /*max_num_scheduled_tokens=*/max_num_scheduled_tokens,
                 /*long_prefill_token_threshold=*/prefill_threshold,
                 /*enable_chunked_prefill=*/true,
                 /*reserve_full_isl=*/params_base.paged_admission == "full-ctx",
@@ -3548,7 +3566,7 @@ private:
 
             const int32_t decode_tokens_in_batch = tick_decision.decode_tokens_in_batch;
             SRV_DBG("[paged] decode_tokens=%d\n", decode_tokens_in_batch);
-            const auto & prefill_candidates = tick_decision.prefill_candidates;
+            std::vector<size_t> prefill_candidates = tick_decision.prefill_candidates;
             const auto budget = tick_decision.budget;
             auto prefill_cursor = paged_sched.make_prefill_cursor(budget);
             int32_t sched_decode_toks_tick = 0;
@@ -3592,6 +3610,70 @@ private:
             if (sched_prefill_toks_tick >= 0) {
                 prefill_cursor.prefill_total_budget = std::min(prefill_cursor.prefill_total_budget, sched_prefill_toks_tick);
                 prefill_cursor.prefill_per_request_budget = std::min(prefill_cursor.prefill_per_request_budget, prefill_threshold);
+            }
+
+            // vLLM-style prefill fairness ordering: short/new requests first,
+            // long continuations last with round-robin rotation.
+            std::vector<size_t> short_new;
+            std::vector<size_t> short_cont;
+            std::vector<size_t> long_near_done;
+            std::vector<size_t> long_cont;
+            short_new.reserve(prefill_candidates.size());
+            short_cont.reserve(prefill_candidates.size());
+            long_near_done.reserve(prefill_candidates.size());
+            long_cont.reserve(prefill_candidates.size());
+
+            for (const size_t ridx : prefill_candidates) {
+                const auto & req = paged_requests[ridx];
+                const int32_t total_prompt_tokens = req.task ? req.task->n_tokens() : 0;
+                const int32_t already_prefilled_tokens = req.prompt.n_tokens();
+                const int32_t remaining_prefill_tokens = std::max(0, total_prompt_tokens - already_prefilled_tokens);
+                const bool is_new_prompt = req.phase == PAGED_REQUEST_STARTED;
+                const bool is_short_prefill = total_prompt_tokens <= short_prefill_threshold;
+                if (is_short_prefill) {
+                    if (is_new_prompt) short_new.push_back(ridx);
+                    else short_cont.push_back(ridx);
+                } else {
+                    if (remaining_prefill_tokens <= std::max(1, prefill_chunk_long)) long_near_done.push_back(ridx);
+                    else long_cont.push_back(ridx);
+                }
+            }
+            if (!long_cont.empty()) {
+                const size_t rot = paged_prefill_rr_cursor % long_cont.size();
+                std::rotate(long_cont.begin(), long_cont.begin() + rot, long_cont.end());
+                paged_prefill_rr_cursor = (paged_prefill_rr_cursor + 1) % long_cont.size();
+            }
+
+            prefill_candidates.clear();
+            prefill_candidates.insert(prefill_candidates.end(), short_new.begin(), short_new.end());
+            prefill_candidates.insert(prefill_candidates.end(), short_cont.begin(), short_cont.end());
+            prefill_candidates.insert(prefill_candidates.end(), long_near_done.begin(), long_near_done.end());
+            prefill_candidates.insert(prefill_candidates.end(), long_cont.begin(), long_cont.end());
+
+            // Latency policy: cap prefill more aggressively by class and
+            // restrict long prefill to a single chunk per scheduling turn.
+            if (policy_latency) {
+                const bool has_short_prefill = !short_new.empty() || !short_cont.empty();
+                if (n_decode_active > 0) {
+                    prefill_cursor.prefill_total_budget = std::min(prefill_cursor.prefill_total_budget, prefill_chunk_active_decode);
+                    prefill_cursor.prefill_per_request_budget = std::min(prefill_cursor.prefill_per_request_budget, prefill_chunk_active_decode);
+                } else if (has_short_prefill) {
+                    prefill_cursor.prefill_total_budget = std::min(prefill_cursor.prefill_total_budget, prefill_chunk_short);
+                    prefill_cursor.prefill_per_request_budget = std::min(prefill_cursor.prefill_per_request_budget, prefill_chunk_short);
+                } else {
+                    int32_t long_cap = prefill_chunk_long;
+                    if (!prefill_candidates.empty()) {
+                        const auto & req0 = paged_requests[prefill_candidates.front()];
+                        const int32_t already_prefilled_tokens = req0.prompt.n_tokens();
+                        if (already_prefilled_tokens > 32768) {
+                            long_cap = std::min(long_cap, 64);
+                        } else if (already_prefilled_tokens > 8192) {
+                            long_cap = std::min(long_cap, 128);
+                        }
+                    }
+                    prefill_cursor.prefill_total_budget = std::min(prefill_cursor.prefill_total_budget, long_cap);
+                    prefill_cursor.prefill_per_request_budget = std::min(prefill_cursor.prefill_per_request_budget, long_cap);
+                }
             }
             if (split_mixed_batch) {
                 // Phase A (latency mode): decode-only first.
