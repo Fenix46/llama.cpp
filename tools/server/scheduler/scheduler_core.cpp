@@ -229,25 +229,11 @@ SchedulerCore::ScheduleDecision SchedulerCore::schedule_tokens(const RuntimeSnap
         budget = std::max(1, (int32_t) out.running_seq_ids.size());
     }
 
-    for (const int32_t seq_id : out.running_seq_ids) {
-        if (budget <= 0) {
-            break;
+    auto try_reserve_tokens = [&](const RequestState & req, int32_t scheduled) -> bool {
+        if (scheduled <= 0) {
+            return false;
         }
-        const RequestState * req = find_request(*snapshot.reqs, seq_id);
-        if (!req) {
-            continue;
-        }
-        int32_t desired = request_desired_tokens(*req);
-        if (desired <= 0) {
-            continue;
-        }
-        if (snapshot.enable_chunked_prefill &&
-            (req->phase == PAGED_REQUEST_STARTED || req->phase == PAGED_REQUEST_PREFILLING) &&
-            snapshot.long_prefill_token_threshold > 0) {
-            desired = std::min(desired, snapshot.long_prefill_token_threshold);
-        }
-        int32_t scheduled = std::min(desired, budget);
-        if (snapshot.can_fit_tokens && !snapshot.can_fit_tokens(*req, scheduled)) {
+        if (snapshot.can_fit_tokens && !snapshot.can_fit_tokens(req, scheduled)) {
             // KV pressure: attempt to free space by preempting a lower-priority
             // running request, then retry fit. This mirrors vLLM's preemption loop
             // inside allocate_slots(): preempt victim → retry → admit or defer.
@@ -258,7 +244,7 @@ SchedulerCore::ScheduleDecision SchedulerCore::schedule_tokens(const RuntimeSnap
                 int32_t victim_seq_id = -1;
                 int victim_priority = 999;
                 for (const int32_t candidate : running_) {
-                    if (candidate == seq_id) {
+                    if (candidate == req.seq_id) {
                         continue;
                     }
                     const RequestState * vreq = find_request(*snapshot.reqs, candidate);
@@ -269,7 +255,6 @@ SchedulerCore::ScheduleDecision SchedulerCore::schedule_tokens(const RuntimeSnap
                     }
                 }
                 if (victim_seq_id >= 0) {
-                    // Evict victim from running to waiting and free its KV blocks.
                     running_.erase(std::remove(running_.begin(), running_.end(), victim_seq_id), running_.end());
                     running_set_.erase(victim_seq_id);
                     waiting_.push_front(victim_seq_id);
@@ -278,23 +263,82 @@ SchedulerCore::ScheduleDecision SchedulerCore::schedule_tokens(const RuntimeSnap
                     out.preempted++;
                     out.preempted_seq_ids.push_back(victim_seq_id);
                     out.preempted_reasons["kv-pressure"]++;
-                    // Retry fit after freeing victim's KV.
-                    fit_after_preempt = snapshot.can_fit_tokens(*req, scheduled);
+                    fit_after_preempt = snapshot.can_fit_tokens(req, scheduled);
                 }
             }
             if (!fit_after_preempt) {
                 out.deferred++;
                 out.deferred_reasons["kv-pressure"]++;
-                continue;
+                return false;
             }
+        }
+        return true;
+    };
+
+    // Pass 1: decode-first fairness. Each decode-ready request gets exactly one token.
+    for (const int32_t seq_id : out.running_seq_ids) {
+        if (budget <= 0) {
+            break;
+        }
+        const RequestState * req = find_request(*snapshot.reqs, seq_id);
+        if (!req) {
+            continue;
+        }
+        const bool decode_ready = req->phase == PAGED_REQUEST_DECODING || req->phase == PAGED_REQUEST_DONE_PREFILL;
+        if (!decode_ready) {
+            continue;
+        }
+        const int32_t desired = request_desired_tokens(*req);
+        if (desired <= 0) {
+            continue;
+        }
+        const int32_t scheduled = std::min(1, budget);
+        if (!try_reserve_tokens(*req, scheduled)) {
+            continue;
         }
 
         RequestTokenPlan plan;
         plan.seq_id = seq_id;
         plan.scheduled_tokens = scheduled;
-        plan.scheduled_decode_tokens = req->phase == PAGED_REQUEST_DECODING || req->phase == PAGED_REQUEST_DONE_PREFILL ? std::min(1, scheduled) : 0;
-        plan.scheduled_prefill_tokens = scheduled - plan.scheduled_decode_tokens;
-        plan.lookahead_tokens = req->can_speculate() ? std::max(0, scheduled - plan.scheduled_decode_tokens) : 0;
+        plan.scheduled_decode_tokens = scheduled;
+        plan.scheduled_prefill_tokens = 0;
+        plan.lookahead_tokens = 0;
+        out.request_plans.push_back(plan);
+        out.total_scheduled_tokens += scheduled;
+        budget -= scheduled;
+    }
+
+    // Pass 2: prefill only after decode quota has been reserved.
+    for (const int32_t seq_id : out.running_seq_ids) {
+        if (budget <= 0) {
+            break;
+        }
+        const RequestState * req = find_request(*snapshot.reqs, seq_id);
+        if (!req) {
+            continue;
+        }
+        if (req->phase != PAGED_REQUEST_STARTED && req->phase != PAGED_REQUEST_PREFILLING) {
+            continue;
+        }
+
+        int32_t desired = request_desired_tokens(*req);
+        if (desired <= 0) {
+            continue;
+        }
+        if (snapshot.enable_chunked_prefill && snapshot.long_prefill_token_threshold > 0) {
+            desired = std::min(desired, snapshot.long_prefill_token_threshold);
+        }
+        const int32_t scheduled = std::min(desired, budget);
+        if (!try_reserve_tokens(*req, scheduled)) {
+            continue;
+        }
+
+        RequestTokenPlan plan;
+        plan.seq_id = seq_id;
+        plan.scheduled_tokens = scheduled;
+        plan.scheduled_decode_tokens = 0;
+        plan.scheduled_prefill_tokens = scheduled;
+        plan.lookahead_tokens = req->can_speculate() ? scheduled : 0;
         if (plan.lookahead_tokens > 0 && !req->spec.spec_draft.empty()) {
             const int32_t n = std::min<int32_t>(plan.lookahead_tokens, (int32_t) req->spec.spec_draft.size());
             out.scheduled_spec_decode_tokens[seq_id] = std::vector<llama_token>(
@@ -305,6 +349,7 @@ SchedulerCore::ScheduleDecision SchedulerCore::schedule_tokens(const RuntimeSnap
         out.total_scheduled_tokens += scheduled;
         budget -= scheduled;
     }
+
     out.remaining_budget = budget;
     return out;
 }
