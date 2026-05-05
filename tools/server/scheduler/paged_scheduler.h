@@ -105,6 +105,7 @@ struct PrefillRequestResult {
 struct PrefillPassResult {
     int32_t first_prefill_request_index = -1;
     bool batch_full = false;
+    bool prompt_done_any = false;
 };
 
 struct PrefillPassCallbacks {

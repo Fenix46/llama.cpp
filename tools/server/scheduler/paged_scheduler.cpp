@@ -521,9 +521,13 @@ PrefillPassResult PagedScheduler::process_prefill_candidates(
         }
 
         if (prefill_res.prompt_done) {
+            out.prompt_done_any = true;
             if (cbs.on_request_prompt_done) {
                 cbs.on_request_prompt_done(req);
             }
+            // A request became decode-ready in this prefill pass; stop adding
+            // more prefill work so decode can run at the next batch boundary.
+            break;
         } else if (cbs.on_request_progress) {
             cbs.on_request_progress(req);
         }
