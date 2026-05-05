@@ -1770,6 +1770,19 @@ private:
         SRV_WRN("[paged] hard reset seq_id=%d reason=%s\n", req.seq_id, reason);
     }
 
+    void reset_paged_request_for_reprefill(paged_request_state & req, const char * reason) {
+        reset_paged_request_state(req, reason);
+        req.sampled = LLAMA_TOKEN_NULL;
+        req.i_batch = -1;
+        req.n_decoded = 0;
+        req.n_remaining = -1;
+        req.n_prompt_tokens_cache = 0;
+        req.n_prompt_tokens_processed = 0;
+        req.spec.clear_runtime();
+        req.drop_cache_on_release = true;
+        SRV_WRN("[paged] re-prefill reset seq_id=%d reason=%s\n", req.seq_id, reason);
+    }
+
     void register_paged_prefix_cache_on_release(int32_t seq_id) {
         paged_request_state * req = get_paged_request_by_seq_id(seq_id);
         const bool can_cache =
@@ -1811,6 +1824,9 @@ private:
             task.tokens.has_mtmd) {
             return;
         }
+        if (req.ctx_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+            return;
+        }
 
         const auto & task_toks = task.tokens.get_tokens();
         const int32_t cur_common = (int32_t) req.prompt.tokens.get_common_prefix(task.tokens);
@@ -1835,7 +1851,7 @@ private:
         SRV_INF("[kv-prefix-cache] paged reuse: donor=%d -> seq=%d, n_cached=%d (cur_common=%d)\n",
                 res.donor_slot_id, req.seq_id, res.n_cached_tokens, cur_pages);
 
-        reset_paged_request_state(req, "prefix-reuse");
+        reset_paged_request_for_reprefill(req, "prefix-reuse");
 
         server_scheduler::BlockManager::copy_sequence(ctx, donor->seq_id, req.seq_id);
         server_scheduler::BlockManager::truncate_seq_tail(ctx, req.seq_id, (llama_pos) res.n_cached_tokens);
@@ -2042,6 +2058,9 @@ private:
             paged_core.on_request_finished(sid);
         };
 
+        if (req.prompt.n_tokens() > 0) {
+            reset_paged_request_for_reprefill(req, "reuse-no-verified-prefix");
+        }
         try_apply_paged_prefix_cache(req, task);
 
         // sampler
@@ -3542,7 +3561,7 @@ private:
                     // matching vLLM default preemption mode).
                     paged_request_state * victim = get_paged_request_by_seq_id(preempted_seq_id);
                     if (victim) {
-                        reset_paged_request_state(*victim, "kv-preemption");
+                        reset_paged_request_for_reprefill(*victim, "kv-preemption");
                         server_scheduler::BlockManager::release_blocks(*victim);
                         PGD_WRN(*victim, "preempted by scheduler due to KV pressure, seq_id=%d\n", preempted_seq_id);
                     }
@@ -3800,7 +3819,7 @@ private:
                             if (reason && std::string_view(reason) == "truncate-failed") {
                                 ++paged_truncate_failed_;
                             }
-                            reset_paged_request_state(r, reason);
+                            reset_paged_request_for_reprefill(r, reason);
                         },
                         /*on_create_checkpoint=*/[this](paged_request_state & r, int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
                             create_checkpoint(r, n_tokens_cur, pos_min, pos_max);
@@ -4063,7 +4082,7 @@ private:
                                 if (reason && std::string_view(reason) == "truncate-failed") {
                                     ++paged_truncate_failed_;
                                 }
-                                reset_paged_request_state(r, reason);
+                                reset_paged_request_for_reprefill(r, reason);
                             },
                             /*on_create_checkpoint=*/[this](paged_request_state & r, int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
                                 create_checkpoint(r, n_tokens_cur, pos_min, pos_max);

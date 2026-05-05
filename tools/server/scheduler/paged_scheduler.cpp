@@ -314,6 +314,10 @@ bool PagedScheduler::validate_prefill_truncate(llama_context * ctx, const Reques
     if (!ctx) {
         return false;
     }
+    const bool legacy_truncate_enabled = std::getenv("LLAMA_PAGED_ENABLE_LEGACY_TRUNCATE") != nullptr;
+    if (!legacy_truncate_enabled || req.ctx_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+        return true;
+    }
     const llama_pos p0 = req.prompt.tokens.pos_next();
     // If p0 == 0 the KV sequence is already empty; nothing to truncate.
     // Calling seq_rm(seq_id, 0, -1) on an uninitialised or empty sequence
@@ -322,7 +326,28 @@ bool PagedScheduler::validate_prefill_truncate(llama_context * ctx, const Reques
     if (p0 == 0) {
         return true;
     }
-    return BlockManager::truncate_seq_tail(ctx, req.seq_id, p0);
+    const llama_pos pos_min_before = BlockManager::seq_pos_min(ctx, req.seq_id);
+    const llama_pos pos_max_before = BlockManager::seq_pos_max(ctx, req.seq_id);
+    PGD_WRN(req, "[truncate-debug] seq=%d task=%d phase=%d old_prompt_tokens=%zu new_task_tokens=%d common_prefix=%d pos_next=%d seq_pos_min=%d seq_pos_max=%d ctx_seq_rm_type=%d\n",
+            req.seq_id,
+            req.request_id,
+            (int) req.phase,
+            req.prompt.tokens.size(),
+            req.task ? req.task->n_tokens() : -1,
+            (int) req.prompt.tokens.size(),
+            (int) p0,
+            (int) pos_min_before,
+            (int) pos_max_before,
+            (int) req.ctx_seq_rm_type);
+    const bool ok = BlockManager::truncate_seq_tail(ctx, req.seq_id, p0);
+    const llama_pos pos_min_after = BlockManager::seq_pos_min(ctx, req.seq_id);
+    const llama_pos pos_max_after = BlockManager::seq_pos_max(ctx, req.seq_id);
+    PGD_WRN(req, "[truncate-debug-after] seq=%d ok=%d seq_pos_min=%d seq_pos_max=%d\n",
+            req.seq_id,
+            ok ? 1 : 0,
+            (int) pos_min_after,
+            (int) pos_max_after);
+    return ok;
 }
 
 PrefillCheckpointDecision PagedScheduler::restore_or_reset_checkpoint(
@@ -407,6 +432,7 @@ PrefillRequestResult PagedScheduler::process_prefill_request(
     PrefillRequestResult out;
     int32_t req_prefill_added = 0;
     const int64_t n_tokens_prev = batch.n_tokens;
+    bool just_started_prefill = false;
 
     if (should_begin_prefill(req)) {
         const int64_t t_prefill_start = ggml_time_us();
@@ -433,12 +459,13 @@ PrefillRequestResult PagedScheduler::process_prefill_request(
         n_past = adjust_n_past_for_prompt_logits(req, ckpt.n_past);
         prune_invalid_checkpoints(req, ckpt.pos_next, params.checkpoints_enabled);
         begin_prefill(req, n_past, t_prefill_start);
+        just_started_prefill = true;
         if (should_send_prefill_progress(req) && cbs.on_partial_progress) {
             cbs.on_partial_progress(req);
         }
     }
 
-    if (!validate_prefill_truncate(params.ctx, req)) {
+    if (just_started_prefill && !validate_prefill_truncate(params.ctx, req)) {
         // Truncation failure with p0 > 0: the KV cache backend does not support
         // partial sequence removal (e.g. hybrid recurrent+attention models).
         // A hard reset clears the cached prefix so prefill restarts from scratch.

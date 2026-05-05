@@ -121,7 +121,9 @@ bool BlockManager::clear_sequence(llama_context * ctx, int32_t seq_id) {
     if (!ctx) {
         return false;
     }
-    return llama_memory_seq_rm(llama_get_memory(ctx), seq_id, -1, -1);
+    const bool ok = llama_memory_seq_rm(llama_get_memory(ctx), seq_id, -1, -1);
+    llama_kv_cache_rebuild_block_table(llama_get_memory(ctx), seq_id);
+    return ok;
 }
 
 bool BlockManager::copy_sequence(llama_context * ctx, int32_t src_seq_id, int32_t dst_seq_id) {
@@ -130,6 +132,7 @@ bool BlockManager::copy_sequence(llama_context * ctx, int32_t src_seq_id, int32_
     }
     clear_sequence(ctx, dst_seq_id);
     llama_memory_seq_cp(llama_get_memory(ctx), src_seq_id, dst_seq_id, -1, -1);
+    llama_kv_cache_rebuild_block_table(llama_get_memory(ctx), dst_seq_id);
     return true;
 }
 
@@ -144,7 +147,9 @@ bool BlockManager::truncate_seq_tail(llama_context * ctx, int32_t seq_id, llama_
     if (!ctx) {
         return false;
     }
-    return llama_memory_seq_rm(llama_get_memory(ctx), seq_id, from_pos, -1);
+    const bool ok = llama_memory_seq_rm(llama_get_memory(ctx), seq_id, from_pos, -1);
+    llama_kv_cache_rebuild_block_table(llama_get_memory(ctx), seq_id);
+    return ok;
 }
 
 llama_pos BlockManager::seq_pos_min(llama_context * ctx, int32_t seq_id) {
