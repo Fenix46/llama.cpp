@@ -1785,15 +1785,35 @@ private:
 
     void register_paged_prefix_cache_on_release(int32_t seq_id) {
         paged_request_state * req = get_paged_request_by_seq_id(seq_id);
+        const bool cacheable_task =
+            req != nullptr &&
+            req->task &&
+            (req->task->type == SERVER_TASK_TYPE_COMPLETION || req->task->need_sampling());
         const bool can_cache =
             seq_id >= 0 &&
             req != nullptr &&
             req->task &&
             !req->drop_cache_on_release &&
             req->task->params.cache_prompt &&
-            req->task->type == SERVER_TASK_TYPE_COMPLETION &&
+            cacheable_task &&
             !req->prompt.tokens.has_mtmd &&
             !req->prompt.tokens.empty();
+
+        SRV_WRN(
+            "[paged-release-cache-check] seq=%d req=%p task=%p can_cache=%d "
+            "drop=%d cache_prompt=%d task_type=%d has_mtmd=%d prompt_tokens=%zu "
+            "prefix_cache=%d cache_ram_mib=%d\n",
+            seq_id,
+            (void *) req,
+            req ? (void *) req->task.get() : nullptr,
+            can_cache ? 1 : 0,
+            req ? (req->drop_cache_on_release ? 1 : 0) : -1,
+            (req && req->task) ? (req->task->params.cache_prompt ? 1 : 0) : -1,
+            (req && req->task) ? (int) req->task->type : -1,
+            req ? (req->prompt.tokens.has_mtmd ? 1 : 0) : -1,
+            req ? req->prompt.tokens.size() : 0,
+            prefix_cache_ ? 1 : 0,
+            params_base.cache_ram_mib);
 
         if (can_cache) {
             if (prefix_cache_) {
@@ -2058,10 +2078,24 @@ private:
             paged_core.on_request_finished(sid);
         };
 
-        if (req.prompt.n_tokens() > 0) {
+        bool same_seq_append_reuse = false;
+        if (req.prompt.n_tokens() > 0 && task.params.cache_prompt && !task.tokens.has_mtmd) {
+            const auto & old_toks = req.prompt.tokens.get_tokens();
+            const auto & new_toks = task.tokens.get_tokens();
+            if (new_toks.size() >= old_toks.size() &&
+                std::equal(old_toks.begin(), old_toks.end(), new_toks.begin())) {
+                same_seq_append_reuse = true;
+                SRV_INF("[paged] same-seq append reuse seq=%d old=%zu new=%zu suffix=%zu\n",
+                        req.seq_id, old_toks.size(), new_toks.size(), new_toks.size() - old_toks.size());
+            }
+        }
+
+        if (!same_seq_append_reuse && req.prompt.n_tokens() > 0) {
             reset_paged_request_for_reprefill(req, "reuse-no-verified-prefix");
         }
-        try_apply_paged_prefix_cache(req, task);
+        if (!same_seq_append_reuse) {
+            try_apply_paged_prefix_cache(req, task);
+        }
 
         // sampler
         if (task.need_sampling()) {
