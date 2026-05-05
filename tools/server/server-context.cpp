@@ -3418,22 +3418,28 @@ private:
             const float kv_pressure_ratio = server_scheduler::BlockManager::pressure_ratio(blk_stats, paged_total_blocks_);
             const int32_t block_size_for_fit = paged_blocks_per_seq_ > 0 ? std::max(1, n_ctx_slot_ / paged_blocks_per_seq_) : 1;
 
-            // Count decode-phase requests to compute a decode-aware prefill cap.
-            // When decode requests are active, cap prefill chunks so they don't
-            // monopolize the GPU batch — matches vLLM long_prefill_token_threshold
-            // semantics. With N active decode sequences, each gets 1 token and
-            // the remaining budget is shared with prefill; cap prefill per-request
-            // to n_ubatch / (1 + n_decode_active) so decode latency stays bounded.
+            // Count decode-ready requests to apply an adaptive prefill cap.
+            // Decode-active ticks get a small prefill chunk; idle-decode ticks
+            // allow larger prefill chunks for throughput.
             int32_t n_decode_active = 0;
             for (const auto & req : paged_requests) {
-                if (req.phase == PAGED_REQUEST_DECODING) {
+                if (req.phase == PAGED_REQUEST_DECODING || req.phase == PAGED_REQUEST_DONE_PREFILL) {
                     n_decode_active++;
                 }
             }
-            const int32_t eff_ubatch = n_ubatch > 0 ? n_ubatch : n_batch;
+            auto env_i32 = [](const char * name, int32_t def) {
+                const char * v = std::getenv(name);
+                if (!v || !*v) {
+                    return def;
+                }
+                const int32_t parsed = atoi(v);
+                return parsed > 0 ? parsed : def;
+            };
+            const int32_t prefill_chunk_active_decode = env_i32("LLAMA_PAGED_PREFILL_CHUNK_ACTIVE_DECODE", 256);
+            const int32_t prefill_chunk_idle = env_i32("LLAMA_PAGED_PREFILL_CHUNK_IDLE", 2048);
             const int32_t prefill_threshold = n_decode_active > 0
-                ? std::max(64, eff_ubatch / (1 + n_decode_active))
-                : eff_ubatch;
+                ? prefill_chunk_active_decode
+                : prefill_chunk_idle;
 
             const auto schedule_decision = paged_core.schedule_tokens(server_scheduler::SchedulerCore::RuntimeSnapshot{
                 /*reqs=*/&paged_requests,
