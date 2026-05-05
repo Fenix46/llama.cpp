@@ -2107,6 +2107,23 @@ void llama_kv_cache::set_input_block_table(ggml_tensor * dst) const {
     } else {
         std::fill(block_table_dirty_seq.begin(), block_table_dirty_seq.end(), 0);
     }
+
+    if (std::getenv("LLAMA_PAGED_DEBUG_INPUTS")) {
+        for (uint32_t seq = 0; seq < std::min<uint32_t>(n_seqs, 4); ++seq) {
+            int mapped = 0;
+            for (uint32_t page = 0; page < max_pages; ++page) {
+                const int32_t blk = data[seq * max_pages + page];
+                if (blk >= 0) {
+                    ++mapped;
+                    if (mapped <= 8) {
+                        LLAMA_LOG_WARN("[paged-input-block-table] seq=%u page=%u blk=%d\n",
+                            seq, page, blk);
+                    }
+                }
+            }
+            LLAMA_LOG_WARN("[paged-input-block-table] seq=%u mapped_pages=%d\n", seq, mapped);
+        }
+    }
 }
 
 ggml_tensor * llama_kv_cache::build_input_seq_ids_q(ggml_context * ctx, const llama_ubatch & ubatch) const {
