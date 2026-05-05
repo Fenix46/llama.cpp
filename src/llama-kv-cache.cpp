@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -2145,6 +2146,16 @@ void llama_kv_cache::set_input_seq_ids_q(ggml_tensor * dst, const llama_ubatch *
     for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
         data[i] = (ubatch->n_seq_id[i] > 0) ? (int32_t) ubatch->seq_id[i][0] : 0;
     }
+
+    if (std::getenv("LLAMA_PAGED_DEBUG_INPUTS")) {
+        for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+            LLAMA_LOG_WARN("[paged-input-seq_ids_q] q=%u pos=%d n_seq_id=%d seq=%d\n",
+                i,
+                ubatch->pos[i],
+                ubatch->n_seq_id[i],
+                data[i]);
+        }
+    }
 }
 
 void llama_kv_cache::set_input_page_limits_q(ggml_tensor * dst, const llama_ubatch * ubatch) const {
@@ -2177,6 +2188,17 @@ void llama_kv_cache::set_input_page_limits_q(ggml_tensor * dst, const llama_ubat
 
         data[i*2 + 0] = start_page;
         data[i*2 + 1] = end_page;
+    }
+
+    if (std::getenv("LLAMA_PAGED_DEBUG_INPUTS")) {
+        for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+            LLAMA_LOG_WARN("[paged-input-page_limits_q] q=%u seq=%d pos=%d start_page=%d end_page=%d\n",
+                i,
+                ubatch->n_seq_id[i] > 0 ? ubatch->seq_id[i][0] : -1,
+                ubatch->pos[i],
+                data[i*2 + 0],
+                data[i*2 + 1]);
+        }
     }
 }
 
