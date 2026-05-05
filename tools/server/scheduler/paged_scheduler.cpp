@@ -5,6 +5,7 @@
 #include "request_lifecycle.h"
 #include "speculative_executor.h"
 
+#include <atomic>
 #include <cstdlib>
 
 namespace server_scheduler {
@@ -552,11 +553,18 @@ DecodePassResult PagedScheduler::process_decode_pass(
     int32_t decode_segments = 0;
     int32_t decode_tokens_total = 0;
     const bool paged_trace = std::getenv("LLAMA_PAGED_TRACE") != nullptr;
+    const char * trace_every_env = std::getenv("LLAMA_PAGED_TRACE_EVERY");
+    int32_t trace_every = trace_every_env ? std::max(1, atoi(trace_every_env)) : 100;
+    static std::atomic<uint64_t> decode_pass_counter { 0 };
+    const uint64_t decode_pass_index = decode_pass_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+    const bool trace_this_pass = paged_trace && (decode_pass_index % (uint64_t) trace_every == 0);
+    int64_t decode_us = 0;
+    int64_t sample_us = 0;
 
     for (int32_t i = 0; i < batch.n_tokens; i = i_next) {
         const auto seg = StepExecutor::select_decode_segment(batch, i, cur_n_batch, paged_scheduler);
         const int32_t n_tokens = seg.n_tokens;
-        if (paged_trace) {
+        if (trace_this_pass) {
             SRV_WRN("[paged-decode-seg] batch_total=%d i=%d n_tokens=%d paged=%d\n",
                 batch.n_tokens,
                 i,
@@ -578,7 +586,9 @@ DecodePassResult PagedScheduler::process_decode_pass(
         decode_tokens_total += n_tokens;
 
         const llama_batch batch_view = StepExecutor::make_batch_view(batch, i, n_tokens);
+        const int64_t t_decode_start = ggml_time_us();
         const int ret = StepExecutor::decode_segment(ctx, batch, i, n_tokens);
+        decode_us += ggml_time_us() - t_decode_start;
         if (cbs.on_segment_decoded) {
             cbs.on_segment_decoded();
         }
@@ -606,6 +616,7 @@ DecodePassResult PagedScheduler::process_decode_pass(
         i_next = i + n_tokens;
         cur_n_batch = n_batch;
 
+        const int64_t t_sample_start = ggml_time_us();
         if (cbs.on_segment_sample) {
             cbs.on_segment_sample(i, n_tokens, batch_view);
         }
@@ -636,13 +647,25 @@ DecodePassResult PagedScheduler::process_decode_pass(
                 out.speculative_rejected_tokens += std::max(0, rejected_before - rejected_after);
             }
         }
+        sample_us += ggml_time_us() - t_sample_start;
     }
 
-    if (paged_trace) {
-        SRV_WRN("[paged-decode-pass] batch_total=%d segments=%d decoded=%d\n",
+    if (trace_this_pass) {
+        int32_t active_reqs = 0;
+        if (cbs.reqs != nullptr) {
+            for (const auto & req : *cbs.reqs) {
+                if (req.is_processing()) {
+                    ++active_reqs;
+                }
+            }
+        }
+        SRV_WRN("[paged-decode-pass] active_reqs=%d batch_total=%d segments=%d decoded=%d decode_ms=%.3f sample_ms=%.3f\n",
+            active_reqs,
             batch.n_tokens,
             decode_segments,
-            decode_tokens_total);
+            decode_tokens_total,
+            decode_us / 1000.0,
+            sample_us / 1000.0);
     }
 
     return out;
