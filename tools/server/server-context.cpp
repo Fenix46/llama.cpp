@@ -3681,6 +3681,16 @@ private:
 
             if (batch.n_tokens == 0) {
                 SRV_WRN("%s", "[paged] no tokens to decode\n");
+                // In paged latency scheduling a zero-token turn can happen when
+                // budgets/plans yield no executable work for this immediate pass.
+                // Do not crash if there is still pending prefill/decode-ready
+                // work; just yield and continue next scheduler iteration.
+                if (decode_ready_reqs_tick > 0 || prefill_ready_reqs_tick > 0) {
+                    n_empty_consecutive = 0;
+                    SRV_DBG("[paged] yielding empty turn (decode_ready=%d, prefill_ready=%d)\n",
+                            decode_ready_reqs_tick, prefill_ready_reqs_tick);
+                    return;
+                }
                 if (++n_empty_consecutive > 3) {
                     GGML_ABORT("fatal error - please provide logs and repro in %s\n",
                                "https://github.com/ggml-org/llama.cpp/pull/20277");
