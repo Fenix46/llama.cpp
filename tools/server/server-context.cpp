@@ -3557,6 +3557,33 @@ private:
                 sched_decode_toks_tick += plan.scheduled_decode_tokens;
                 sched_prefill_toks_tick += plan.scheduled_prefill_tokens;
             }
+            int32_t active_reqs_tick = 0;
+            int32_t decode_ready_reqs_tick = 0;
+            int32_t prefill_ready_reqs_tick = 0;
+            for (const auto & req : paged_requests) {
+                if (!req.is_processing()) {
+                    continue;
+                }
+                ++active_reqs_tick;
+                if (req.phase == PAGED_REQUEST_DECODING || req.phase == PAGED_REQUEST_DONE_PREFILL) {
+                    ++decode_ready_reqs_tick;
+                }
+                if (req.phase == PAGED_REQUEST_STARTED || req.phase == PAGED_REQUEST_PREFILLING) {
+                    ++prefill_ready_reqs_tick;
+                }
+            }
+            if (decode_ready_reqs_tick > 0 && sched_decode_toks_tick == 0) {
+                SRV_ERR("[paged-sched-bug] decode_ready=%d but decode_sched=0 active=%d prefill_ready=%d prefill_sched=%d batch=%d\n",
+                        decode_ready_reqs_tick,
+                        active_reqs_tick,
+                        prefill_ready_reqs_tick,
+                        sched_prefill_toks_tick,
+                        batch.n_tokens);
+                const bool latency_mode = decode_ready_reqs_tick > 0;
+                if (latency_mode) {
+                    GGML_ASSERT(!(decode_ready_reqs_tick > 0 && sched_decode_toks_tick == 0));
+                }
+            }
             // Enforce token-plan budget at execution time: prevents oversized
             // prefill bursts from monopolizing the batch when decode is active.
             if (sched_prefill_toks_tick >= 0) {
@@ -3622,29 +3649,13 @@ private:
             }
 
             if (std::getenv("LLAMA_PAGED_SCHED_TRACE")) {
-                int32_t active_reqs = 0;
-                int32_t decode_ready_reqs = 0;
-                int32_t prefill_ready_reqs = 0;
                 const int32_t decode_tokens_scheduled = sched_decode_toks_tick;
                 const int32_t prefill_tokens_scheduled = sched_prefill_toks_tick;
 
-                for (const auto & req : paged_requests) {
-                    if (!req.is_processing()) {
-                        continue;
-                    }
-                    ++active_reqs;
-                    if (req.phase == PAGED_REQUEST_DECODING || req.phase == PAGED_REQUEST_DONE_PREFILL) {
-                        ++decode_ready_reqs;
-                    }
-                    if (req.phase == PAGED_REQUEST_STARTED || req.phase == PAGED_REQUEST_PREFILLING) {
-                        ++prefill_ready_reqs;
-                    }
-                }
-
                 SRV_WRN("[paged-sched] active=%d decode_ready=%d prefill_ready=%d decode_sched=%d prefill_sched=%d prefill_cap=%d batch=%d n_decode_rows=%zu n_prefill_rows=%zu\n",
-                        active_reqs,
-                        decode_ready_reqs,
-                        prefill_ready_reqs,
+                        active_reqs_tick,
+                        decode_ready_reqs_tick,
+                        prefill_ready_reqs_tick,
                         decode_tokens_scheduled,
                         prefill_tokens_scheduled,
                         prefill_threshold,
