@@ -120,6 +120,13 @@ struct paged_request_state {
     int32_t n_prompt_tokens_processed = 0;
 
     // --- timing ---
+    int64_t t_arrival_us            = 0;
+    int64_t t_admitted_us           = 0;
+    int64_t t_first_prefill_start_us = 0;
+    int64_t t_prefill_done_us       = 0;
+    int64_t t_first_token_us        = 0;
+    int64_t t_last_token_us         = 0;
+
     int64_t t_start_process_prompt = 0;
     int64_t t_start_generation     = 0;
     int64_t t_last_used            = -1;

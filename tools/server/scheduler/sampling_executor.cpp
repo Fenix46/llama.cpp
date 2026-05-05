@@ -74,9 +74,11 @@ SamplingExecutor::SampleDecision SamplingExecutor::sample_token(RequestState & r
 
 void SamplingExecutor::on_sampled_token(RequestState & req, int64_t t_current_us) {
     req.n_decoded += 1;
+    req.t_last_token_us = t_current_us;
 
     if (req.n_decoded == 1) {
         req.t_start_generation = t_current_us;
+        req.t_first_token_us = t_current_us;
         req.t_prompt_processing = (req.t_start_generation - req.t_start_process_prompt) / 1e3;
     }
 

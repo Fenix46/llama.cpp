@@ -60,6 +60,12 @@ bool PagedScheduler::should_begin_prefill(const RequestState & req) {
 }
 
 void PagedScheduler::begin_prefill(RequestState & req, int32_t n_past, int64_t t_start_process_prompt_us) {
+    if (req.t_admitted_us == 0) {
+        req.t_admitted_us = t_start_process_prompt_us;
+    }
+    if (req.t_first_prefill_start_us == 0) {
+        req.t_first_prefill_start_us = t_start_process_prompt_us;
+    }
     req.t_start_process_prompt = t_start_process_prompt_us;
     req.t_start_generation = 0;
     (void) transition(req, RequestEvent::BeginPrefill);
@@ -70,6 +76,7 @@ void PagedScheduler::begin_prefill(RequestState & req, int32_t n_past, int64_t t
 
 void PagedScheduler::mark_prompt_done(RequestState & req, llama_batch & batch) {
     (void) transition(req, RequestEvent::PromptDone);
+    req.t_prefill_done_us = ggml_time_us();
     GGML_ASSERT(batch.n_tokens > 0);
     batch.logits[batch.n_tokens - 1] = true;
     req.n_decoded = 0;

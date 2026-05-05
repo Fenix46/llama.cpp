@@ -2058,6 +2058,12 @@ private:
         req.request_id = task.id;
         req.parent_id  = task.id_parent;
         req.phase      = task.is_child() ? PAGED_REQUEST_WAIT_PARENT : PAGED_REQUEST_STARTED;
+        req.t_arrival_us = ggml_time_us();
+        req.t_admitted_us = 0;
+        req.t_first_prefill_start_us = 0;
+        req.t_prefill_done_us = 0;
+        req.t_first_token_us = 0;
+        req.t_last_token_us = 0;
         req.task       = std::make_unique<const server_task>(std::move(task));
 
         n_empty_consecutive = 0;
@@ -2653,6 +2659,30 @@ private:
         res->generation_params = req.task->params;
 
         queue_results.send(std::move(res));
+
+        const int64_t now_us = ggml_time_us();
+        const int64_t admitted_us = req.t_admitted_us > 0 ? req.t_admitted_us : req.t_arrival_us;
+        const int64_t prefill_start_us = req.t_first_prefill_start_us > 0 ? req.t_first_prefill_start_us : admitted_us;
+        const int64_t prefill_done_us = req.t_prefill_done_us > 0 ? req.t_prefill_done_us : now_us;
+        const int64_t first_token_us = req.t_first_token_us > 0 ? req.t_first_token_us : now_us;
+        const int64_t last_token_us = req.t_last_token_us > 0 ? req.t_last_token_us : now_us;
+
+        const int64_t queue_wait_ms = std::max<int64_t>(0, (admitted_us - req.t_arrival_us) / 1000);
+        const int64_t ttft_ms = std::max<int64_t>(0, (first_token_us - req.t_arrival_us) / 1000);
+        const int64_t prefill_ms = std::max<int64_t>(0, (prefill_done_us - prefill_start_us) / 1000);
+        const int64_t decode_ms = std::max<int64_t>(0, (last_token_us - first_token_us) / 1000);
+        const int64_t total_ms = std::max<int64_t>(0, (now_us - req.t_arrival_us) / 1000);
+
+        SRV_WRN("[paged-latency] seq=%d task=%d prompt_tokens=%d output_tokens=%d queue_wait_ms=%lld ttft_ms=%lld prefill_ms=%lld decode_ms=%lld total_ms=%lld\n",
+                req.seq_id,
+                req.request_id,
+                req.task ? req.task->n_tokens() : 0,
+                req.n_decoded,
+                (long long) queue_wait_ms,
+                (long long) ttft_ms,
+                (long long) prefill_ms,
+                (long long) decode_ms,
+                (long long) total_ms);
     }
 
     // --- end paged overloads ---
@@ -3571,9 +3601,17 @@ private:
             auto prefill_cursor = paged_sched.make_prefill_cursor(budget);
             int32_t sched_decode_toks_tick = 0;
             int32_t sched_prefill_toks_tick = 0;
+            int32_t planned_decode_rows_tick = 0;
+            int32_t planned_prefill_rows_tick = 0;
             for (const auto & plan : schedule_decision.request_plans) {
                 sched_decode_toks_tick += plan.scheduled_decode_tokens;
                 sched_prefill_toks_tick += plan.scheduled_prefill_tokens;
+                if (plan.scheduled_decode_tokens > 0) {
+                    planned_decode_rows_tick++;
+                }
+                if (plan.scheduled_prefill_tokens > 0) {
+                    planned_prefill_rows_tick++;
+                }
             }
             const bool latency_mode = std::getenv("LLAMA_PAGED_LATENCY_MODE") == nullptr ||
                 std::string_view(std::getenv("LLAMA_PAGED_LATENCY_MODE")) != "0";
@@ -3604,6 +3642,17 @@ private:
                 if (latency_mode) {
                     GGML_ASSERT(!(decode_ready_reqs_tick > 0 && sched_decode_toks_tick == 0));
                 }
+            }
+            if (decode_ready_reqs_tick == 0 &&
+                prefill_ready_reqs_tick > 0 &&
+                sched_decode_toks_tick == 0 &&
+                sched_prefill_toks_tick == 0 &&
+                !prefill_candidates.empty()) {
+                // Safety fallback: if prefill-ready requests exist but token planning
+                // produced no executable rows, force one small prefill chunk to avoid
+                // empty-turn stalls.
+                sched_prefill_toks_tick = std::max(1, std::min(prefill_threshold, max_num_scheduled_tokens));
+                planned_prefill_rows_tick = 1;
             }
             // Enforce token-plan budget at execution time: prevents oversized
             // prefill bursts from monopolizing the batch when decode is active.
@@ -3750,8 +3799,8 @@ private:
                         prefill_tokens_scheduled,
                         prefill_threshold,
                         batch.n_tokens,
-                        tick_outcome.decode_rows.size(),
-                        tick_outcome.prefill_rows.size());
+                        (size_t) planned_decode_rows_tick,
+                        (size_t) planned_prefill_rows_tick);
             }
 
             SRV_DBG("[paged] decoding batch, n_tokens=%d\n", batch.n_tokens);
