@@ -714,6 +714,8 @@ private:
     int slots_debug = 0;
     int n_empty_consecutive = 0;
     size_t paged_prefill_rr_cursor = 0;
+    int32_t paged_decode_burst_steps = 0;
+    int32_t paged_decode_steps_since_long_prefill = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
@@ -3478,6 +3480,8 @@ private:
             const int32_t prefill_chunk_short = env_i32("LLAMA_PAGED_PREFILL_CHUNK_SHORT", 512);
             const int32_t prefill_chunk_long = env_i32("LLAMA_PAGED_PREFILL_CHUNK_LONG", 128);
             const int32_t prefill_chunk_idle = env_i32("LLAMA_PAGED_PREFILL_CHUNK_IDLE", policy_latency ? prefill_chunk_idle_latency : 2048);
+            const int32_t prefill_every_n_decode_steps = env_i32("LLAMA_PAGED_PREFILL_EVERY_N_DECODE_STEPS", policy_latency ? 8 : 1);
+            const int32_t decode_burst_tokens = env_i32("LLAMA_PAGED_DECODE_BURST_TOKENS", policy_latency ? 8 : 1);
             const int32_t max_batched_tokens_latency = env_i32("LLAMA_PAGED_MAX_NUM_BATCHED_TOKENS_LATENCY", 512);
             const int32_t max_batched_tokens_throughput = env_i32("LLAMA_PAGED_MAX_NUM_BATCHED_TOKENS_THROUGHPUT", n_batch);
 
@@ -3631,6 +3635,9 @@ private:
                     ++prefill_ready_reqs_tick;
                 }
             }
+            if (decode_ready_reqs_tick == 0) {
+                paged_decode_burst_steps = 0;
+            }
             if (decode_ready_reqs_tick > 0 && sched_decode_toks_tick == 0) {
                 SRV_ERR("[paged-sched-bug] decode_ready=%d but decode_sched=0 active=%d prefill_ready=%d prefill_sched=%d batch=%d\n",
                         decode_ready_reqs_tick,
@@ -3699,10 +3706,31 @@ private:
             prefill_candidates.insert(prefill_candidates.end(), long_near_done.begin(), long_near_done.end());
             prefill_candidates.insert(prefill_candidates.end(), long_cont.begin(), long_cont.end());
 
+            const bool has_short_prefill = !short_new.empty() || !short_cont.empty();
+            const bool has_long_prefill = !long_near_done.empty() || !long_cont.empty();
+            bool long_prefill_background_slice = false;
+            bool short_prefill_priority_slice = false;
+            bool decode_burst_only = false;
+
+            if (policy_latency && decode_ready_reqs_tick > 0 && has_long_prefill && !has_short_prefill) {
+                const bool allow_long_prefill = (paged_decode_burst_steps >= decode_burst_tokens) ||
+                    (paged_decode_steps_since_long_prefill >= prefill_every_n_decode_steps);
+                if (!allow_long_prefill) {
+                    prefill_candidates.clear();
+                    sched_prefill_toks_tick = 0;
+                    planned_prefill_rows_tick = 0;
+                    decode_burst_only = true;
+                } else {
+                    long_prefill_background_slice = true;
+                }
+            }
+            if (policy_latency && has_short_prefill) {
+                short_prefill_priority_slice = true;
+            }
+
             // Latency policy: cap prefill more aggressively by class and
             // restrict long prefill to a single chunk per scheduling turn.
             if (policy_latency) {
-                const bool has_short_prefill = !short_new.empty() || !short_cont.empty();
                 if (n_decode_active > 0) {
                     prefill_cursor.prefill_total_budget = std::min(prefill_cursor.prefill_total_budget, prefill_chunk_active_decode);
                     prefill_cursor.prefill_per_request_budget = std::min(prefill_cursor.prefill_per_request_budget, prefill_chunk_active_decode);
@@ -3976,10 +4004,16 @@ private:
                 const int32_t executed_prefill_tokens = 0;
                 GGML_ASSERT(executed_prefill_tokens == 0);
                 GGML_ASSERT(batch.n_tokens == executed_decode_tokens);
+                if (executed_decode_tokens > 0) {
+                    paged_decode_burst_steps++;
+                    paged_decode_steps_since_long_prefill++;
+                }
                 if (std::getenv("LLAMA_PAGED_SCHED_TRACE")) {
                     SRV_WRN("[paged-sched-phase] phase=decode_only planned_decode=%d planned_prefill=%d executed_decode=%d executed_prefill=%d batch=%d\n",
                             sched_decode_toks_tick, sched_prefill_toks_tick,
                             executed_decode_tokens, executed_prefill_tokens, batch.n_tokens);
+                    SRV_WRN("[paged-sched-phase] phase=decode_only reason=decode_burst step=%d/%d\n",
+                            paged_decode_burst_steps, std::max(1, decode_burst_tokens));
                 }
 
                 common_batch_clear(batch);
@@ -4045,10 +4079,19 @@ private:
                     const int32_t executed_prefill_tokens = batch.n_tokens;
                     GGML_ASSERT(executed_decode_tokens == 0);
                     GGML_ASSERT(batch.n_tokens == executed_prefill_tokens);
+                    if (long_prefill_background_slice) {
+                        paged_decode_burst_steps = 0;
+                        paged_decode_steps_since_long_prefill = 0;
+                    }
                     if (std::getenv("LLAMA_PAGED_SCHED_TRACE")) {
                         SRV_WRN("[paged-sched-phase] phase=prefill_only planned_decode=%d planned_prefill=%d executed_decode=%d executed_prefill=%d batch=%d\n",
                                 0, sched_prefill_toks_tick,
                                 executed_decode_tokens, executed_prefill_tokens, batch.n_tokens);
+                        if (short_prefill_priority_slice) {
+                            SRV_WRN("%s", "[paged-sched-phase] phase=prefill_only class=short reason=first_token_priority\n");
+                        } else if (long_prefill_background_slice) {
+                            SRV_WRN("%s", "[paged-sched-phase] phase=prefill_only class=long reason=background_slice\n");
+                        }
                     }
 
                     const auto prefill_decode_outcome = server_scheduler::PagedScheduler::process_decode_pass(
@@ -4085,6 +4128,30 @@ private:
                         });
                     decode_outcome.fatal = decode_outcome.fatal || prefill_decode_outcome.fatal;
                     decode_outcome.retried = decode_outcome.retried || prefill_decode_outcome.retried;
+                }
+            } else if (batch.n_tokens > 0) {
+                if (decode_tokens_in_batch > 0 && sched_prefill_toks_tick == 0) {
+                    paged_decode_burst_steps++;
+                    paged_decode_steps_since_long_prefill++;
+                    if (std::getenv("LLAMA_PAGED_SCHED_TRACE")) {
+                        SRV_WRN("[paged-sched-phase] phase=decode_only reason=decode_burst step=%d/%d\n",
+                                paged_decode_burst_steps, std::max(1, decode_burst_tokens));
+                    }
+                } else if (decode_tokens_in_batch == 0) {
+                    if (short_prefill_priority_slice) {
+                        if (std::getenv("LLAMA_PAGED_SCHED_TRACE")) {
+                            SRV_WRN("%s", "[paged-sched-phase] phase=prefill_only class=short reason=first_token_priority\n");
+                        }
+                    } else if (long_prefill_background_slice) {
+                        paged_decode_burst_steps = 0;
+                        paged_decode_steps_since_long_prefill = 0;
+                        if (std::getenv("LLAMA_PAGED_SCHED_TRACE")) {
+                            SRV_WRN("%s", "[paged-sched-phase] phase=prefill_only class=long reason=background_slice\n");
+                        }
+                    }
+                } else if (decode_burst_only && std::getenv("LLAMA_PAGED_SCHED_TRACE")) {
+                    SRV_WRN("[paged-sched-phase] phase=decode_only reason=decode_burst step=%d/%d\n",
+                            paged_decode_burst_steps, std::max(1, decode_burst_tokens));
                 }
             }
             tick_outcome.decode_result = decode_outcome;
