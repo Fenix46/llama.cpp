@@ -5,6 +5,8 @@
 #include "request_lifecycle.h"
 #include "speculative_executor.h"
 
+#include <cstdlib>
+
 namespace server_scheduler {
 
 TickOutcome PagedScheduler::tick(const PagedRuntime & runtime) const {
@@ -549,25 +551,28 @@ DecodePassResult PagedScheduler::process_decode_pass(
     int32_t cur_n_batch = n_batch;
     int32_t decode_segments = 0;
     int32_t decode_tokens_total = 0;
+    const bool paged_trace = std::getenv("LLAMA_PAGED_TRACE") != nullptr;
 
     for (int32_t i = 0; i < batch.n_tokens; i = i_next) {
         const auto seg = StepExecutor::select_decode_segment(batch, i, cur_n_batch, paged_scheduler);
         const int32_t n_tokens = seg.n_tokens;
-        SRV_WRN("[paged-decode-seg] batch_total=%d i=%d n_tokens=%d paged=%d\n",
-            batch.n_tokens,
-            i,
-            n_tokens,
-            paged_scheduler ? 1 : 0);
-        for (int32_t j = 0; j < n_tokens; ++j) {
-            const int32_t idx = i + j;
-            SRV_WRN("[paged-decode-row] local=%d global=%d token=%d pos=%d n_seq_id=%d seq0=%d logits=%d\n",
-                j,
-                idx,
-                batch.token[idx],
-                batch.pos[idx],
-                batch.n_seq_id[idx],
-                batch.n_seq_id[idx] > 0 ? batch.seq_id[idx][0] : -1,
-                batch.logits[idx] ? 1 : 0);
+        if (paged_trace) {
+            SRV_WRN("[paged-decode-seg] batch_total=%d i=%d n_tokens=%d paged=%d\n",
+                batch.n_tokens,
+                i,
+                n_tokens,
+                paged_scheduler ? 1 : 0);
+            for (int32_t j = 0; j < n_tokens; ++j) {
+                const int32_t idx = i + j;
+                SRV_WRN("[paged-decode-row] local=%d global=%d token=%d pos=%d n_seq_id=%d seq0=%d logits=%d\n",
+                    j,
+                    idx,
+                    batch.token[idx],
+                    batch.pos[idx],
+                    batch.n_seq_id[idx],
+                    batch.n_seq_id[idx] > 0 ? batch.seq_id[idx][0] : -1,
+                    batch.logits[idx] ? 1 : 0);
+            }
         }
         decode_segments++;
         decode_tokens_total += n_tokens;
@@ -633,10 +638,12 @@ DecodePassResult PagedScheduler::process_decode_pass(
         }
     }
 
-    SRV_WRN("[paged-decode-pass] batch_total=%d segments=%d decoded=%d\n",
-        batch.n_tokens,
-        decode_segments,
-        decode_tokens_total);
+    if (paged_trace) {
+        SRV_WRN("[paged-decode-pass] batch_total=%d segments=%d decoded=%d\n",
+            batch.n_tokens,
+            decode_segments,
+            decode_tokens_total);
+    }
 
     return out;
 }
@@ -708,22 +715,25 @@ DecodeBatchResult PagedScheduler::populate_decode_batch(
     }
 
 #ifndef NDEBUG
-    std::unordered_set<int32_t> seen_seq_ids;
+    const bool paged_trace = std::getenv("LLAMA_PAGED_TRACE") != nullptr;
+    if (paged_trace) {
+        std::unordered_set<int32_t> seen_seq_ids;
 
-    for (int32_t k = 0; k < batch.n_tokens; ++k) {
-        GGML_ASSERT(batch.n_seq_id[k] > 0);
-        const int32_t seq = batch.seq_id[k][0];
+        for (int32_t k = 0; k < batch.n_tokens; ++k) {
+            GGML_ASSERT(batch.n_seq_id[k] > 0);
+            const int32_t seq = batch.seq_id[k][0];
 
-        if (batch.logits[k]) {
-            seen_seq_ids.insert(seq);
+            if (batch.logits[k]) {
+                seen_seq_ids.insert(seq);
+            }
+
+            SRV_WRN("[paged-batch-final] k=%d seq=%d pos=%d logits=%d\n",
+                    k, seq, batch.pos[k], batch.logits[k] ? 1 : 0);
         }
 
-        SRV_WRN("[paged-batch-final] k=%d seq=%d pos=%d logits=%d\n",
-                k, seq, batch.pos[k], batch.logits[k] ? 1 : 0);
+        SRV_WRN("[paged-batch-final] n_tokens=%d unique_logits_seqs=%zu\n",
+                batch.n_tokens, seen_seq_ids.size());
     }
-
-    SRV_WRN("[paged-batch-final] n_tokens=%d unique_logits_seqs=%zu\n",
-            batch.n_tokens, seen_seq_ids.size());
 #endif
 
     out.decode_tokens_in_batch = batch.n_tokens;

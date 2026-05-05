@@ -2108,7 +2108,7 @@ void llama_kv_cache::set_input_block_table(ggml_tensor * dst) const {
         std::fill(block_table_dirty_seq.begin(), block_table_dirty_seq.end(), 0);
     }
 
-    if (std::getenv("LLAMA_PAGED_DEBUG_INPUTS")) {
+    if (std::getenv("LLAMA_PAGED_TRACE")) {
         for (uint32_t seq = 0; seq < std::min<uint32_t>(n_seqs, 4); ++seq) {
             int mapped = 0;
             for (uint32_t page = 0; page < max_pages; ++page) {
@@ -2164,7 +2164,7 @@ void llama_kv_cache::set_input_seq_ids_q(ggml_tensor * dst, const llama_ubatch *
         data[i] = (ubatch->n_seq_id[i] > 0) ? (int32_t) ubatch->seq_id[i][0] : 0;
     }
 
-    if (std::getenv("LLAMA_PAGED_DEBUG_INPUTS")) {
+    if (std::getenv("LLAMA_PAGED_TRACE")) {
         for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
             LLAMA_LOG_WARN("[paged-input-seq_ids_q] q=%u pos=%d n_seq_id=%d seq=%d\n",
                 i,
@@ -2207,7 +2207,7 @@ void llama_kv_cache::set_input_page_limits_q(ggml_tensor * dst, const llama_ubat
         data[i*2 + 1] = end_page;
     }
 
-    if (std::getenv("LLAMA_PAGED_DEBUG_INPUTS")) {
+    if (std::getenv("LLAMA_PAGED_TRACE")) {
         for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
             LLAMA_LOG_WARN("[paged-input-page_limits_q] q=%u seq=%d pos=%d start_page=%d end_page=%d\n",
                 i,

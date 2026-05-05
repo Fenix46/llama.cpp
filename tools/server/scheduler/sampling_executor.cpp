@@ -4,6 +4,7 @@
 #include "speculative.h"
 
 #include <algorithm>
+#include <cstdlib>
 
 namespace server_scheduler {
 
@@ -48,13 +49,15 @@ SamplingExecutor::SampleDecision SamplingExecutor::sample_token(RequestState & r
     }
 
     const int tok_idx = req.i_batch - i;
-    SRV_WRN("[paged-sample] seq=%d global_i_batch=%d segment_start=%d local_tok_idx=%d phase=%d n_decoded=%d\n",
-            req.seq_id,
-            req.i_batch,
-            i,
-            tok_idx,
-            req.phase,
-            req.n_decoded);
+    if (std::getenv("LLAMA_PAGED_TRACE")) {
+        SRV_WRN("[paged-sample] seq=%d global_i_batch=%d segment_start=%d local_tok_idx=%d phase=%d n_decoded=%d\n",
+                req.seq_id,
+                req.i_batch,
+                i,
+                tok_idx,
+                req.phase,
+                req.n_decoded);
+    }
     llama_token id = common_sampler_sample(req.smpl.get(), req.ctx, tok_idx);
     req.i_batch = -1;
     common_sampler_accept(req.smpl.get(), id, true);
