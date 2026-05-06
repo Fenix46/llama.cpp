@@ -123,6 +123,96 @@ bool BlockManager::prepare_fresh_sequence(RequestState & req) {
     return clear_destination_sequence(req);
 }
 
+std::vector<int32_t> BlockManager::get_physical_blocks_for_sequence(
+        llama_context * ctx,
+        int32_t seq_id,
+        size_t n_blocks_hint) {
+    std::vector<int32_t> blocks;
+    if (!ctx || seq_id < 0) {
+        return blocks;
+    }
+    llama_memory_t mem = llama_get_memory(ctx);
+    const int32_t total_blocks = llama_kv_cache_n_blocks(mem);
+    if (total_blocks <= 0) {
+        return blocks;
+    }
+    const uint32_t cap = n_blocks_hint > 0 ? (uint32_t) n_blocks_hint : (uint32_t) total_blocks;
+    blocks.reserve(cap);
+    for (uint32_t page = 0; page < cap; ++page) {
+        uint32_t blk_id = 0;
+        if (!llama_kv_cache_seq_get_block(mem, seq_id, page, &blk_id)) {
+            break;
+        }
+        blocks.push_back((int32_t) blk_id);
+    }
+    return blocks;
+}
+
+bool BlockManager::retain_blocks_for_cache(llama_context * ctx, const std::vector<int32_t> & blocks) {
+    if (!ctx) {
+        return false;
+    }
+    llama_memory_t mem = llama_get_memory(ctx);
+    for (const int32_t blk : blocks) {
+        if (blk < 0 || !llama_kv_cache_block_retain(mem, (uint32_t) blk)) {
+            return false;
+        }
+        LOG_DBG("[paged-blocks] retain-cache block=%d\n", blk);
+    }
+    return true;
+}
+
+bool BlockManager::release_cached_blocks(llama_context * ctx, const std::vector<int32_t> & blocks) {
+    if (!ctx) {
+        return false;
+    }
+    llama_memory_t mem = llama_get_memory(ctx);
+    for (const int32_t blk : blocks) {
+        if (blk < 0 || !llama_kv_cache_block_release(mem, (uint32_t) blk)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+BlockManager::PrefixAttachResult BlockManager::attach_cached_blocks(RequestState & req, const PrefixCacheEntryView & entry) {
+    PrefixAttachResult out;
+    out.cached_tokens = entry.n_tokens;
+    if (!req.task) {
+        out.failure_reason = "missing-task";
+        return out;
+    }
+    out.suffix_tokens = req.task->tokens.size() > entry.n_tokens ? req.task->tokens.size() - entry.n_tokens : 0;
+    if (!req.ctx || req.seq_id < 0) {
+        out.failure_reason = "invalid-dst";
+        return out;
+    }
+    if (entry.physical_block_ids.empty() || entry.n_tokens == 0) {
+        out.ok = true;
+        return out;
+    }
+    llama_memory_t mem = llama_get_memory(req.ctx);
+    if (!clear_destination_sequence(req)) {
+        out.failure_reason = "clear-dst-failed";
+        return out;
+    }
+    for (size_t page = 0; page < entry.physical_block_ids.size(); ++page) {
+        const int32_t blk = entry.physical_block_ids[page];
+        if (blk < 0 || !llama_kv_cache_seq_set_block(mem, req.seq_id, (uint32_t) page, (uint32_t) blk)) {
+            out.failure_reason = "attach-shared-failed";
+            return out;
+        }
+        if (!llama_kv_cache_block_retain(mem, (uint32_t) blk)) {
+            out.failure_reason = "retain-attached-failed";
+            return out;
+        }
+    }
+    LOG_DBG("[paged-blocks] attach-cached-blocks request_id=%d seq_id=%d cached_tokens=%zu blocks=%zu\n",
+            req.request_id, req.seq_id, out.cached_tokens, entry.physical_block_ids.size());
+    out.ok = true;
+    return out;
+}
+
 BlockManager::PrefixAttachResult BlockManager::attach_prefix(RequestState & req, const PrefixReusePlan & plan) {
     PrefixAttachResult out;
     out.cached_tokens = plan.cached_tokens;

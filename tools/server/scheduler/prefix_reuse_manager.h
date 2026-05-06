@@ -30,6 +30,15 @@ struct PrefixReuseMetadata {
     uint64_t mtmd_hash = 0;
 };
 
+struct PrefixCacheEntry {
+    uint64_t hash = 0;
+    PrefixReuseMetadata metadata;
+    size_t n_tokens = 0;
+    std::vector<int32_t> physical_block_ids;
+    uint32_t refcount = 0;
+    int64_t last_used_us = 0;
+};
+
 struct PrefixReusePlan {
     PrefixReuseMode mode = PrefixReuseMode::None;
     size_t cached_tokens = 0;
@@ -53,13 +62,14 @@ public:
             const RequestState & req,
             const PrefixReuseMetadata & md,
             bool allow_same_seq_append,
-            bool can_use_prefix_copy,
+            bool enable_donor_seq_fallback,
             const LookupRequestBySeq & lookup_req);
 
     bool register_finished_request(
             const RequestState & req,
             const PrefixReuseMetadata & md,
-            bool cacheable);
+            bool cacheable,
+            const std::vector<int32_t> & sequence_blocks);
 
     void register_raw(int32_t seq_id, const std::vector<llama_token> & tokens);
     kv_prefix_cache::lookup_result lookup_raw(const std::vector<llama_token> & tokens) const;
@@ -67,21 +77,6 @@ public:
     void record_reuse(size_t n_tokens);
     kv_prefix_cache::stats get_stats() const;
     int32_t block_size() const;
-
-    struct PrefixCacheEntry {
-        uint64_t prefix_hash = 0;
-        uint64_t model_hash = 0;
-        uint64_t adapter_hash = 0;
-        uint32_t block_size = 0;
-        size_t n_tokens = 0;
-        std::vector<int32_t> physical_block_ids;
-        uint32_t refcount = 0;        // total refs
-        uint32_t active_refcount = 0; // refs from active (in-flight) requests
-        uint32_t cache_refcount = 0;  // refs from completed but cached requests
-        int64_t last_used_us = 0;
-        int64_t created_us = 0;
-        bool is_evictable() const { return active_refcount == 0; }
-    };
 
     struct EvictExpiredResult {
         size_t evicted_entries = 0;

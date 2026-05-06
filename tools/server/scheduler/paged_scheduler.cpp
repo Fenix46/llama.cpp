@@ -74,6 +74,13 @@ void PagedScheduler::begin_prefill(RequestState & req, int32_t n_past, int64_t t
     (void) transition(req, RequestEvent::BeginPrefill);
     req.n_prompt_tokens_cache = n_past;
     req.n_prompt_tokens_processed = 0;
+    req.cached_prefix_tokens = (size_t) std::max(0, n_past);
+    req.prefill_start_token = req.cached_prefix_tokens;
+    if (req.task && req.task->n_tokens() > n_past) {
+        req.remaining_prefill_tokens = (size_t) (req.task->n_tokens() - n_past);
+    } else {
+        req.remaining_prefill_tokens = 0;
+    }
     req.prompt.tokens.keep_first(n_past);
     if (req.task) {
         const int32_t total = req.task->n_tokens();

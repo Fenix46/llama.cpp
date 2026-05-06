@@ -36,6 +36,10 @@ struct RequestLifecycleOps {
     std::function<void(int32_t, const std::vector<llama_token> &)> prefix_register;
     std::function<bool(const RequestState &, bool)> prefix_register_request;
     std::function<void(const RequestState &, int32_t, int64_t)> lineage_register_cached;
+    std::function<std::vector<int32_t>(const RequestState &, size_t)> seq_get_physical_blocks;
+    std::function<bool(const RequestState &, const std::vector<int32_t> &)> blocks_retain_cached;
+    std::function<bool(const RequestState &, const std::vector<int32_t> &)> blocks_release_cached;
+    std::function<bool(const RequestState &, const std::vector<int32_t> &)> prefix_register_request_blocks;
     std::function<bool(int32_t)> clear_sequence;
     std::function<llama_pos(int32_t)> seq_pos_min;
     std::function<llama_pos(int32_t)> seq_pos_max;

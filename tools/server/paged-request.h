@@ -124,6 +124,9 @@ struct paged_request_state {
     // --- prompt processing counters ---
     int32_t n_prompt_tokens_cache     = 0;
     int32_t n_prompt_tokens_processed = 0;
+    size_t cached_prefix_tokens = 0;
+    size_t prefill_start_token = 0;
+    size_t remaining_prefill_tokens = 0;
 
     // --- timing ---
     int64_t t_arrival_us            = 0;

@@ -75,7 +75,7 @@ uint64_t PrefixReuseManager::prefix_hash(const std::vector<llama_token> & toks, 
     return hash_u64(h, hash_tokens(toks, toks.size()));
 }
 
-const PrefixReuseManager::PrefixCacheEntry * PrefixReuseManager::lookup_block_entry(
+const PrefixCacheEntry * PrefixReuseManager::lookup_block_entry(
         const std::vector<llama_token> & toks,
         const PrefixReuseMetadata & md) const {
     // Longest-prefix-match: probe each block-aligned prefix length from largest to smallest.
@@ -100,18 +100,13 @@ void PrefixReuseManager::register_block_entry(
         const PrefixReuseMetadata & md,
         const std::vector<int32_t> & block_ids) {
     PrefixCacheEntry e;
-    e.prefix_hash = prefix_hash(toks, md);
-    e.model_hash = std::hash<std::string>{}(md.model_id);
-    e.adapter_hash = std::hash<std::string>{}(md.lora_id);
-    e.block_size = md.block_size;
+    e.hash = prefix_hash(toks, md);
+    e.metadata = md;
     e.n_tokens = toks.size();
     e.physical_block_ids = block_ids;
     e.refcount = 1;
-    e.active_refcount = 0;
-    e.cache_refcount = 1;
     e.last_used_us = ggml_time_us();
-    e.created_us = e.last_used_us;
-    block_cache_[e.prefix_hash] = std::move(e);
+    block_cache_[e.hash] = std::move(e);
 }
 
 PrefixReusePlan PrefixReuseManager::resolve(
@@ -119,7 +114,7 @@ PrefixReusePlan PrefixReuseManager::resolve(
         const RequestState & req,
         const PrefixReuseMetadata & md,
         bool allow_same_seq_append,
-        bool can_use_prefix_copy,
+        bool enable_donor_seq_fallback,
         const LookupRequestBySeq & lookup_req) {
     PrefixReusePlan plan;
     plan.suffix_tokens = task.tokens.size();
@@ -156,22 +151,18 @@ PrefixReusePlan PrefixReuseManager::resolve(
         plan.suffix_tokens = new_toks.size() - entry->n_tokens;
         plan.physical_block_ids = entry->physical_block_ids;
         plan.reason = "shared-block-hit";
-        // touch LRU timestamp and bump active refcount
-        const uint64_t h = entry->prefix_hash;
+        const uint64_t h = entry->hash;
         auto it = block_cache_.find(h);
         if (it != block_cache_.end()) {
             it->second.last_used_us = ggml_time_us();
-            it->second.active_refcount++;
             it->second.refcount++;
-            LOG_DBG("[paged-cache-ref] block=%" PRIu64 " refcount=%u active=%u cached=%u\n",
-                    h, it->second.refcount, it->second.active_refcount, it->second.cache_refcount);
         }
-        LOG_DBG("[paged-prefix-block] hit request_id=%d cached_tokens=%zu blocks=%zu\n",
-                task.id, plan.cached_tokens, plan.physical_block_ids.size());
+        LOG_DBG("[paged-prefix-block] longest-hit request_id=%d cached_tokens=%zu suffix_tokens=%zu blocks=%zu\n",
+                task.id, plan.cached_tokens, plan.suffix_tokens, plan.physical_block_ids.size());
         return plan;
     }
 
-    if (can_use_prefix_copy) {
+    if (enable_donor_seq_fallback) {
         auto hit = cache_.lookup(new_toks);
         if (hit.donor_slot_id >= 0 && hit.n_cached_tokens > 0 && hit.donor_slot_id != req.seq_id) {
             const RequestState * donor = lookup_req ? lookup_req(hit.donor_slot_id) : nullptr;
@@ -190,6 +181,9 @@ PrefixReusePlan PrefixReuseManager::resolve(
     }
 
     plan.reason = "no-prefix";
+    if (!enable_donor_seq_fallback) {
+        LOG_DBG("[paged-prefix] block-cache miss; donor fallback disabled; fresh prefill\n");
+    }
     LOG_DBG("[paged-prefix-block] fallback-fresh request_id=%d\n", task.id);
     return plan;
 }
@@ -197,7 +191,8 @@ PrefixReusePlan PrefixReuseManager::resolve(
 bool PrefixReuseManager::register_finished_request(
         const RequestState & req,
         const PrefixReuseMetadata & md,
-        bool cacheable) {
+        bool cacheable,
+        const std::vector<int32_t> & sequence_blocks) {
     if (!cacheable || !req.task || req.prompt.tokens.empty()) {
         LOG_DBG("[paged-prefix] reject request_id=%d reason=%s\n",
                 req.request_id, cacheable ? "no-prefix" : "uncacheable");
@@ -212,36 +207,24 @@ bool PrefixReuseManager::register_finished_request(
         return false;
     }
     const auto & toks = req.prompt.tokens.get_tokens();
-    // Register the largest block-aligned prefix. A trailing partial block is common
-    // (prompt length rarely equals an exact multiple of block_size), so we must not
-    // reject the whole entry — we register floor(n_tokens / block_size) * block_size
-    // tokens, which covers all fully-written blocks whose KV is stable.
     const size_t bs = std::max<size_t>(1, md.block_size);
     const size_t n_blocks = toks.size() / bs;
-    const size_t n_aligned_toks = n_blocks * bs;
     if (n_blocks == 0) {
         LOG_DBG("[paged-prefix-block] reject request_id=%d reason=too-short tokens=%zu block_size=%zu\n",
                 req.request_id, toks.size(), bs);
     } else {
-        // Use only the aligned prefix for the block-entry key.
-        const std::vector<llama_token> aligned_toks(toks.begin(), toks.begin() + (int32_t)n_aligned_toks);
-        std::vector<int32_t> blocks;
-        blocks.reserve(n_blocks);
-        for (size_t page = 0; page < n_blocks; ++page) {
-            uint32_t blk_id = 0;
-            if (!llama_kv_cache_seq_get_block(llama_get_memory(req.ctx), req.seq_id, (uint32_t) page, &blk_id)) {
-                LOG_DBG("[paged-prefix-block] reject request_id=%d reason=missing-block page=%zu\n",
-                        req.request_id, page);
-                blocks.clear();
-                break;
+        if (sequence_blocks.size() < n_blocks) {
+            LOG_DBG("[paged-prefix-block] reject request_id=%d reason=missing-blocks seq_blocks=%zu full_blocks=%zu\n",
+                    req.request_id, sequence_blocks.size(), n_blocks);
+        } else {
+            for (size_t i = 1; i <= n_blocks; ++i) {
+                const size_t prefix_tokens = i * bs;
+                std::vector<llama_token> aligned_toks(toks.begin(), toks.begin() + (int32_t) prefix_tokens);
+                std::vector<int32_t> blocks(sequence_blocks.begin(), sequence_blocks.begin() + (int32_t) i);
+                register_block_entry(aligned_toks, md, blocks);
+                LOG_DBG("[paged-prefix-block] register request_id=%d prefix_tokens=%zu blocks=%zu\n",
+                        req.request_id, prefix_tokens, blocks.size());
             }
-            blocks.push_back((int32_t) blk_id);
-        }
-        if (!blocks.empty()) {
-            register_block_entry(aligned_toks, md, blocks);
-            LOG_DBG("[paged-prefix-block] register entry hash=%" PRIu64 " tokens=%zu blocks=%zu (total_tokens=%zu partial=%zu)\n",
-                    prefix_hash(aligned_toks, md), aligned_toks.size(), blocks.size(),
-                    toks.size(), toks.size() - n_aligned_toks);
         }
     }
 
@@ -259,17 +242,13 @@ PrefixReuseManager::EvictExpiredResult PrefixReuseManager::evict_expired(int64_t
     auto it = block_cache_.begin();
     while (it != block_cache_.end()) {
         const auto & e = it->second;
-        if (!e.is_evictable()) {
-            ++it;
-            continue;
-        }
         const bool expired = e.last_used_us >= 0 && (now_us - e.last_used_us) > ttl_us;
         if (!expired) {
             ++it;
             continue;
         }
         LOG_INF("[paged-cache-ttl] evict block-entry hash=%" PRIu64 " tokens=%zu blocks=%zu age_sec=%.1f\n",
-                e.prefix_hash, e.n_tokens, e.physical_block_ids.size(),
+                e.hash, e.n_tokens, e.physical_block_ids.size(),
                 (double)(now_us - e.last_used_us) / 1e6);
         out.freed_blocks += e.physical_block_ids.size();
         out.evicted_entries++;
@@ -283,10 +262,7 @@ void PrefixReuseManager::add_active_ref(uint64_t hash) {
     if (it == block_cache_.end()) {
         return;
     }
-    it->second.active_refcount++;
     it->second.refcount++;
-    LOG_DBG("[paged-cache-ref] block=%" PRIu64 " refcount=%u active=%u cached=%u\n",
-            hash, it->second.refcount, it->second.active_refcount, it->second.cache_refcount);
 }
 
 void PrefixReuseManager::release_active_ref(uint64_t hash) {
@@ -295,15 +271,10 @@ void PrefixReuseManager::release_active_ref(uint64_t hash) {
         return;
     }
     auto & e = it->second;
-    if (e.active_refcount > 0) {
-        e.active_refcount--;
-    }
     if (e.refcount > 0) {
         e.refcount--;
     }
     e.last_used_us = ggml_time_us();
-    LOG_DBG("[paged-cache-ref] block=%" PRIu64 " refcount=%u active=%u cached=%u\n",
-            hash, e.refcount, e.active_refcount, e.cache_refcount);
 }
 
 void PrefixReuseManager::register_raw(int32_t seq_id, const std::vector<llama_token> & tokens) {

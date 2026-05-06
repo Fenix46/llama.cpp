@@ -745,6 +745,9 @@ private:
     // Experimental cross-slot KV prefix cache (--kv-prefix-cache).
     // Null when flag is off. Registered on slot release, invalidated on eviction.
     std::unique_ptr<server_scheduler::PrefixReuseManager> prefix_cache_;
+    bool paged_enable_block_prefix_cache_ = true;
+    bool paged_enable_donor_seq_fallback_ = false;
+    bool paged_enable_same_seq_append_ = false;
 
     json json_webui_settings = json::object();
 
@@ -761,6 +764,14 @@ private:
         const char * v = std::getenv(name);
         if (!v) {
             return true;
+        }
+        return !(strcmp(v, "0") == 0 || strcasecmp(v, "false") == 0 || strcasecmp(v, "off") == 0);
+    }
+
+    static bool env_enabled_default_false(const char * name) {
+        const char * v = std::getenv(name);
+        if (!v) {
+            return false;
         }
         return !(strcmp(v, "0") == 0 || strcasecmp(v, "false") == 0 || strcasecmp(v, "off") == 0);
     }
@@ -1162,7 +1173,23 @@ private:
                 if (!prefix_cache_) {
                     return false;
                 }
-                return prefix_cache_->register_finished_request(req, build_prefix_reuse_metadata(req), cacheable);
+                const std::vector<int32_t> empty_blocks;
+                return prefix_cache_->register_finished_request(req, build_prefix_reuse_metadata(req), cacheable, empty_blocks);
+            };
+            lifecycle_ops.seq_get_physical_blocks = [](const server_scheduler::RequestState & req, size_t n_blocks_hint) {
+                return server_scheduler::BlockManager::get_physical_blocks_for_sequence(req.ctx, req.seq_id, n_blocks_hint);
+            };
+            lifecycle_ops.blocks_retain_cached = [](const server_scheduler::RequestState & req, const std::vector<int32_t> & blocks) {
+                return server_scheduler::BlockManager::retain_blocks_for_cache(req.ctx, blocks);
+            };
+            lifecycle_ops.blocks_release_cached = [](const server_scheduler::RequestState & req, const std::vector<int32_t> & blocks) {
+                return server_scheduler::BlockManager::release_cached_blocks(req.ctx, blocks);
+            };
+            lifecycle_ops.prefix_register_request_blocks = [this](const server_scheduler::RequestState & req, const std::vector<int32_t> & blocks) {
+                if (!prefix_cache_) {
+                    return false;
+                }
+                return prefix_cache_->register_finished_request(req, build_prefix_reuse_metadata(req), true, blocks);
             };
             lifecycle_ops.lineage_register_cached =
                 [this](const server_scheduler::RequestState & req, int32_t seq_id, int64_t now_us) {
@@ -1297,6 +1324,9 @@ private:
                         (int)params_base.kv_block_size);
             }
         }
+        paged_enable_block_prefix_cache_ = env_enabled_default_true("LLAMA_PAGED_ENABLE_BLOCK_PREFIX_CACHE");
+        paged_enable_donor_seq_fallback_ = env_enabled_default_false("LLAMA_PAGED_ENABLE_DONOR_SEQ_FALLBACK");
+        paged_enable_same_seq_append_    = env_enabled_default_false("LLAMA_PAGED_ENABLE_SAME_SEQ_APPEND");
 
         // Dynamic slot scheduler
         if (params_base.dynamic_slots) {
@@ -1315,11 +1345,15 @@ private:
                     SRV_INF("[paged-cache-ttl] configured ttl_sec=%" PRId64 "\n", ttl_sec);
                 }
                 {
-                    const char * lineage_ttl_env = std::getenv("LLAMA_PAGED_LINEAGE_SEQ_TTL_SEC");
-                    const int64_t lineage_ttl_sec = lineage_ttl_env ? (int64_t) std::atoll(lineage_ttl_env) : 1800LL;
-                    const int64_t lineage_ttl_us  = lineage_ttl_sec > 0 ? lineage_ttl_sec * 1'000'000LL : 0LL;
-                    lineage_mgr_ = std::make_unique<server_scheduler::LineageManager>(lineage_ttl_us);
-                    SRV_INF("[paged-lineage] lineage-sticky seq reuse enabled ttl_sec=%" PRId64 "\n", lineage_ttl_sec);
+                    if (paged_enable_same_seq_append_) {
+                        const char * lineage_ttl_env = std::getenv("LLAMA_PAGED_LINEAGE_SEQ_TTL_SEC");
+                        const int64_t lineage_ttl_sec = lineage_ttl_env ? (int64_t) std::atoll(lineage_ttl_env) : 1800LL;
+                        const int64_t lineage_ttl_us  = lineage_ttl_sec > 0 ? lineage_ttl_sec * 1'000'000LL : 0LL;
+                        lineage_mgr_ = std::make_unique<server_scheduler::LineageManager>(lineage_ttl_us);
+                        SRV_INF("[paged-lineage] lineage-sticky seq reuse enabled ttl_sec=%" PRId64 "\n", lineage_ttl_sec);
+                    } else {
+                        lineage_mgr_.reset();
+                    }
                 }
                 {
                     sched_policy_cfg_ = server_scheduler::SchedulerPolicyConfig::from_env(llama_n_batch(ctx));
@@ -2032,7 +2066,11 @@ private:
         if (can_cache) {
             // Register block-entry cache (primary: physical block IDs survive seq release).
             if (prefix_cache_) {
-                prefix_cache_->register_finished_request(*req, build_prefix_reuse_metadata(*req), true);
+                const std::vector<int32_t> seq_blocks =
+                    server_scheduler::BlockManager::get_physical_blocks_for_sequence(req->ctx, req->seq_id);
+                if (server_scheduler::BlockManager::retain_blocks_for_cache(req->ctx, seq_blocks)) {
+                    prefix_cache_->register_finished_request(*req, build_prefix_reuse_metadata(*req), true, seq_blocks);
+                }
                 // Also keep legacy donor-seq index for CrossPrefixCopy fallback.
                 prefix_cache_->register_raw(seq_id, req->prompt.tokens.get_tokens());
             }
@@ -2091,8 +2129,8 @@ private:
         return md;
     }
 
-    void execute_prefix_reuse_plan(paged_request_state & req, const server_task & task, bool allow_same_seq_append) {
-        if (!prefix_cache_) {
+    void execute_prefix_reuse_plan(paged_request_state & req, const server_task & task) {
+        if (!paged_enable_block_prefix_cache_ || !prefix_cache_) {
             (void) server_scheduler::BlockManager::prepare_fresh_sequence(req);
             return;
         }
@@ -2101,13 +2139,16 @@ private:
             task,
             req,
             build_prefix_reuse_metadata(req),
-            allow_same_seq_append,
-            can_use_prefix_copy(req),
+            paged_enable_same_seq_append_ && req.same_lineage_verified_for_launch,
+            paged_enable_donor_seq_fallback_ && can_use_prefix_copy(req),
             [this](int32_t seq_id) -> const server_scheduler::RequestState * {
                 return get_paged_request_by_seq_id(seq_id);
             });
 
-        const auto attach = server_scheduler::BlockManager::attach_prefix(req, plan.to_block_plan());
+        server_scheduler::BlockManager::PrefixCacheEntryView view;
+        view.n_tokens = plan.cached_tokens;
+        view.physical_block_ids = plan.physical_block_ids;
+        const auto attach = server_scheduler::BlockManager::attach_cached_blocks(req, view);
         if (!attach.ok) {
             SRV_WRN("[paged-prefix] attach failed request_id=%d reason=%s; falling back to fresh prefill\n",
                     task.id, attach.failure_reason ? attach.failure_reason : "unknown");
@@ -2322,15 +2363,14 @@ private:
         };
 
         // same-seq append only when dispatch verified this is a same-lineage continuation.
-        const bool allow_same_seq_append = req.same_lineage_verified_for_launch;
-        if (allow_same_seq_append) {
+        if (paged_enable_same_seq_append_ && req.same_lineage_verified_for_launch) {
             SRV_INF("[paged-prefix] lookup request_id=%d mode=same-seq key=%s cached_tokens=%zu suffix_tokens=%zu\n",
                     task.id, req.lineage_key.c_str(),
                     req.prompt.tokens.get_tokens().size(),
                     task.tokens.get_tokens().size() > req.prompt.tokens.get_tokens().size()
                         ? task.tokens.get_tokens().size() - req.prompt.tokens.get_tokens().size() : 0);
         }
-        execute_prefix_reuse_plan(req, task, allow_same_seq_append);
+        execute_prefix_reuse_plan(req, task);
         reset_runtime_state_for_new_request(req, "launch");
 
         // sampler
@@ -3414,11 +3454,7 @@ private:
                                 break;
                             }
                         } else {
-                            // Try same-lineage reuse before allocating a fresh seq.
-                            paged_request_state * req = try_lineage_reuse(task);
-                            if (!req) {
-                                req = get_or_create_paged_request(task);
-                            }
+                            paged_request_state * req = get_or_create_paged_request(task);
                             if (!req) {
                                 SRV_DBG("[paged] no capacity, defer id_task=%d\n", id_task);
                                 queue_tasks.defer(std::move(task));

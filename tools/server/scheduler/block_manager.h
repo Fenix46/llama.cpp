@@ -29,6 +29,11 @@ public:
         const char * failure_reason = "none";
     };
 
+    struct PrefixCacheEntryView {
+        size_t n_tokens = 0;
+        std::vector<int32_t> physical_block_ids;
+    };
+
     struct EvictionResult {
         size_t freed_blocks = 0;
         size_t evicted_entries = 0;
@@ -72,6 +77,10 @@ public:
     static float pressure_ratio(const Stats & stats, int32_t total_blocks);
 
     static bool prepare_fresh_sequence(RequestState & req);
+    static std::vector<int32_t> get_physical_blocks_for_sequence(llama_context * ctx, int32_t seq_id, size_t n_blocks_hint = 0);
+    static bool retain_blocks_for_cache(llama_context * ctx, const std::vector<int32_t> & blocks);
+    static bool release_cached_blocks(llama_context * ctx, const std::vector<int32_t> & blocks);
+    static PrefixAttachResult attach_cached_blocks(RequestState & req, const PrefixCacheEntryView & entry);
     static PrefixAttachResult attach_shared_prefix(RequestState & req, const PrefixReusePlan & plan);
     static PrefixAttachResult attach_prefix(RequestState & req, const PrefixReusePlan & plan);
     static bool allocate_for_prefill(RequestState & req, size_t n_tokens);

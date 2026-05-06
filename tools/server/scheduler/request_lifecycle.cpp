@@ -1,5 +1,6 @@
 #include "request_lifecycle.h"
 #include "block_manager.h"
+#include "llama.h"
 
 #include <cassert>
 #include <cstdio>
@@ -106,6 +107,9 @@ void RequestLifecycle::reset_runtime_state_for_new_request(RequestState & req, c
     req.n_remaining = -1;
     req.n_prompt_tokens_cache = 0;
     req.n_prompt_tokens_processed = 0;
+    req.cached_prefix_tokens = 0;
+    req.prefill_start_token = 0;
+    req.remaining_prefill_tokens = 0;
     req.spec.clear_runtime();
     req.t_admitted_us = 0;
     req.t_first_prefill_start_us = 0;
@@ -180,13 +184,37 @@ bool RequestLifecycle::register_prefix_cache_on_release(
 
     if (can_cache) {
         bool registered = true;
-        if (has_prefix_cache && ops_.prefix_register_request) {
+        std::vector<int32_t> seq_blocks;
+        if (has_prefix_cache && ops_.seq_get_physical_blocks && req != nullptr) {
+            const int32_t block_sz = req->ctx ? llama_kv_cache_block_size(llama_get_memory(req->ctx)) : 0;
+            const size_t bs = std::max<size_t>(1, block_sz > 0 ? (size_t) block_sz : 1);
+            const size_t n_blocks_hint = req->prompt.tokens.size() / bs;
+            seq_blocks = ops_.seq_get_physical_blocks(*req, n_blocks_hint);
+            if (!seq_blocks.empty() && ops_.blocks_retain_cached) {
+                const bool retained = ops_.blocks_retain_cached(*req, seq_blocks);
+                if (!retained) {
+                    registered = false;
+                }
+            }
+            if (registered && ops_.prefix_register_request_blocks) {
+                registered = ops_.prefix_register_request_blocks(*req, seq_blocks);
+            } else if (registered && ops_.prefix_register_request) {
+                registered = ops_.prefix_register_request(*req, true);
+            } else if (registered && ops_.prefix_register) {
+                ops_.prefix_register(seq_id, req->prompt.tokens.get_tokens());
+            }
+            if (!registered && !seq_blocks.empty() && ops_.blocks_release_cached) {
+                (void) ops_.blocks_release_cached(*req, seq_blocks);
+            }
+        } else if (has_prefix_cache && ops_.prefix_register_request) {
             registered = ops_.prefix_register_request(*req, true);
         } else if (has_prefix_cache && ops_.prefix_register) {
             ops_.prefix_register(seq_id, req->prompt.tokens.get_tokens());
         }
         if (!registered) {
             std::fprintf(stderr, "[paged-prefix] reject request_id=%d reason=manager-register-rejected\n", req ? req->request_id : -1);
+        } else {
+            std::fprintf(stderr, "[paged-lifecycle] release-runtime seq_id=%d after_block_cache_register=1\n", seq_id);
         }
         if (ops_.lineage_register_cached) {
             ops_.lineage_register_cached(*req, seq_id, ops_.now_us ? ops_.now_us() : 0);
