@@ -16,6 +16,7 @@
 #include "scheduler/request_lifecycle.h"
 #include "scheduler/sampling_executor.h"
 #include "scheduler/scheduler_core.h"
+#include "scheduler/scheduler_policy_config.h"
 #include "scheduler/speculative_executor.h"
 #include "scheduler/step_executor.h"
 
@@ -714,6 +715,7 @@ private:
     int64_t  paged_kv_ttl_us_ = 0;        // TTL for cached KV blocks (0 = disabled)
     int64_t  paged_last_sweep_us_ = 0;     // last time TTL/LRU sweep ran
     static constexpr int64_t PAGED_SWEEP_INTERVAL_US = 10'000'000LL; // sweep every 10s
+    server_scheduler::SchedulerPolicyConfig sched_policy_cfg_; // parsed once at init
 
     int slots_debug = 0;
     int n_empty_consecutive = 0;
@@ -1277,6 +1279,15 @@ private:
                     const int64_t ttl_sec = ttl_env ? (int64_t) std::atoll(ttl_env) : 1800LL;
                     paged_kv_ttl_us_ = ttl_sec > 0 ? ttl_sec * 1'000'000LL : 0LL;
                     SRV_INF("[paged-cache-ttl] configured ttl_sec=%" PRId64 "\n", ttl_sec);
+                }
+                {
+                    sched_policy_cfg_ = server_scheduler::SchedulerPolicyConfig::from_env(llama_n_batch(ctx));
+                    paged_core.policy_config = sched_policy_cfg_;
+                    SRV_INF("[paged-scheduler] policy=%s max_tokens=%d decode_burst=%d prefill_every_n=%d\n",
+                            sched_policy_cfg_.policy_name(),
+                            sched_policy_cfg_.max_num_batched_tokens,
+                            sched_policy_cfg_.decode_burst_tokens,
+                            sched_policy_cfg_.prefill_every_n_decode_steps);
                 }
             }
 
@@ -3637,48 +3648,20 @@ private:
             const float kv_pressure_ratio = server_scheduler::BlockManager::pressure_ratio(blk_stats, paged_total_blocks_);
             const int32_t block_size_for_fit = paged_blocks_per_seq_ > 0 ? std::max(1, n_ctx_slot_ / paged_blocks_per_seq_) : 1;
 
-            // Count decode-ready requests and derive scheduling policy knobs.
+            // Count decode-ready requests.
             int32_t n_decode_active = 0;
             for (const auto & req : paged_requests) {
                 if (req.phase == PAGED_REQUEST_DECODING) {
                     n_decode_active++;
                 }
             }
-            auto env_str = [](const char * name, const char * def) {
-                const char * v = std::getenv(name);
-                return (v && *v) ? std::string(v) : std::string(def);
-            };
-            auto env_i32 = [](const char * name, int32_t def) {
-                const char * v = std::getenv(name);
-                if (!v || !*v) {
-                    return def;
-                }
-                const int32_t parsed = atoi(v);
-                return parsed > 0 ? parsed : def;
-            };
 
-            const std::string sched_policy = env_str("LLAMA_PAGED_SCHED_POLICY", "latency");
-            const bool policy_latency = sched_policy == "latency";
-            const bool policy_balanced = sched_policy == "balanced";
-
-            const int32_t short_prefill_threshold = env_i32("LLAMA_PAGED_SHORT_PREFILL_THRESHOLD", 512);
-            const int32_t prefill_chunk_idle_latency = env_i32("LLAMA_PAGED_PREFILL_CHUNK_IDLE_LATENCY", 256);
-            const int32_t prefill_chunk_active_decode = env_i32("LLAMA_PAGED_PREFILL_CHUNK_ACTIVE_DECODE", 128);
-            const int32_t prefill_chunk_short = env_i32("LLAMA_PAGED_PREFILL_CHUNK_SHORT", 512);
-            const int32_t prefill_chunk_long = env_i32("LLAMA_PAGED_PREFILL_CHUNK_LONG", 128);
-            const int32_t prefill_chunk_idle = env_i32("LLAMA_PAGED_PREFILL_CHUNK_IDLE", policy_latency ? prefill_chunk_idle_latency : 2048);
-            const int32_t prefill_every_n_decode_steps = env_i32("LLAMA_PAGED_PREFILL_EVERY_N_DECODE_STEPS", policy_latency ? 8 : 1);
-            const int32_t decode_burst_tokens = env_i32("LLAMA_PAGED_DECODE_BURST_TOKENS", policy_latency ? 8 : 1);
-            const int32_t max_batched_tokens_latency = env_i32("LLAMA_PAGED_MAX_NUM_BATCHED_TOKENS_LATENCY", 512);
-            const int32_t max_batched_tokens_throughput = env_i32("LLAMA_PAGED_MAX_NUM_BATCHED_TOKENS_THROUGHPUT", n_batch);
-
-            const int32_t max_num_scheduled_tokens = policy_latency
-                ? std::min(n_batch, max_batched_tokens_latency)
-                : (policy_balanced ? std::min(n_batch, std::max(512, n_batch/2)) : std::min(n_batch, max_batched_tokens_throughput));
-
+            // Policy knobs come from sched_policy_cfg_ (parsed once at init).
+            const auto & spc = sched_policy_cfg_;
+            const int32_t max_num_scheduled_tokens = spc.max_num_batched_tokens;
             const int32_t prefill_threshold = n_decode_active > 0
-                ? prefill_chunk_active_decode
-                : prefill_chunk_idle;
+                ? spc.prefill_chunk_active_decode
+                : spc.prefill_chunk_idle;
 
             const auto schedule_decision = paged_core.schedule_tokens(server_scheduler::SchedulerCore::RuntimeSnapshot{
                 /*reqs=*/&paged_requests,
@@ -3809,9 +3792,8 @@ private:
                     planned_prefill_rows_tick++;
                 }
             }
-            const bool latency_mode = std::getenv("LLAMA_PAGED_LATENCY_MODE") == nullptr ||
-                std::string_view(std::getenv("LLAMA_PAGED_LATENCY_MODE")) != "0";
-            const bool split_mixed_batch = latency_mode && sched_decode_toks_tick > 0 && sched_prefill_toks_tick > 0;
+            const bool split_mixed_batch = sched_policy_cfg_.latency_mode &&
+                                           sched_decode_toks_tick > 0 && sched_prefill_toks_tick > 0;
             int32_t active_reqs_tick = 0;
             int32_t decode_ready_reqs_tick = 0;
             int32_t prefill_ready_reqs_tick = 0;
@@ -3860,94 +3842,38 @@ private:
                 prefill_cursor.prefill_per_request_budget = std::min(prefill_cursor.prefill_per_request_budget, prefill_threshold);
             }
 
-            // vLLM-style prefill fairness ordering: short/new requests first,
-            // long continuations last with round-robin rotation.
-            std::vector<size_t> short_new;
-            std::vector<size_t> short_cont;
-            std::vector<size_t> long_near_done;
-            std::vector<size_t> long_cont;
-            short_new.reserve(prefill_candidates.size());
-            short_cont.reserve(prefill_candidates.size());
-            long_near_done.reserve(prefill_candidates.size());
-            long_cont.reserve(prefill_candidates.size());
+            // Apply prefill ordering and budget capping via policy config.
+            {
+                server_scheduler::PrefillPolicyInput pp_in;
+                pp_in.reqs              = &paged_requests;
+                pp_in.candidates        = &prefill_candidates;
+                pp_in.n_decode_active   = n_decode_active;
+                pp_in.sched_decode_toks = sched_decode_toks_tick;
+                pp_in.sched_prefill_toks = sched_prefill_toks_tick;
+                pp_in.decode_burst_steps = paged_decode_burst_steps;
+                pp_in.decode_steps_since_long_prefill = paged_decode_steps_since_long_prefill;
+                pp_in.prefill_total_budget   = prefill_cursor.prefill_total_budget;
+                pp_in.prefill_per_req_budget = prefill_cursor.prefill_per_request_budget;
+                pp_in.rr_cursor = paged_prefill_rr_cursor;
 
-            for (const size_t ridx : prefill_candidates) {
-                const auto & req = paged_requests[ridx];
-                const int32_t total_prompt_tokens = req.task ? req.task->n_tokens() : 0;
-                const int32_t already_prefilled_tokens = req.prompt.n_tokens();
-                const int32_t remaining_prefill_tokens = std::max(0, total_prompt_tokens - already_prefilled_tokens);
-                const bool is_new_prompt = req.phase == PAGED_REQUEST_STARTED;
-                const bool is_short_prefill = total_prompt_tokens <= short_prefill_threshold;
-                if (is_short_prefill) {
-                    if (is_new_prompt) short_new.push_back(ridx);
-                    else short_cont.push_back(ridx);
-                } else {
-                    if (remaining_prefill_tokens <= std::max(1, prefill_chunk_long)) long_near_done.push_back(ridx);
-                    else long_cont.push_back(ridx);
-                }
-            }
-            if (!long_cont.empty()) {
-                const size_t rot = paged_prefill_rr_cursor % long_cont.size();
-                std::rotate(long_cont.begin(), long_cont.begin() + rot, long_cont.end());
-                paged_prefill_rr_cursor = (paged_prefill_rr_cursor + 1) % long_cont.size();
-            }
+                const auto pp = server_scheduler::apply_prefill_policy(sched_policy_cfg_, pp_in, paged_prefill_rr_cursor);
 
-            prefill_candidates.clear();
-            prefill_candidates.insert(prefill_candidates.end(), short_new.begin(), short_new.end());
-            prefill_candidates.insert(prefill_candidates.end(), short_cont.begin(), short_cont.end());
-            prefill_candidates.insert(prefill_candidates.end(), long_near_done.begin(), long_near_done.end());
-            prefill_candidates.insert(prefill_candidates.end(), long_cont.begin(), long_cont.end());
+                prefill_candidates = pp.ordered_candidates;
+                prefill_cursor.prefill_total_budget   = pp.prefill_total_budget;
+                prefill_cursor.prefill_per_request_budget = pp.prefill_per_req_budget;
 
-            const bool has_short_prefill = !short_new.empty() || !short_cont.empty();
-            const bool has_long_prefill = !long_near_done.empty() || !long_cont.empty();
-            bool long_prefill_background_slice = false;
-            bool short_prefill_priority_slice = false;
-            bool decode_burst_only = false;
-
-            if (policy_latency && decode_ready_reqs_tick > 0 && has_long_prefill && !has_short_prefill) {
-                const bool allow_long_prefill = (paged_decode_burst_steps >= decode_burst_tokens) ||
-                    (paged_decode_steps_since_long_prefill >= prefill_every_n_decode_steps);
-                if (!allow_long_prefill) {
+                if (pp.decode_burst_only) {
                     prefill_candidates.clear();
                     sched_prefill_toks_tick = 0;
                     planned_prefill_rows_tick = 0;
-                    decode_burst_only = true;
-                } else {
-                    long_prefill_background_slice = true;
+                    SRV_DBG("[paged-scheduler] decode-burst tokens=%d (suppressing long prefill)\n",
+                            sched_decode_toks_tick);
                 }
-            }
-            if (policy_latency && has_short_prefill) {
-                short_prefill_priority_slice = true;
-            }
-
-            // Latency policy: cap prefill more aggressively by class and
-            // restrict long prefill to a single chunk per scheduling turn.
-            if (policy_latency) {
-                if (n_decode_active > 0) {
-                    prefill_cursor.prefill_total_budget = std::min(prefill_cursor.prefill_total_budget, prefill_chunk_active_decode);
-                    prefill_cursor.prefill_per_request_budget = std::min(prefill_cursor.prefill_per_request_budget, prefill_chunk_active_decode);
-                } else if (has_short_prefill) {
-                    prefill_cursor.prefill_total_budget = std::min(prefill_cursor.prefill_total_budget, prefill_chunk_short);
-                    prefill_cursor.prefill_per_request_budget = std::min(prefill_cursor.prefill_per_request_budget, prefill_chunk_short);
-                } else {
-                    int32_t long_cap = prefill_chunk_long;
-                    if (!prefill_candidates.empty()) {
-                        const auto & req0 = paged_requests[prefill_candidates.front()];
-                        const int32_t already_prefilled_tokens = req0.prompt.n_tokens();
-                        if (already_prefilled_tokens > 32768) {
-                            long_cap = std::min(long_cap, 64);
-                        } else if (already_prefilled_tokens > 8192) {
-                            long_cap = std::min(long_cap, 128);
-                        }
-                    }
-                    prefill_cursor.prefill_total_budget = std::min(prefill_cursor.prefill_total_budget, long_cap);
-                    prefill_cursor.prefill_per_request_budget = std::min(prefill_cursor.prefill_per_request_budget, long_cap);
+                if (split_mixed_batch) {
+                    // Phase A (latency mode): decode-only first.
+                    prefill_cursor.prefill_total_budget = 0;
+                    prefill_cursor.prefill_per_request_budget = 0;
                 }
-            }
-            if (split_mixed_batch) {
-                // Phase A (latency mode): decode-only first.
-                prefill_cursor.prefill_total_budget = 0;
-                prefill_cursor.prefill_per_request_budget = 0;
             }
 
             const auto prefill_pass = server_scheduler::PagedScheduler::process_prefill_candidates(
@@ -4217,7 +4143,7 @@ private:
                             sched_decode_toks_tick, sched_prefill_toks_tick,
                             executed_decode_tokens, executed_prefill_tokens, batch.n_tokens);
                     SRV_WRN("[paged-sched-phase] phase=decode_only reason=decode_burst step=%d/%d\n",
-                            paged_decode_burst_steps, std::max(1, decode_burst_tokens));
+                            paged_decode_burst_steps, std::max(1, sched_policy_cfg_.decode_burst_tokens));
                 }
 
                 common_batch_clear(batch);
@@ -4291,7 +4217,8 @@ private:
                     const int32_t executed_prefill_tokens = batch.n_tokens;
                     GGML_ASSERT(executed_decode_tokens == 0);
                     GGML_ASSERT(batch.n_tokens == executed_prefill_tokens);
-                    if (long_prefill_background_slice) {
+                    // Long-prefill background slice resets burst counters.
+                    if (n_decode_active == 0 || paged_decode_burst_steps >= sched_policy_cfg_.decode_burst_tokens) {
                         paged_decode_burst_steps = 0;
                         paged_decode_steps_since_long_prefill = 0;
                     }
@@ -4299,11 +4226,6 @@ private:
                         SRV_WRN("[paged-sched-phase] phase=prefill_only planned_decode=%d planned_prefill=%d executed_decode=%d executed_prefill=%d batch=%d\n",
                                 0, sched_prefill_toks_tick,
                                 executed_decode_tokens, executed_prefill_tokens, batch.n_tokens);
-                        if (short_prefill_priority_slice) {
-                            SRV_WRN("%s", "[paged-sched-phase] phase=prefill_only class=short reason=first_token_priority\n");
-                        } else if (long_prefill_background_slice) {
-                            SRV_WRN("%s", "[paged-sched-phase] phase=prefill_only class=long reason=background_slice\n");
-                        }
                     }
 
                     const auto prefill_decode_outcome = server_scheduler::PagedScheduler::process_decode_pass(
@@ -4347,23 +4269,20 @@ private:
                     paged_decode_steps_since_long_prefill++;
                     if (std::getenv("LLAMA_PAGED_SCHED_TRACE")) {
                         SRV_WRN("[paged-sched-phase] phase=decode_only reason=decode_burst step=%d/%d\n",
-                                paged_decode_burst_steps, std::max(1, decode_burst_tokens));
+                                paged_decode_burst_steps, std::max(1, sched_policy_cfg_.decode_burst_tokens));
                     }
                 } else if (decode_tokens_in_batch == 0) {
-                    if (short_prefill_priority_slice) {
-                        if (std::getenv("LLAMA_PAGED_SCHED_TRACE")) {
-                            SRV_WRN("%s", "[paged-sched-phase] phase=prefill_only class=short reason=first_token_priority\n");
-                        }
-                    } else if (long_prefill_background_slice) {
+                    // Prefill-only turn: update burst counters based on prefill class.
+                    const bool has_long = (sched_prefill_toks_tick > 0 && sched_decode_toks_tick == 0 &&
+                                           decode_ready_reqs_tick == 0);
+                    if (has_long) {
                         paged_decode_burst_steps = 0;
                         paged_decode_steps_since_long_prefill = 0;
-                        if (std::getenv("LLAMA_PAGED_SCHED_TRACE")) {
-                            SRV_WRN("%s", "[paged-sched-phase] phase=prefill_only class=long reason=background_slice\n");
-                        }
                     }
-                } else if (decode_burst_only && std::getenv("LLAMA_PAGED_SCHED_TRACE")) {
-                    SRV_WRN("[paged-sched-phase] phase=decode_only reason=decode_burst step=%d/%d\n",
-                            paged_decode_burst_steps, std::max(1, decode_burst_tokens));
+                    if (std::getenv("LLAMA_PAGED_SCHED_TRACE")) {
+                        SRV_WRN("[paged-sched-phase] phase=prefill_only class=%s\n",
+                                has_long ? "long" : "short");
+                    }
                 }
             }
             tick_outcome.decode_result = decode_outcome;

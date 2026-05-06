@@ -1,6 +1,7 @@
 #pragma once
 
 #include "prefill_policy.h"
+#include "scheduler_policy_config.h"
 #include "request_state.h"
 #include "llama.h"
 
@@ -47,6 +48,7 @@ public:
         int32_t total_scheduled_tokens = 0;
         int32_t remaining_budget = 0;
         std::unordered_map<int32_t, std::vector<llama_token>> scheduled_spec_decode_tokens;
+        const char * policy_reason = "none";
     };
 
     struct RuntimeSnapshot {
@@ -71,6 +73,9 @@ public:
         // calls reflect the freed capacity. Optional: if null, no KV preemption.
         std::function<void(int32_t /* seq_id */)> on_preempt_kv;
     };
+
+    // Policy config — set once at init before any scheduling calls.
+    SchedulerPolicyConfig policy_config;
 
     void on_request_started(int32_t seq_id);
     void on_request_finished(int32_t seq_id);

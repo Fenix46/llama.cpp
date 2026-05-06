@@ -1,6 +1,9 @@
 #include "scheduler_core.h"
 
+#include "common/log.h"
+
 #include <algorithm>
+#include <cinttypes>
 
 namespace server_scheduler {
 
@@ -351,6 +354,24 @@ SchedulerCore::ScheduleDecision SchedulerCore::schedule_tokens(const RuntimeSnap
     }
 
     out.remaining_budget = budget;
+    out.policy_reason = policy_config.policy_name();
+
+    // Count decode/prefill reqs in plans for the log.
+    int32_t log_decode_reqs = 0, log_prefill_reqs = 0;
+    for (const auto & p : out.request_plans) {
+        if (p.scheduled_decode_tokens > 0) log_decode_reqs++;
+        if (p.scheduled_prefill_tokens > 0) log_prefill_reqs++;
+    }
+    LOG_DBG("[paged-scheduler] decision policy=%s decode_reqs=%d prefill_reqs=%d total_tokens=%d\n",
+            out.policy_reason, log_decode_reqs, log_prefill_reqs, out.total_scheduled_tokens);
+
+    for (const auto & it : out.deferred_reasons) {
+        LOG_DBG("[paged-scheduler] defer count=%d reason=%s\n", it.second, it.first.c_str());
+    }
+    for (const auto & it : out.preempted_reasons) {
+        LOG_DBG("[paged-scheduler] preempt count=%d reason=%s\n", it.second, it.first.c_str());
+    }
+
     return out;
 }
 
