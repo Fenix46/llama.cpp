@@ -81,6 +81,7 @@ void PagedScheduler::begin_prefill(RequestState & req, int32_t n_past, int64_t t
     } else {
         req.remaining_prefill_tokens = 0;
     }
+    req.last_prefill_progress_suffix_done = 0;
     req.prompt.tokens.keep_first(n_past);
     if (req.task) {
         const int32_t total = req.task->n_tokens();

@@ -127,6 +127,7 @@ struct paged_request_state {
     size_t cached_prefix_tokens = 0;
     size_t prefill_start_token = 0;
     size_t remaining_prefill_tokens = 0;
+    size_t last_prefill_progress_suffix_done = 0;
 
     // --- timing ---
     int64_t t_arrival_us            = 0;

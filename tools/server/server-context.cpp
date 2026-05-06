@@ -3047,10 +3047,15 @@ private:
         const int64_t decode_ms = std::max<int64_t>(0, (last_token_us - first_token_us) / 1000);
         const int64_t total_ms = std::max<int64_t>(0, (now_us - req.t_arrival_us) / 1000);
 
-        SRV_WRN("[paged-latency] seq=%d task=%d prompt_tokens=%d output_tokens=%d queue_wait_ms=%lld ttft_ms=%lld prefill_ms=%lld decode_ms=%lld total_ms=%lld\n",
+        const int32_t prompt_tokens_total = req.task ? req.task->n_tokens() : 0;
+        const int32_t cached_prefix_tokens = (int32_t) std::min<size_t>(req.cached_prefix_tokens, (size_t) std::max(0, prompt_tokens_total));
+        const int32_t prefill_tokens_actual = std::max(0, prompt_tokens_total - cached_prefix_tokens);
+        SRV_WRN("[paged-latency] seq=%d task=%d prompt_tokens=%d cached_prefix_tokens=%d prefill_tokens=%d output_tokens=%d queue_wait_ms=%lld ttft_ms=%lld prefill_ms=%lld decode_ms=%lld total_ms=%lld\n",
                 req.seq_id,
                 req.request_id,
-                req.task ? req.task->n_tokens() : 0,
+                prompt_tokens_total,
+                cached_prefix_tokens,
+                prefill_tokens_actual,
                 req.n_decoded,
                 (long long) queue_wait_ms,
                 (long long) ttft_ms,
@@ -4156,10 +4161,25 @@ private:
                     /*on_request_prompt_done=*/[this](paged_request_state & r) {
                         PGD_INF(r, "prompt done, n_tokens=%d, batch.n_tokens=%d\n",
                                 r.prompt.n_tokens(), this->batch.n_tokens);
+                        const size_t prompt_total = r.task ? (size_t) r.task->n_tokens() : 0;
+                        const size_t cached = std::min(r.cached_prefix_tokens, prompt_total);
+                        const size_t suffix_total = prompt_total > cached ? prompt_total - cached : 0;
+                        SRV_INF("[paged-prefill] done request_id=%d seq=%d cached=%zu prefilled_suffix=%zu total_prompt=%zu\n",
+                                r.request_id, r.seq_id, cached, suffix_total, prompt_total);
                     },
                     /*on_request_progress=*/[](paged_request_state & r) {
                         PGD_INF(r, "prefill progress, n_tokens=%d/%d\n",
                                 r.prompt.n_tokens(), r.task->n_tokens());
+                        const size_t prompt_total = r.task ? (size_t) r.task->n_tokens() : 0;
+                        const size_t cached = std::min(r.cached_prefix_tokens, prompt_total);
+                        const size_t suffix_total = prompt_total > cached ? prompt_total - cached : 0;
+                        const size_t abs_pos = std::min((size_t) r.prompt.n_tokens(), prompt_total);
+                        const size_t suffix_done = abs_pos > cached ? abs_pos - cached : 0;
+                        const size_t chunk = suffix_done >= r.last_prefill_progress_suffix_done
+                            ? (suffix_done - r.last_prefill_progress_suffix_done) : 0;
+                        r.last_prefill_progress_suffix_done = suffix_done;
+                        SRV_INF("[paged-prefill] progress request_id=%d seq=%d cached=%zu suffix_done=%zu/%zu abs=%zu/%zu chunk=%zu\n",
+                                r.request_id, r.seq_id, cached, suffix_done, suffix_total, abs_pos, prompt_total, chunk);
                     },
                     /*request_callbacks=*/server_scheduler::PrefillRequestCallbacks{
                         /*on_release_final=*/[this](paged_request_state & r) {
@@ -4438,10 +4458,25 @@ private:
                         /*on_request_prompt_done=*/[this](paged_request_state & r) {
                             PGD_INF(r, "prompt done, n_tokens=%d, batch.n_tokens=%d\n",
                                     r.prompt.n_tokens(), this->batch.n_tokens);
+                            const size_t prompt_total = r.task ? (size_t) r.task->n_tokens() : 0;
+                            const size_t cached = std::min(r.cached_prefix_tokens, prompt_total);
+                            const size_t suffix_total = prompt_total > cached ? prompt_total - cached : 0;
+                            SRV_INF("[paged-prefill] done request_id=%d seq=%d cached=%zu prefilled_suffix=%zu total_prompt=%zu\n",
+                                    r.request_id, r.seq_id, cached, suffix_total, prompt_total);
                         },
                         /*on_request_progress=*/[](paged_request_state & r) {
                             PGD_INF(r, "prefill progress, n_tokens=%d/%d\n",
                                     r.prompt.n_tokens(), r.task->n_tokens());
+                            const size_t prompt_total = r.task ? (size_t) r.task->n_tokens() : 0;
+                            const size_t cached = std::min(r.cached_prefix_tokens, prompt_total);
+                            const size_t suffix_total = prompt_total > cached ? prompt_total - cached : 0;
+                            const size_t abs_pos = std::min((size_t) r.prompt.n_tokens(), prompt_total);
+                            const size_t suffix_done = abs_pos > cached ? abs_pos - cached : 0;
+                            const size_t chunk = suffix_done >= r.last_prefill_progress_suffix_done
+                                ? (suffix_done - r.last_prefill_progress_suffix_done) : 0;
+                            r.last_prefill_progress_suffix_done = suffix_done;
+                            SRV_INF("[paged-prefill] progress request_id=%d seq=%d cached=%zu suffix_done=%zu/%zu abs=%zu/%zu chunk=%zu\n",
+                                    r.request_id, r.seq_id, cached, suffix_done, suffix_total, abs_pos, prompt_total, chunk);
                         },
                         /*request_callbacks=*/server_scheduler::PrefillRequestCallbacks{
                             /*on_release_final=*/[this](paged_request_state & r) {

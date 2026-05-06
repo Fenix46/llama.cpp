@@ -110,6 +110,7 @@ void RequestLifecycle::reset_runtime_state_for_new_request(RequestState & req, c
     req.cached_prefix_tokens = 0;
     req.prefill_start_token = 0;
     req.remaining_prefill_tokens = 0;
+    req.last_prefill_progress_suffix_done = 0;
     req.spec.clear_runtime();
     req.t_admitted_us = 0;
     req.t_first_prefill_start_us = 0;
