@@ -31,6 +31,7 @@ struct SchedulerPolicyConfig {
     int32_t prefill_every_n_decode_steps  = 8;
     bool    short_prefill_isolate         = false;
     bool    latency_mode                  = true;
+    bool    multi_seq_decode              = false; // allow multiple seqs in one decode segment
 
     static SchedulerPolicyConfig from_env(int32_t n_batch) {
         SchedulerPolicyConfig cfg;
@@ -76,6 +77,7 @@ struct SchedulerPolicyConfig {
                                                    is_latency ? 8 : 1);
         cfg.short_prefill_isolate       = env_bool("LLAMA_PAGED_SHORT_PREFILL_ISOLATE", false);
         cfg.latency_mode                = env_bool("LLAMA_PAGED_LATENCY_MODE", true);
+        cfg.multi_seq_decode            = env_bool("LLAMA_PAGED_MULTI_SEQ_DECODE", false);
 
         const int32_t max_batched_latency    = env_i32("LLAMA_PAGED_MAX_NUM_BATCHED_TOKENS_LATENCY", 512);
         const int32_t max_batched_throughput = env_i32("LLAMA_PAGED_MAX_NUM_BATCHED_TOKENS_THROUGHPUT", n_batch);

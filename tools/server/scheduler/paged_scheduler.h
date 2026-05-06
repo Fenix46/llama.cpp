@@ -5,6 +5,7 @@
 #include "prefill_policy.h"
 #include "request_lifecycle.h"
 #include "scheduler_core.h"
+#include "scheduler_metrics.h"
 #include "step_executor.h"
 #include "llama.h"
 #include "mtmd.h"
@@ -142,6 +143,7 @@ struct DecodePassCallbacks {
     std::function<bool(completion_token_output &, RequestState &)> on_speculative_token;
     std::function<void(RequestState &)> on_speculative_finish;
     const std::unordered_map<int32_t, std::vector<llama_token>> * planned_spec_decode_tokens = nullptr;
+    SchedulerMetrics * metrics = nullptr; // optional: updated with multi-seq stats
 };
 
 struct DecodePassResult {
@@ -233,7 +235,9 @@ public:
             llama_batch & batch,
             int32_t n_batch,
             bool paged_scheduler,
-            const DecodePassCallbacks & cbs);
+            const DecodePassCallbacks & cbs,
+            bool allow_multi_seq = false,
+            int32_t scheduled_decode_seqs = 0);
 
     TickOutcome tick(const PagedRuntime & runtime) const;
     PagedTickDecision tick(const PagedTickInput & in) const;

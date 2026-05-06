@@ -9,14 +9,14 @@ DecodeSegment StepExecutor::select_decode_segment(
         const llama_batch & batch,
         int32_t i,
         int32_t cur_n_batch,
-        bool paged_scheduler) {
+        bool paged_scheduler,
+        bool allow_multi_seq) {
     DecodeSegment out;
     out.n_tokens = std::min(cur_n_batch, batch.n_tokens - i);
-    const bool allow_multi_seq_paged_decode =
-        std::getenv("LLAMA_PAGED_MULTI_SEQ_DECODE") != nullptr;
 
-    // Paged attention kernels currently assume same seq_id per decode segment.
-    if (paged_scheduler && !allow_multi_seq_paged_decode && batch.n_seq_id[i] > 0) {
+    // When multi-seq decode is disabled (default), restrict each kernel call
+    // to tokens of a single seq_id so attention kernels behave correctly.
+    if (paged_scheduler && !allow_multi_seq && batch.n_seq_id[i] > 0) {
         const llama_seq_id seq_id_cur = batch.seq_id[i][0];
         int32_t n_same_seq = 1;
         while (n_same_seq < out.n_tokens) {

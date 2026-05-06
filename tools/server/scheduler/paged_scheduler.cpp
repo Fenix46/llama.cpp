@@ -2,11 +2,14 @@
 
 #include "block_manager.h"
 #include "common.h"
+#include "common/log.h"
 #include "request_lifecycle.h"
 #include "speculative_executor.h"
 
 #include <atomic>
+#include <cinttypes>
 #include <cstdlib>
+#include <unordered_set>
 
 namespace server_scheduler {
 
@@ -601,7 +604,9 @@ DecodePassResult PagedScheduler::process_decode_pass(
         llama_batch & batch,
         int32_t n_batch,
         bool paged_scheduler,
-        const DecodePassCallbacks & cbs) {
+        const DecodePassCallbacks & cbs,
+        bool allow_multi_seq,
+        int32_t scheduled_decode_seqs) {
     DecodePassResult out;
     int32_t i_next = 0;
     int32_t cur_n_batch = n_batch;
@@ -616,8 +621,40 @@ DecodePassResult PagedScheduler::process_decode_pass(
     int64_t decode_us = 0;
     int64_t sample_us = 0;
 
+    // Count actual unique seq_ids in the batch for observability.
+    int32_t actual_batch_seqs = 0;
+    {
+        std::unordered_set<int32_t> batch_seq_set;
+        for (int32_t k = 0; k < batch.n_tokens; ++k) {
+            if (batch.n_seq_id[k] > 0) {
+                batch_seq_set.insert(batch.seq_id[k][0]);
+            }
+        }
+        actual_batch_seqs = (int32_t) batch_seq_set.size();
+    }
+
+    LOG_DBG("[paged-decode] step=%" PRIu64 " n_seq=%d n_tokens=%d multi_seq_enabled=%d actual_multi_seq=%d\n",
+            decode_pass_index, actual_batch_seqs, batch.n_tokens,
+            allow_multi_seq ? 1 : 0,
+            actual_batch_seqs > 1 ? 1 : 0);
+
+    // Detect hidden serialization: scheduler planned multiple decode seqs
+    // but batch contains only one seq (routing or budgeting issue).
+    if (scheduled_decode_seqs > 1 && actual_batch_seqs == 1) {
+        LOG_WRN("[paged-decode] serialization-fallback: scheduled=%d actual_batch_seqs=1"
+                " — multi-seq decode silently serialized\n",
+                scheduled_decode_seqs);
+    }
+
+    // Update metrics.
+    if (cbs.metrics) {
+        cbs.metrics->multi_seq.record_step(
+            scheduled_decode_seqs > 0 ? scheduled_decode_seqs : actual_batch_seqs,
+            actual_batch_seqs);
+    }
+
     for (int32_t i = 0; i < batch.n_tokens; i = i_next) {
-        const auto seg = StepExecutor::select_decode_segment(batch, i, cur_n_batch, paged_scheduler);
+        const auto seg = StepExecutor::select_decode_segment(batch, i, cur_n_batch, paged_scheduler, allow_multi_seq);
         const int32_t n_tokens = seg.n_tokens;
         if (trace_this_pass) {
             SRV_WRN("[paged-decode-seg] batch_total=%d i=%d n_tokens=%d paged=%d\n",
@@ -788,10 +825,23 @@ DecodeBatchResult PagedScheduler::populate_decode_batch(
         auto & req = reqs[idx];
         GGML_ASSERT(req.phase == PAGED_REQUEST_DECODING);
         GGML_ASSERT(req.sampled != LLAMA_TOKEN_NULL);
+        // Stable-seq assertion: seq_id must not be -1 during active decode.
+        GGML_ASSERT(req.seq_id >= 0 && "decode: seq_id must be stable during active request");
         if (out.first_decode_request_index < 0) {
             out.first_decode_request_index = (int32_t) idx;
         }
+
+        const llama_pos pos_before = req.prompt.tokens.pos_next();
         req.update_batch(batch);
+        const llama_pos pos_after = req.prompt.tokens.pos_next();
+
+        // Block-table log: position must advance by exactly 1 per decode step.
+        LOG_DBG("[paged-decode] batch seq_id=%d pos=%d->%d block_table_len=%d\n",
+                req.seq_id, (int) pos_before, (int) pos_after, req.prompt.n_tokens());
+        if (pos_after != pos_before + 1) {
+            LOG_WRN("[paged-decode] unexpected pos advance: seq_id=%d expected +1 got %d\n",
+                    req.seq_id, (int)(pos_after - pos_before));
+        }
     }
 
 #ifndef NDEBUG

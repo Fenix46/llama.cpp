@@ -16,6 +16,7 @@
 #include "scheduler/request_lifecycle.h"
 #include "scheduler/sampling_executor.h"
 #include "scheduler/scheduler_core.h"
+#include "scheduler/scheduler_metrics.h"
 #include "scheduler/scheduler_policy_config.h"
 #include "scheduler/speculative_executor.h"
 #include "scheduler/step_executor.h"
@@ -732,6 +733,7 @@ private:
     std::unique_ptr<kv_block_scheduler> kv_sched;
     server_scheduler::SchedulerCore paged_core;
     server_scheduler::PagedScheduler paged_sched;
+    server_scheduler::SchedulerMetrics paged_metrics_;
     std::unique_ptr<server_scheduler::RequestLifecycle> paged_lifecycle;
     bool paged_orchestrator_v2_ = true;
 
@@ -1288,6 +1290,8 @@ private:
                             sched_policy_cfg_.max_num_batched_tokens,
                             sched_policy_cfg_.decode_burst_tokens,
                             sched_policy_cfg_.prefill_every_n_decode_steps);
+                    SRV_INF("[paged-decode] multi_seq_enabled=%d (LLAMA_PAGED_MULTI_SEQ_DECODE)\n",
+                            sched_policy_cfg_.multi_seq_decode ? 1 : 0);
                 }
             }
 
@@ -4127,7 +4131,10 @@ private:
                         req.release();
                     },
                     /*planned_spec_decode_tokens=*/&schedule_decision.scheduled_spec_decode_tokens,
-                });
+                    /*metrics=*/&paged_metrics_,
+                },
+                /*allow_multi_seq=*/sched_policy_cfg_.multi_seq_decode,
+                /*scheduled_decode_seqs=*/planned_decode_rows_tick);
 
             if (split_mixed_batch && !decode_outcome.fatal && sched_prefill_toks_tick > 0) {
                 const int32_t executed_decode_tokens = batch.n_tokens;
@@ -4259,7 +4266,10 @@ private:
                             /*on_speculative_token=*/{},
                             /*on_speculative_finish=*/{},
                             /*planned_spec_decode_tokens=*/&schedule_decision.scheduled_spec_decode_tokens,
-                        });
+                            /*metrics=*/&paged_metrics_,
+                        },
+                        /*allow_multi_seq=*/sched_policy_cfg_.multi_seq_decode,
+                        /*scheduled_decode_seqs=*/0);
                     decode_outcome.fatal = decode_outcome.fatal || prefill_decode_outcome.fatal;
                     decode_outcome.retried = decode_outcome.retried || prefill_decode_outcome.retried;
                 }

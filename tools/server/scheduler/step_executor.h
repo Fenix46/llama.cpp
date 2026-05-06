@@ -22,7 +22,8 @@ public:
             const llama_batch & batch,
             int32_t i,
             int32_t cur_n_batch,
-            bool paged_scheduler);
+            bool paged_scheduler,
+            bool allow_multi_seq = false);
 
     static DecodeRetDecision classify_decode_ret(int32_t ret, int32_t cur_n_batch);
     static llama_batch make_batch_view(const llama_batch & batch, int32_t i, int32_t n_tokens);
