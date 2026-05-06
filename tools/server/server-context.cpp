@@ -6,13 +6,14 @@
 #include "server-task.h"
 #include "server-queue.h"
 #include "kv-block-scheduler.h"
-#include "kv-prefix-cache.h"
+#include "scheduler/prefix_reuse_manager.h"
 #include "paged-request.h"
 #include "scheduler/admission_controller.h"
 #include "scheduler/block_manager.h"
 #include "scheduler/prefill_policy.h"
 #include "scheduler/paged_scheduler.h"
 #include "scheduler/reservation_model.h"
+#include "scheduler/request_lifecycle.h"
 #include "scheduler/sampling_executor.h"
 #include "scheduler/scheduler_core.h"
 #include "scheduler/speculative_executor.h"
@@ -726,11 +727,12 @@ private:
     std::unique_ptr<kv_block_scheduler> kv_sched;
     server_scheduler::SchedulerCore paged_core;
     server_scheduler::PagedScheduler paged_sched;
+    std::unique_ptr<server_scheduler::RequestLifecycle> paged_lifecycle;
     bool paged_orchestrator_v2_ = true;
 
     // Experimental cross-slot KV prefix cache (--kv-prefix-cache).
     // Null when flag is off. Registered on slot release, invalidated on eviction.
-    std::unique_ptr<kv_prefix_cache> prefix_cache_;
+    std::unique_ptr<server_scheduler::PrefixReuseManager> prefix_cache_;
 
     json json_webui_settings = json::object();
 
@@ -841,7 +843,7 @@ private:
     // Invalidate prefix cache entry for a slot whose KV is about to be cleared.
     void prefix_cache_invalidate(int id_slot) {
         if (prefix_cache_) {
-            prefix_cache_->invalidate(id_slot);
+            prefix_cache_->invalidate_seq(id_slot, "slot-invalidate");
         }
     }
 
@@ -875,7 +877,7 @@ private:
 
             if (prefix_cache_) {
                 if (can_cache) {
-                    prefix_cache_->register_slot(id_slot, sl->prompt.tokens.get_tokens());
+                    prefix_cache_->register_raw(id_slot, sl->prompt.tokens.get_tokens());
                 }
             }
             if (params_base.scheduler == "paged") {
@@ -1119,16 +1121,59 @@ private:
         paged_requests.clear();
         if (params_base.scheduler == "paged") {
             paged_seq_leases.reset((int32_t) llama_n_seq_max(ctx));
+            server_scheduler::RequestLifecycleOps lifecycle_ops;
+            lifecycle_ops.now_us = []() { return ggml_time_us(); };
+            lifecycle_ops.scheduler_on_request_started = [this](int32_t seq_id) {
+                paged_core.on_request_started(seq_id);
+            };
+            lifecycle_ops.scheduler_on_request_finished = [this](int32_t seq_id) {
+                paged_core.on_request_finished(seq_id);
+            };
+            lifecycle_ops.seq_mark_cached = [this](int32_t seq_id) {
+                paged_seq_leases.mark_cached(seq_id);
+            };
+            lifecycle_ops.seq_release_uncached = [this](int32_t seq_id) {
+                paged_seq_leases.release_uncached(seq_id);
+            };
+            lifecycle_ops.seq_is_active = [this](int32_t seq_id) {
+                return paged_seq_leases.is_active(seq_id);
+            };
+            lifecycle_ops.prefix_invalidate = [this](int32_t seq_id) {
+                prefix_cache_invalidate(seq_id);
+            };
+            lifecycle_ops.prefix_register = [this](int32_t seq_id, const std::vector<llama_token> & toks) {
+                if (prefix_cache_) {
+                    prefix_cache_->register_raw(seq_id, toks);
+                }
+            };
+            lifecycle_ops.prefix_register_request = [this](const server_scheduler::RequestState & req, bool cacheable) -> bool {
+                if (!prefix_cache_) {
+                    return false;
+                }
+                return prefix_cache_->register_finished_request(req, build_prefix_reuse_metadata(req), cacheable);
+            };
+            lifecycle_ops.clear_sequence = [this](int32_t seq_id) {
+                return server_scheduler::BlockManager::clear_sequence(ctx, seq_id);
+            };
+            lifecycle_ops.seq_pos_min = [this](int32_t seq_id) {
+                return server_scheduler::BlockManager::seq_pos_min(ctx, seq_id);
+            };
+            lifecycle_ops.seq_pos_max = [this](int32_t seq_id) {
+                return server_scheduler::BlockManager::seq_pos_max(ctx, seq_id);
+            };
+            paged_lifecycle = std::make_unique<server_scheduler::RequestLifecycle>(
+                server_scheduler::RequestLifecycleConfig{
+                    /*cache_prompt_default=*/true,
+                    /*allow_prefix_cache=*/true,
+                },
+                std::move(lifecycle_ops));
+        } else {
+            paged_lifecycle.reset();
         }
 
-        common_context_seq_rm_type ctx_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+        common_context_seq_rm_type ctx_seq_rm_type = common_context_can_seq_rm(ctx);
 
-        // In paged scheduler we do not use checkpoint-based seq-rm probing in the hot path.
-        // Skip capability probing to avoid misleading warnings and side effects.
-        if (params_base.scheduler != "paged") {
-            ctx_seq_rm_type = common_context_can_seq_rm(ctx);
-        }
-        if (params_base.scheduler != "paged" && ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+        if (ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             SRV_WRN("%s", "speculative decoding not supported by this context\n");
         }
 
@@ -1149,6 +1194,14 @@ private:
             params_base.speculative.type != COMMON_SPECULATIVE_TYPE_NONE) {
             SRV_WRN("%s", "[paged] disabling speculative decoding: checkpoint-based speculative is unsupported\n");
             params_base.speculative.type = COMMON_SPECULATIVE_TYPE_NONE;
+        }
+
+        if (params_base.scheduler == "paged") {
+            SRV_INF("[paged-capability] ctx_seq_rm_type=%d clear=%d copy=%d truncate=%d\n",
+                    (int) ctx_seq_rm_type,
+                    ctx_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO ? 1 : 0,
+                    ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ? 1 : 0,
+                    ctx_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO ? 1 : 0);
         }
 
         // cache for dynamic slot creation
@@ -1200,7 +1253,7 @@ private:
                 SRV_WRN("%s", "[kv-prefix-cache] requires --kv-unified for cross-slot seq_cp — disabling\n");
                 params_base.kv_prefix_cache = false;
             } else {
-                prefix_cache_ = std::make_unique<kv_prefix_cache>(params_base.kv_block_size);
+                prefix_cache_ = std::make_unique<server_scheduler::PrefixReuseManager>(params_base.kv_block_size);
                 SRV_INF("[kv-prefix-cache] enabled (experimental): cross-slot prefix reuse, block_size=%d\n",
                         (int)params_base.kv_block_size);
             }
@@ -1421,39 +1474,33 @@ private:
 
     // Find or create a paged_request_state ready for a new task.
     // Returns nullptr if KV pool is exhausted or seq_id pool is empty.
+    // In paged mode, cached prompt/KV must be reused via prefix plan, not by
+    // arbitrarily reactivating a cached seq_id here.
     paged_request_state * get_or_create_paged_request(const server_task & task) {
         const int32_t seq_max     = (int32_t) llama_n_seq_max(ctx);
         const int32_t blks_needed = paged_task_reserved_blocks(task);
         const int32_t seq_cap     = params_base.paged_admission != "actual-len"
             ? std::min(seq_max, paged_max_full_ctx_concurrency_)
             : seq_max;
-
-        // Reuse an idle request only if its seq_id can be made active again.
-        // Cached entries keep their KV prefix; empty entries lease a fresh seq_id.
-        for (auto & req : paged_requests) {
-            if (!req.is_processing()) {
-                if (req.prompt.n_tokens() > 0) {
-                    if (paged_seq_leases.n_active() >= seq_cap) {
-                        continue;
-                    }
-
-                    if (paged_seq_leases.activate_cached(req.seq_id)) {
-                        SRV_INF("[paged] reusing cached request entry seq_id=%d\n", req.seq_id);
-                        return &req;
-                    }
-
-                    if (req.seq_id >= 0) {
-                        prefix_cache_invalidate(req.seq_id);
-                        req.prompt_clear(false);
-                        paged_seq_leases.release_uncached(req.seq_id);
-                        req.seq_id = -1;
-                    } else {
-                        req.prompt.tokens.clear();
-                    }
-                    req.prompt.checkpoints.clear();
+        auto reclaim_cached_seq_for_lease = [this](const char * reason) -> bool {
+            for (auto & cached_req : paged_requests) {
+                if (cached_req.is_processing() || cached_req.seq_id < 0) {
+                    continue;
                 }
+                if (paged_seq_leases.is_active(cached_req.seq_id) || cached_req.prompt.n_tokens() == 0) {
+                    continue;
+                }
+                SRV_WRN("[paged] reclaim cached request seq_id=%d reason=%s\n", cached_req.seq_id, reason);
+                prefix_cache_invalidate(cached_req.seq_id);
+                (void) server_scheduler::BlockManager::clear_destination_sequence(cached_req);
+                paged_seq_leases.release_uncached(cached_req.seq_id);
+                cached_req.seq_id = -1;
+                cached_req.prompt.tokens.clear();
+                cached_req.prompt.checkpoints.clear();
+                return true;
             }
-        }
+            return false;
+        };
 
         // check cap and KV availability before creating a new entry
         const int32_t n_active = paged_seq_leases.n_active();
@@ -1476,8 +1523,11 @@ private:
         }
 
         for (auto & req : paged_requests) {
-            if (!req.is_processing() && req.prompt.n_tokens() == 0) {
-                const int32_t seq_id = paged_seq_leases.lease();
+            if (!req.is_processing() && req.seq_id < 0) {
+                int32_t seq_id = paged_seq_leases.lease();
+                if (seq_id < 0 && reclaim_cached_seq_for_lease("lease-reclaim")) {
+                    seq_id = paged_seq_leases.lease();
+                }
                 if (seq_id < 0) {
                     SRV_WRN("%s", "[paged] no free seq_id lease\n");
                     return nullptr;
@@ -1487,12 +1537,15 @@ private:
                 req.n_ctx  = n_ctx_slot_;
                 req.prompt.tokens.has_mtmd = mctx != nullptr;
 
-                SRV_INF("[paged] reusing empty request entry seq_id=%d\n", seq_id);
+                SRV_INF("[paged] reusing request entry with fresh seq_id=%d\n", seq_id);
                 return &req;
             }
         }
 
-        const int32_t seq_id = paged_seq_leases.lease();
+        int32_t seq_id = paged_seq_leases.lease();
+        if (seq_id < 0 && reclaim_cached_seq_for_lease("lease-reclaim")) {
+            seq_id = paged_seq_leases.lease();
+        }
         if (seq_id < 0) {
             SRV_WRN("%s", "[paged] no free seq_id lease\n");
             return nullptr;
@@ -1625,7 +1678,7 @@ private:
             const uint32_t bs = prefix_cache_->block_size();
             const int32_t cur_pages = (cur_common / (int32_t)bs) * (int32_t)bs;
 
-            auto res = prefix_cache_->lookup(task_toks);
+            auto res = prefix_cache_->lookup_raw(task_toks);
 
             if (res.donor_slot_id >= 0 &&
                 res.donor_slot_id != ret->seq_id() &&
@@ -1650,7 +1703,7 @@ private:
                         ret->seq_id(),   // dst seq_id
                         0,
                         (llama_pos) res.n_cached_tokens);
-                    prefix_cache_->record_reuse(res.n_cached_tokens);
+                    prefix_cache_->record_reuse((size_t) res.n_cached_tokens);
 
                     // prime ret->prompt.tokens with the cached prefix tokens so
                     // get_common_prefix() later returns n_cached_tokens and n_past is set
@@ -1703,12 +1756,9 @@ private:
         if (!params_base.kv_unified) {
             return false;
         }
-        const bool evicted = server_scheduler::BlockManager::evict(
-            server_scheduler::BlockManager::PolicyContext{
-                /*reqs=*/&paged_requests,
-                /*now_us=*/ggml_time_us(),
-                /*idle_threshold_us=*/0,
-            });
+        const auto ev = server_scheduler::BlockManager::evict_idle_cache(
+            paged_requests, ggml_time_us(), 0, 0);
+        const bool evicted = ev.evicted_entries > 0;
         if (!evicted) {
             return false;
         }
@@ -1720,7 +1770,7 @@ private:
                 SRV_WRN("[paged] purging idle req seq_id=%d\n", req.seq_id);
                 if (req.seq_id >= 0) {
                     prefix_cache_invalidate(req.seq_id);
-                    server_scheduler::BlockManager::clear_sequence(ctx, req.seq_id);
+                    (void) server_scheduler::BlockManager::clear_destination_sequence(req);
                     paged_seq_leases.release_uncached(req.seq_id);
                     req.seq_id = -1;
                 }
@@ -1754,37 +1804,59 @@ private:
         GGML_ASSERT(pos_min == -1 && pos_max == -1 && "paged seq clear invariant violated");
     }
 
-    void reset_paged_request_state(paged_request_state & req, const char * reason) {
-        if (req.seq_id >= 0) {
-            prefix_cache_invalidate(req.seq_id);
-            (void) server_scheduler::BlockManager::clear_sequence(ctx, req.seq_id);
-            assert_paged_seq_cleared(req);
+    void mark_request_uncacheable(paged_request_state & req, const char * reason) {
+        if (paged_lifecycle) {
+            paged_lifecycle->mark_uncacheable(req, reason);
+            return;
         }
+        req.drop_cache_on_release = true;
+    }
 
-        req.prompt.tokens.clear();
-        req.prompt.checkpoints.clear();
-        req.n_prompt_tokens_cache = 0;
-        req.n_prompt_tokens_processed = 0;
-        req.drop_cache_on_release = false;
+    bool can_use_prefix_copy(const paged_request_state & req) const {
+        return req.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+    }
 
-        SRV_WRN("[paged] hard reset seq_id=%d reason=%s\n", req.seq_id, reason);
+    void reset_runtime_state_for_new_request(paged_request_state & req, const char * reason) {
+        if (paged_lifecycle) {
+            paged_lifecycle->reset_runtime_state_for_new_request(req, reason);
+            return;
+        }
+        req.spec.clear_runtime();
+        req.output.reset();
+    }
+
+    void clear_sequence_kv(paged_request_state & req, const char * reason) {
+        if (paged_lifecycle) {
+            paged_lifecycle->clear_sequence_kv(req, reason);
+            return;
+        }
+        (void) reason;
+    }
+
+    void prepare_empty_sequence_for_prefix_copy(paged_request_state & req, const char * reason) {
+        if (paged_lifecycle) {
+            paged_lifecycle->prepare_empty_sequence_for_prefix_copy(req, reason);
+            return;
+        }
+        clear_sequence_kv(req, reason);
     }
 
     void reset_paged_request_for_reprefill(paged_request_state & req, const char * reason) {
-        reset_paged_request_state(req, reason);
-        req.sampled = LLAMA_TOKEN_NULL;
-        req.i_batch = -1;
-        req.n_decoded = 0;
-        req.n_remaining = -1;
-        req.n_prompt_tokens_cache = 0;
-        req.n_prompt_tokens_processed = 0;
-        req.spec.clear_runtime();
-        req.drop_cache_on_release = true;
-        SRV_WRN("[paged] re-prefill reset seq_id=%d reason=%s\n", req.seq_id, reason);
+        if (paged_lifecycle) {
+            paged_lifecycle->reset_for_reprefill(req, reason);
+            return;
+        }
+        prepare_empty_sequence_for_prefix_copy(req, reason);
+        reset_runtime_state_for_new_request(req, reason);
     }
 
     void register_paged_prefix_cache_on_release(int32_t seq_id) {
         paged_request_state * req = get_paged_request_by_seq_id(seq_id);
+        if (paged_lifecycle) {
+            (void) paged_lifecycle->register_prefix_cache_on_release(
+                req, seq_id, prefix_cache_ != nullptr, params_base.cache_ram_mib);
+            return;
+        }
         const bool cacheable_task =
             req != nullptr &&
             req->task &&
@@ -1817,16 +1889,19 @@ private:
 
         if (can_cache) {
             if (prefix_cache_) {
-                prefix_cache_->register_slot(seq_id, req->prompt.tokens.get_tokens());
+                prefix_cache_->register_raw(seq_id, req->prompt.tokens.get_tokens());
             }
             paged_seq_leases.mark_cached(seq_id);
         } else {
             if (req != nullptr) {
-                reset_paged_request_state(*req, "release-uncached");
+                prepare_empty_sequence_for_prefix_copy(*req, "release-uncached");
+                reset_runtime_state_for_new_request(*req, "release-uncached");
             } else if (seq_id >= 0) {
                 prefix_cache_invalidate(seq_id);
-                (void) server_scheduler::BlockManager::clear_sequence(ctx, seq_id);
-                server_scheduler::BlockManager::rebuild_block_table(ctx, seq_id);
+                server_scheduler::RequestState tmp;
+                tmp.ctx = ctx;
+                tmp.seq_id = seq_id;
+                (void) server_scheduler::BlockManager::clear_destination_sequence(tmp);
                 GGML_ASSERT(server_scheduler::BlockManager::seq_pos_min(ctx, seq_id) == -1);
                 GGML_ASSERT(server_scheduler::BlockManager::seq_pos_max(ctx, seq_id) == -1);
             }
@@ -1837,49 +1912,48 @@ private:
         }
     }
 
-    void try_apply_paged_prefix_cache(paged_request_state & req, const server_task & task) {
-        if (!prefix_cache_ ||
-            task.type != SERVER_TASK_TYPE_COMPLETION ||
-            !task.params.cache_prompt ||
-            task.tokens.has_mtmd) {
-            return;
-        }
-        if (req.ctx_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
-            return;
-        }
+    server_scheduler::PrefixReuseMetadata build_prefix_reuse_metadata(const paged_request_state & req) const {
+        server_scheduler::PrefixReuseMetadata md;
+        md.model_id = model_name;
+        md.lora_id = req.lora.empty() ? "none" : std::to_string(req.lora.size());
+        md.kv_dtype = "TODO-kv-dtype";
+        md.rope_cfg = "TODO-rope";
+        md.block_size = (uint32_t) params_base.kv_block_size;
+        md.has_mtmd = req.prompt.tokens.has_mtmd;
+        md.mtmd_hash = 0; // TODO: wire real multimodal hash
+        return md;
+    }
 
-        const auto & task_toks = task.tokens.get_tokens();
-        const int32_t cur_common = (int32_t) req.prompt.tokens.get_common_prefix(task.tokens);
-        const uint32_t bs = prefix_cache_->block_size();
-        const int32_t cur_pages = (cur_common / (int32_t) bs) * (int32_t) bs;
-
-        auto res = prefix_cache_->lookup(task_toks);
-        if (res.donor_slot_id < 0 ||
-            res.donor_slot_id == req.seq_id ||
-            res.n_cached_tokens <= cur_pages) {
+    void execute_prefix_reuse_plan(paged_request_state & req, const server_task & task, bool allow_same_seq_append) {
+        if (!prefix_cache_) {
+            (void) server_scheduler::BlockManager::prepare_fresh_sequence(req);
             return;
         }
 
-        paged_request_state * donor = get_paged_request_by_seq_id(res.donor_slot_id);
-        if (donor == nullptr ||
-            donor->is_processing() ||
-            donor->prompt.tokens.has_mtmd ||
-            (int32_t) donor->prompt.tokens.get_tokens().size() < res.n_cached_tokens) {
+        const auto plan = prefix_cache_->resolve(
+            task,
+            req,
+            build_prefix_reuse_metadata(req),
+            allow_same_seq_append,
+            can_use_prefix_copy(req),
+            [this](int32_t seq_id) -> const server_scheduler::RequestState * {
+                return get_paged_request_by_seq_id(seq_id);
+            });
+
+        const auto attach = server_scheduler::BlockManager::attach_prefix(req, plan.to_block_plan());
+        if (!attach.ok) {
+            SRV_WRN("[paged-prefix] attach failed request_id=%d reason=%s; falling back to fresh prefill\n",
+                    task.id, attach.failure_reason ? attach.failure_reason : "unknown");
+            (void) server_scheduler::BlockManager::prepare_fresh_sequence(req);
             return;
         }
-
-        SRV_INF("[kv-prefix-cache] paged reuse: donor=%d -> seq=%d, n_cached=%d (cur_common=%d)\n",
-                res.donor_slot_id, req.seq_id, res.n_cached_tokens, cur_pages);
-
-        reset_paged_request_for_reprefill(req, "prefix-reuse");
-
-        server_scheduler::BlockManager::copy_sequence(ctx, donor->seq_id, req.seq_id);
-        server_scheduler::BlockManager::truncate_seq_tail(ctx, req.seq_id, (llama_pos) res.n_cached_tokens);
-        prefix_cache_->record_reuse(res.n_cached_tokens);
-
-        const auto & donor_toks = donor->prompt.tokens.get_tokens();
-        for (int32_t i = 0; i < res.n_cached_tokens && i < (int32_t) donor_toks.size(); ++i) {
-            req.prompt.tokens.push_back(donor_toks[i]);
+        if (attach.cached_tokens > 0) {
+            prefix_cache_->record_reuse(attach.cached_tokens);
+            req.prompt.tokens.clear();
+            const auto & new_toks = task.tokens.get_tokens();
+            for (size_t i = 0; i < attach.cached_tokens && i < new_toks.size(); ++i) {
+                req.prompt.tokens.push_back(new_toks[(int32_t) i]);
+            }
         }
     }
 
@@ -2026,10 +2100,7 @@ private:
             auto task_loras = construct_lora_list(task.params.lora);
             if (!are_lora_equal(task_loras, req.lora)) {
                 if (lora_should_clear_cache(req.lora, task_loras)) {
-                    prefix_cache_invalidate(req.seq_id);
-                    server_scheduler::BlockManager::clear_sequence(ctx, req.seq_id);
-                    req.prompt.tokens.clear();
-                    req.prompt.checkpoints.clear();
+                    prepare_empty_sequence_for_prefix_copy(req, "lora-change");
                 }
                 req.lora = task_loras;
             }
@@ -2075,27 +2146,19 @@ private:
         req.drop_cache_on_release = false;
         req.callback_on_release = [this](int32_t sid) {
             register_paged_prefix_cache_on_release(sid);
-            paged_core.on_request_finished(sid);
+            paged_request_state * rel = get_paged_request_by_seq_id(sid);
+            if (paged_lifecycle && rel) {
+                paged_lifecycle->release_request(*rel);
+            } else {
+                paged_core.on_request_finished(sid);
+            }
         };
 
-        bool same_seq_append_reuse = false;
-        if (req.prompt.n_tokens() > 0 && task.params.cache_prompt && !task.tokens.has_mtmd) {
-            const auto & old_toks = req.prompt.tokens.get_tokens();
-            const auto & new_toks = task.tokens.get_tokens();
-            if (new_toks.size() >= old_toks.size() &&
-                std::equal(old_toks.begin(), old_toks.end(), new_toks.begin())) {
-                same_seq_append_reuse = true;
-                SRV_INF("[paged] same-seq append reuse seq=%d old=%zu new=%zu suffix=%zu\n",
-                        req.seq_id, old_toks.size(), new_toks.size(), new_toks.size() - old_toks.size());
-            }
-        }
-
-        if (!same_seq_append_reuse && req.prompt.n_tokens() > 0) {
-            reset_paged_request_for_reprefill(req, "reuse-no-verified-prefix");
-        }
-        if (!same_seq_append_reuse) {
-            try_apply_paged_prefix_cache(req, task);
-        }
+        // same-seq append is a narrow optimization reserved for verified lineage.
+        // New HTTP requests are treated as fresh lineage in phase-1 bugfix mode.
+        const bool allow_same_seq_append = false;
+        execute_prefix_reuse_plan(req, task, allow_same_seq_append);
+        reset_runtime_state_for_new_request(req, "launch");
 
         // sampler
         if (task.need_sampling()) {
@@ -2120,11 +2183,17 @@ private:
         req.t_first_token_us = 0;
         req.t_last_token_us = 0;
         req.task       = std::make_unique<const server_task>(std::move(task));
+        if (paged_lifecycle && req.task) {
+            paged_lifecycle->on_create(req, *req.task);
+            paged_lifecycle->on_admit(req);
+        }
 
         n_empty_consecutive = 0;
         SRV_INF("[paged] launched request seq_id=%d, task=%d, is_child=%d\n",
                 req.seq_id, req.request_id, req.task->is_child() ? 1 : 0);
-        paged_core.on_request_started(req.seq_id);
+        if (!paged_lifecycle) {
+            paged_core.on_request_started(req.seq_id);
+        }
         return true;
     }
 
@@ -2658,6 +2727,9 @@ private:
     }
 
     void send_final_response(paged_request_state & req) {
+        if (paged_lifecycle) {
+            paged_lifecycle->finish_request(req);
+        }
         auto res = std::make_unique<server_task_result_cmpl_final>();
 
         res->id      = req.task->id;
@@ -2743,6 +2815,9 @@ private:
     // --- end paged overloads ---
 
     void send_embedding(const paged_request_state & req, const llama_batch & batch) {
+        if (paged_lifecycle) {
+            paged_lifecycle->finish_request(req);
+        }
         auto res = std::make_unique<server_task_result_embd>();
         res->id        = req.task->id;
         res->index     = req.task->index;
@@ -2780,6 +2855,9 @@ private:
     }
 
     void send_rerank(const paged_request_state & req, const llama_batch & batch) {
+        if (paged_lifecycle) {
+            paged_lifecycle->finish_request(req);
+        }
         auto res = std::make_unique<server_task_result_rerank>();
         res->id       = req.task->id;
         res->index    = req.task->index;
@@ -3197,7 +3275,11 @@ private:
                         for (auto & req : paged_requests) {
                             if (req.task && req.task->id == task.id_target) {
                                 // Defer KV teardown to the normal release path.
-                                req.drop_cache_on_release = true;
+                                if (paged_lifecycle) {
+                                    paged_lifecycle->abort_request(req, "cancelled");
+                                } else {
+                                    mark_request_uncacheable(req, "cancelled");
+                                }
                                 req.release();
                                 break;
                             }
@@ -3595,8 +3677,13 @@ private:
                     // matching vLLM default preemption mode).
                     paged_request_state * victim = get_paged_request_by_seq_id(preempted_seq_id);
                     if (victim) {
+                        if (paged_lifecycle) {
+                            paged_lifecycle->abort_request(*victim, "kv-preemption");
+                        } else {
+                            mark_request_uncacheable(*victim, "kv-preemption");
+                        }
                         reset_paged_request_for_reprefill(*victim, "kv-preemption");
-                        server_scheduler::BlockManager::release_blocks(*victim);
+                        server_scheduler::BlockManager::release_runtime_sequence(*victim);
                         PGD_WRN(*victim, "preempted by scheduler due to KV pressure, seq_id=%d\n", preempted_seq_id);
                     }
                 },
@@ -3826,7 +3913,10 @@ private:
                     /*checkpoints_enabled=*/false,
                 },
                 server_scheduler::PrefillPassCallbacks{
-                    /*on_request_begin=*/[](paged_request_state & r) {
+                    /*on_request_begin=*/[this](paged_request_state & r) {
+                        if (paged_lifecycle) {
+                            paged_lifecycle->mark_prefilling(r);
+                        }
                         PGD_INF(r, "new prompt, n_ctx=%d, n_keep=%d, task.n_tokens=%d\n",
                                 r.n_ctx, r.task->params.n_keep, r.task->n_tokens());
                     },
@@ -3849,12 +3939,17 @@ private:
                             send_error(r, msg, t);
                             r.release();
                         },
-                        /*on_hard_reset=*/[this](paged_request_state & r, const char * reason) {
-                            if (reason && std::string_view(reason) == "truncate-failed") {
-                                ++paged_truncate_failed_;
-                            }
-                            reset_paged_request_for_reprefill(r, reason);
-                        },
+                            /*on_hard_reset=*/[this](paged_request_state & r, const char * reason) {
+                                if (reason && std::string_view(reason) == "truncate-failed") {
+                                    ++paged_truncate_failed_;
+                                    if (paged_lifecycle) {
+                                        paged_lifecycle->abort_request(r, "truncate-failed");
+                                    } else {
+                                        mark_request_uncacheable(r, "truncate-failed");
+                                    }
+                                }
+                                reset_paged_request_for_reprefill(r, reason);
+                            },
                         /*on_create_checkpoint=*/[this](paged_request_state & r, int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
                             create_checkpoint(r, n_tokens_cur, pos_min, pos_max);
                         },
@@ -3929,6 +4024,10 @@ private:
 
                     if (!server_scheduler::SamplingExecutor::can_sample_in_segment(req, i, n_tokens)) {
                         continue;
+                    }
+                    if (paged_lifecycle && req.phase == PAGED_REQUEST_DECODING &&
+                        paged_lifecycle->status_of(req) != server_scheduler::PagedRequestStatus::Decoding) {
+                        paged_lifecycle->mark_decoding(req);
                     }
 
                     const auto prefill_action = server_scheduler::SamplingExecutor::prefill_action(req);
@@ -4089,7 +4188,10 @@ private:
                         /*checkpoints_enabled=*/false,
                     },
                     server_scheduler::PrefillPassCallbacks{
-                        /*on_request_begin=*/[](paged_request_state & r) {
+                        /*on_request_begin=*/[this](paged_request_state & r) {
+                            if (paged_lifecycle) {
+                                paged_lifecycle->mark_prefilling(r);
+                            }
                             PGD_INF(r, "new prompt, n_ctx=%d, n_keep=%d, task.n_tokens=%d\n",
                                     r.n_ctx, r.task->params.n_keep, r.task->n_tokens());
                         },
@@ -4115,6 +4217,11 @@ private:
                             /*on_hard_reset=*/[this](paged_request_state & r, const char * reason) {
                                 if (reason && std::string_view(reason) == "truncate-failed") {
                                     ++paged_truncate_failed_;
+                                    if (paged_lifecycle) {
+                                        paged_lifecycle->abort_request(r, "truncate-failed");
+                                    } else {
+                                        mark_request_uncacheable(r, "truncate-failed");
+                                    }
                                 }
                                 reset_paged_request_for_reprefill(r, reason);
                             },
