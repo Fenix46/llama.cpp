@@ -184,6 +184,8 @@ bool RequestLifecycle::register_prefix_cache_on_release(
 
     if (can_cache) {
         bool registered = true;
+        PrefixReuseManager::RegisterFinishedResult reg_result;
+        reg_result.reason = "no-prefix-cache";
         std::vector<int32_t> seq_blocks;
         if (has_prefix_cache && ops_.seq_get_physical_blocks && req != nullptr) {
             const int32_t block_sz = req->ctx ? llama_kv_cache_block_size(llama_get_memory(req->ctx)) : 0;
@@ -194,28 +196,42 @@ bool RequestLifecycle::register_prefix_cache_on_release(
                 const bool retained = ops_.blocks_retain_cached(*req, seq_blocks);
                 if (!retained) {
                     registered = false;
+                    reg_result.reason = "retain-failed";
                 }
             }
             if (registered && ops_.prefix_register_request_blocks) {
-                registered = ops_.prefix_register_request_blocks(*req, seq_blocks);
+                reg_result = ops_.prefix_register_request_blocks(*req, seq_blocks);
+                registered = reg_result.ok;
             } else if (registered && ops_.prefix_register_request) {
                 registered = ops_.prefix_register_request(*req, true);
+                reg_result.ok = registered;
+                reg_result.reason = registered ? "legacy-ok" : "legacy-rejected";
             } else if (registered && ops_.prefix_register) {
                 ops_.prefix_register(seq_id, req->prompt.tokens.get_tokens());
+                reg_result.ok = true;
+                reg_result.reason = "legacy-raw";
             }
             if (!registered && !seq_blocks.empty() && ops_.blocks_release_cached) {
                 (void) ops_.blocks_release_cached(*req, seq_blocks);
             }
         } else if (has_prefix_cache && ops_.prefix_register_request) {
             registered = ops_.prefix_register_request(*req, true);
+            reg_result.ok = registered;
+            reg_result.reason = registered ? "legacy-ok" : "legacy-rejected";
         } else if (has_prefix_cache && ops_.prefix_register) {
             ops_.prefix_register(seq_id, req->prompt.tokens.get_tokens());
+            reg_result.ok = true;
+            reg_result.reason = "legacy-raw";
         }
         if (!registered) {
             std::fprintf(stderr, "[paged-prefix] reject request_id=%d reason=manager-register-rejected\n", req ? req->request_id : -1);
-        } else {
-            std::fprintf(stderr, "[paged-lifecycle] release-runtime seq_id=%d after_block_cache_register=1\n", seq_id);
         }
+        std::fprintf(stderr,
+                "[paged-lifecycle] release-runtime seq_id=%d after_block_cache_register=%d registered_entries=%zu retained_blocks=%zu\n",
+                seq_id,
+                (registered && reg_result.registered_entries > 0 && reg_result.retained_blocks > 0) ? 1 : 0,
+                reg_result.registered_entries,
+                reg_result.retained_blocks);
         if (ops_.lineage_register_cached) {
             ops_.lineage_register_cached(*req, seq_id, ops_.now_us ? ops_.now_us() : 0);
         }

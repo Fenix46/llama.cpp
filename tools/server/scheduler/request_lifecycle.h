@@ -2,6 +2,7 @@
 
 #include "request_state.h"
 #include "server-task.h"
+#include "prefix_reuse_manager.h"
 
 #include <functional>
 #include <string>
@@ -39,7 +40,7 @@ struct RequestLifecycleOps {
     std::function<std::vector<int32_t>(const RequestState &, size_t)> seq_get_physical_blocks;
     std::function<bool(const RequestState &, const std::vector<int32_t> &)> blocks_retain_cached;
     std::function<bool(const RequestState &, const std::vector<int32_t> &)> blocks_release_cached;
-    std::function<bool(const RequestState &, const std::vector<int32_t> &)> prefix_register_request_blocks;
+    std::function<PrefixReuseManager::RegisterFinishedResult(const RequestState &, const std::vector<int32_t> &)> prefix_register_request_blocks;
     std::function<bool(int32_t)> clear_sequence;
     std::function<llama_pos(int32_t)> seq_pos_min;
     std::function<llama_pos(int32_t)> seq_pos_max;

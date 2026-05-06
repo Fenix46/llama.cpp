@@ -53,6 +53,19 @@ struct PrefixReusePlan {
 
 class PrefixReuseManager {
 public:
+    struct RegisterFinishedResult {
+        bool ok = false;
+        bool has_block_entries = false;
+        size_t prompt_tokens = 0;
+        size_t block_size = 0;
+        size_t n_full_blocks = 0;
+        size_t partial_tail_tokens = 0;
+        size_t registered_entries = 0;
+        size_t retained_blocks = 0;
+        size_t max_cached_tokens = 0;
+        const char * reason = "unknown";
+    };
+
     using LookupRequestBySeq = std::function<const RequestState *(int32_t)>;
 
     explicit PrefixReuseManager(uint32_t block_size);
@@ -65,7 +78,7 @@ public:
             bool enable_donor_seq_fallback,
             const LookupRequestBySeq & lookup_req);
 
-    bool register_finished_request(
+    RegisterFinishedResult register_finished_request(
             const RequestState & req,
             const PrefixReuseMetadata & md,
             bool cacheable,

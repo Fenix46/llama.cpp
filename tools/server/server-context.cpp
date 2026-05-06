@@ -748,6 +748,7 @@ private:
     bool paged_enable_block_prefix_cache_ = true;
     bool paged_enable_donor_seq_fallback_ = false;
     bool paged_enable_same_seq_append_ = false;
+    bool paged_block_prefix_supported_ = true;
 
     json json_webui_settings = json::object();
 
@@ -1174,7 +1175,8 @@ private:
                     return false;
                 }
                 const std::vector<int32_t> empty_blocks;
-                return prefix_cache_->register_finished_request(req, build_prefix_reuse_metadata(req), cacheable, empty_blocks);
+                const auto r = prefix_cache_->register_finished_request(req, build_prefix_reuse_metadata(req), cacheable, empty_blocks);
+                return r.ok;
             };
             lifecycle_ops.seq_get_physical_blocks = [](const server_scheduler::RequestState & req, size_t n_blocks_hint) {
                 return server_scheduler::BlockManager::get_physical_blocks_for_sequence(req.ctx, req.seq_id, n_blocks_hint);
@@ -1187,7 +1189,9 @@ private:
             };
             lifecycle_ops.prefix_register_request_blocks = [this](const server_scheduler::RequestState & req, const std::vector<int32_t> & blocks) {
                 if (!prefix_cache_) {
-                    return false;
+                    server_scheduler::PrefixReuseManager::RegisterFinishedResult out;
+                    out.reason = "no-prefix-cache";
+                    return out;
                 }
                 return prefix_cache_->register_finished_request(req, build_prefix_reuse_metadata(req), true, blocks);
             };
@@ -1327,6 +1331,12 @@ private:
         paged_enable_block_prefix_cache_ = env_enabled_default_true("LLAMA_PAGED_ENABLE_BLOCK_PREFIX_CACHE");
         paged_enable_donor_seq_fallback_ = env_enabled_default_false("LLAMA_PAGED_ENABLE_DONOR_SEQ_FALLBACK");
         paged_enable_same_seq_append_    = env_enabled_default_false("LLAMA_PAGED_ENABLE_SAME_SEQ_APPEND");
+        paged_block_prefix_supported_    = !llama_model_is_recurrent(model);
+        if (!paged_block_prefix_supported_) {
+            SRV_WRN("%s", "[paged-prefix-block] disabled reason=recurrent-memory-not-supported\n");
+            paged_enable_block_prefix_cache_ = false;
+            prefix_cache_.reset();
+        }
 
         // Dynamic slot scheduler
         if (params_base.dynamic_slots) {
@@ -2069,7 +2079,7 @@ private:
                 const std::vector<int32_t> seq_blocks =
                     server_scheduler::BlockManager::get_physical_blocks_for_sequence(req->ctx, req->seq_id);
                 if (server_scheduler::BlockManager::retain_blocks_for_cache(req->ctx, seq_blocks)) {
-                    prefix_cache_->register_finished_request(*req, build_prefix_reuse_metadata(*req), true, seq_blocks);
+                    (void) prefix_cache_->register_finished_request(*req, build_prefix_reuse_metadata(*req), true, seq_blocks);
                 }
                 // Also keep legacy donor-seq index for CrossPrefixCopy fallback.
                 prefix_cache_->register_raw(seq_id, req->prompt.tokens.get_tokens());
@@ -2130,6 +2140,11 @@ private:
     }
 
     void execute_prefix_reuse_plan(paged_request_state & req) {
+        if (!paged_block_prefix_supported_) {
+            SRV_WRN("%s", "[paged-prefix-block] disabled reason=recurrent-memory-not-supported\n");
+            (void) server_scheduler::BlockManager::prepare_fresh_sequence(req);
+            return;
+        }
         if (!req.task) {
             SRV_WRN("[paged-prefix] skip request_id=%d reason=missing-task-before-plan\n", req.request_id);
             (void) server_scheduler::BlockManager::prepare_fresh_sequence(req);
@@ -2162,7 +2177,7 @@ private:
         view.physical_block_ids = plan.physical_block_ids;
         const auto attach = server_scheduler::BlockManager::attach_cached_blocks(req, view);
         if (!attach.ok) {
-            SRV_WRN("[paged-prefix] attach failed request_id=%d reason=%s; falling back to fresh prefill\n",
+            SRV_WRN("[paged-blocks] attach-failed request_id=%d reason=%s\n",
                     task.id, attach.failure_reason ? attach.failure_reason : "unknown");
             (void) server_scheduler::BlockManager::prepare_fresh_sequence(req);
             return;
@@ -2174,6 +2189,11 @@ private:
             for (size_t i = 0; i < attach.cached_tokens && i < new_toks.size(); ++i) {
                 req.prompt.tokens.push_back(new_toks[(int32_t) i]);
             }
+            SRV_INF("[paged-prefill] request_id=%d prefill_start=%zu prefill_tokens=%zu\n",
+                    req.request_id, attach.cached_tokens, attach.suffix_tokens);
+        } else {
+            SRV_INF("[paged-prefill] request_id=%d prefill_start=0 prefill_tokens=%zu\n",
+                    req.request_id, task.tokens.get_tokens().size());
         }
     }
 

@@ -132,6 +132,10 @@ PrefixReusePlan PrefixReuseManager::resolve(
 
     const auto & old_toks = req.prompt.tokens.get_tokens();
     const auto & new_toks = task.tokens.get_tokens();
+    const size_t bs_lookup = std::max<size_t>(1, md.block_size);
+    const size_t full_blocks_lookup = new_toks.size() / bs_lookup;
+    LOG_INF("[paged-prefix-block] lookup request_id=%d prompt_tokens=%zu block_size=%zu full_blocks=%zu\n",
+            task.id, new_toks.size(), bs_lookup, full_blocks_lookup);
     if (!old_toks.empty() && allow_same_seq_append &&
         new_toks.size() >= old_toks.size() &&
         std::equal(old_toks.begin(), old_toks.end(), new_toks.begin())) {
@@ -157,8 +161,8 @@ PrefixReusePlan PrefixReuseManager::resolve(
             it->second.last_used_us = ggml_time_us();
             it->second.refcount++;
         }
-        LOG_DBG("[paged-prefix-block] longest-hit request_id=%d cached_tokens=%zu suffix_tokens=%zu blocks=%zu\n",
-                task.id, plan.cached_tokens, plan.suffix_tokens, plan.physical_block_ids.size());
+        LOG_INF("[paged-prefix-block] longest-hit request_id=%d cached_tokens=%zu blocks=%zu suffix_tokens=%zu\n",
+                task.id, plan.cached_tokens, plan.physical_block_ids.size(), plan.suffix_tokens);
         return plan;
     }
 
@@ -184,54 +188,74 @@ PrefixReusePlan PrefixReuseManager::resolve(
     if (!enable_donor_seq_fallback) {
         LOG_DBG("[paged-prefix] block-cache miss; donor fallback disabled; fresh prefill\n");
     }
-    LOG_DBG("[paged-prefix-block] fallback-fresh request_id=%d\n", task.id);
+    LOG_INF("[paged-prefix-block] miss request_id=%d reason=%s\n", task.id, plan.reason);
+    LOG_INF("[paged-prefix-block] fallback-fresh request_id=%d\n", task.id);
     return plan;
 }
 
-bool PrefixReuseManager::register_finished_request(
+PrefixReuseManager::RegisterFinishedResult PrefixReuseManager::register_finished_request(
         const RequestState & req,
         const PrefixReuseMetadata & md,
         bool cacheable,
         const std::vector<int32_t> & sequence_blocks) {
+    RegisterFinishedResult out;
+    out.prompt_tokens = req.prompt.tokens.size();
+    out.block_size = std::max<size_t>(1, md.block_size);
+    out.n_full_blocks = out.prompt_tokens / out.block_size;
+    out.partial_tail_tokens = out.prompt_tokens % out.block_size;
+    out.max_cached_tokens = out.n_full_blocks * out.block_size;
+    out.retained_blocks = sequence_blocks.size();
+
+    LOG_INF("[paged-prefix-block] register-finished request_id=%d seq_id=%d prompt_tokens=%zu block_size=%zu full_blocks=%zu partial_tail=%zu\n",
+            req.request_id, req.seq_id, out.prompt_tokens, out.block_size, out.n_full_blocks, out.partial_tail_tokens);
+
     if (!cacheable || !req.task || req.prompt.tokens.empty()) {
-        LOG_DBG("[paged-prefix] reject request_id=%d reason=%s\n",
-                req.request_id, cacheable ? "no-prefix" : "uncacheable");
-        return false;
+        out.reason = cacheable ? "no-prefix" : "uncacheable";
+        LOG_INF("[paged-prefix-block] register-summary request_id=%d entries=%zu retained_blocks=%zu max_cached_tokens=%zu reason=%s\n",
+                req.request_id, out.registered_entries, out.retained_blocks, out.max_cached_tokens, out.reason);
+        return out;
     }
     if (!baseline_set_) {
         baseline_md_ = md;
         baseline_set_ = true;
     }
     if (!metadata_compatible(md)) {
-        LOG_DBG("[paged-prefix] reject request_id=%d reason=metadata-mismatch\n", req.request_id);
-        return false;
+        out.reason = "metadata-mismatch";
+        LOG_INF("[paged-prefix-block] register-summary request_id=%d entries=%zu retained_blocks=%zu max_cached_tokens=%zu reason=%s\n",
+                req.request_id, out.registered_entries, out.retained_blocks, out.max_cached_tokens, out.reason);
+        return out;
     }
     const auto & toks = req.prompt.tokens.get_tokens();
-    const size_t bs = std::max<size_t>(1, md.block_size);
-    const size_t n_blocks = toks.size() / bs;
+    const size_t bs = out.block_size;
+    const size_t n_blocks = out.n_full_blocks;
     if (n_blocks == 0) {
-        LOG_DBG("[paged-prefix-block] reject request_id=%d reason=too-short tokens=%zu block_size=%zu\n",
-                req.request_id, toks.size(), bs);
+        out.reason = "too-short";
     } else {
         if (sequence_blocks.size() < n_blocks) {
-            LOG_DBG("[paged-prefix-block] reject request_id=%d reason=missing-blocks seq_blocks=%zu full_blocks=%zu\n",
-                    req.request_id, sequence_blocks.size(), n_blocks);
+            out.reason = "missing-blocks";
         } else {
             for (size_t i = 1; i <= n_blocks; ++i) {
                 const size_t prefix_tokens = i * bs;
                 std::vector<llama_token> aligned_toks(toks.begin(), toks.begin() + (int32_t) prefix_tokens);
                 std::vector<int32_t> blocks(sequence_blocks.begin(), sequence_blocks.begin() + (int32_t) i);
                 register_block_entry(aligned_toks, md, blocks);
-                LOG_DBG("[paged-prefix-block] register request_id=%d prefix_tokens=%zu blocks=%zu\n",
+                out.registered_entries++;
+                out.has_block_entries = true;
+                LOG_INF("[paged-prefix-block] register-entry request_id=%d prefix_tokens=%zu blocks=%zu\n",
                         req.request_id, prefix_tokens, blocks.size());
             }
+            out.reason = "ok";
         }
     }
 
     cache_.register_slot(req.seq_id, toks);
-    LOG_DBG("[paged-prefix] register request_id=%d tokens=%zu cacheable=1\n",
-            req.request_id, req.prompt.tokens.size());
-    return true;
+    out.ok = out.has_block_entries && out.registered_entries > 0 && out.retained_blocks > 0;
+    if (!out.ok && out.reason != nullptr && std::string(out.reason) == "ok") {
+        out.reason = "incomplete";
+    }
+    LOG_INF("[paged-prefix-block] register-summary request_id=%d entries=%zu retained_blocks=%zu max_cached_tokens=%zu reason=%s\n",
+            req.request_id, out.registered_entries, out.retained_blocks, out.max_cached_tokens, out.reason);
+    return out;
 }
 
 PrefixReuseManager::EvictExpiredResult PrefixReuseManager::evict_expired(int64_t now_us, int64_t ttl_us) {
