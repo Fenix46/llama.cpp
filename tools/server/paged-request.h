@@ -89,6 +89,12 @@ struct paged_request_state {
     int32_t n_ctx           = 0;
     bool drop_cache_on_release = false;
 
+    // --- lineage (same-seq sticky reuse) ---
+    // Set by dispatch when a verified same-lineage cached seq is being reactivated.
+    // Cleared on every release/reset so it cannot leak across requests.
+    std::string lineage_key;
+    bool same_lineage_verified_for_launch = false;
+
     paged_request_phase phase = PAGED_REQUEST_IDLE;
 
     // --- llama context pointers (set at init, not owned) ---
@@ -465,6 +471,8 @@ struct paged_request_state {
         parent_id       = -1;
         reserved_blocks = 0;
         drop_cache_on_release = false;
+        lineage_key.clear();
+        same_lineage_verified_for_launch = false;
         phase           = PAGED_REQUEST_IDLE;
         task.reset();
         smpl.reset();
@@ -525,6 +533,27 @@ struct paged_seq_lease_pool {
         active_seq_ids.insert(seq_id);
         cached_seq_ids.erase(seq_id);
         return seq_id;
+    }
+
+    // Lease a specific seq_id from the free pool (for lineage reactivation).
+    // Returns the seq_id on success, -1 if not available in free pool.
+    int32_t lease_specific(int32_t seq_id) {
+        if (seq_id < 0) {
+            return -1;
+        }
+        // Try free pool first.
+        auto it = std::find(free_seq_ids.begin(), free_seq_ids.end(), seq_id);
+        if (it != free_seq_ids.end()) {
+            free_seq_ids.erase(it);
+            active_seq_ids.insert(seq_id);
+            cached_seq_ids.erase(seq_id);
+            return seq_id;
+        }
+        // Try cached pool (legacy path when prefix_cache_ is absent).
+        if (activate_cached(seq_id)) {
+            return seq_id;
+        }
+        return -1;
     }
 
     void mark_cached(int32_t seq_id) {

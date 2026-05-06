@@ -36,6 +36,7 @@ add_library(${TARGET} STATIC
     scheduler/block_manager.h
     scheduler/prefix_reuse_manager.cpp
     scheduler/prefix_reuse_manager.h
+    scheduler/lineage_manager.h
     scheduler/batch_plan.cpp
     scheduler/batch_plan.h
     scheduler/batch_planner.cpp

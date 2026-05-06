@@ -7,6 +7,7 @@
 #include "server-queue.h"
 #include "kv-block-scheduler.h"
 #include "scheduler/prefix_reuse_manager.h"
+#include "scheduler/lineage_manager.h"
 #include "paged-request.h"
 #include "scheduler/admission_controller.h"
 #include "scheduler/block_manager.h"
@@ -718,6 +719,10 @@ private:
     static constexpr int64_t PAGED_SWEEP_INTERVAL_US = 10'000'000LL; // sweep every 10s
     server_scheduler::SchedulerPolicyConfig sched_policy_cfg_; // parsed once at init
 
+    // Lineage-sticky seq reuse: same conversation/agent keeps same runtime seq
+    // while idle-cached, so SameSeqAppend can skip full prefill.
+    std::unique_ptr<server_scheduler::LineageManager> lineage_mgr_;
+
     int slots_debug = 0;
     int n_empty_consecutive = 0;
     size_t paged_prefill_rr_cursor = 0;
@@ -1283,6 +1288,13 @@ private:
                     SRV_INF("[paged-cache-ttl] configured ttl_sec=%" PRId64 "\n", ttl_sec);
                 }
                 {
+                    const char * lineage_ttl_env = std::getenv("LLAMA_PAGED_LINEAGE_SEQ_TTL_SEC");
+                    const int64_t lineage_ttl_sec = lineage_ttl_env ? (int64_t) std::atoll(lineage_ttl_env) : 1800LL;
+                    const int64_t lineage_ttl_us  = lineage_ttl_sec > 0 ? lineage_ttl_sec * 1'000'000LL : 0LL;
+                    lineage_mgr_ = std::make_unique<server_scheduler::LineageManager>(lineage_ttl_us);
+                    SRV_INF("[paged-lineage] lineage-sticky seq reuse enabled ttl_sec=%" PRId64 "\n", lineage_ttl_sec);
+                }
+                {
                     sched_policy_cfg_ = server_scheduler::SchedulerPolicyConfig::from_env(llama_n_batch(ctx));
                     paged_core.policy_config = sched_policy_cfg_;
                     SRV_INF("[paged-scheduler] policy=%s max_tokens=%d decode_burst=%d prefill_every_n=%d\n",
@@ -1496,6 +1508,75 @@ private:
         return create_dynamic_slot(task);
     }
 
+    // Try to reuse an idle-cached paged_request_state for a same-lineage continuation.
+    // Returns the cached request (with same_lineage_verified_for_launch=true set) on hit,
+    // or nullptr on miss (caller must then fall through to get_or_create_paged_request).
+    // MUST NOT resurrect arbitrary cached seqs — only verified same-lineage exact prefix.
+    paged_request_state * try_lineage_reuse(const server_task & task) {
+        if (!lineage_mgr_ || task.lineage_key.empty()) {
+            return nullptr;
+        }
+        const int64_t now_us = ggml_time_us();
+
+        auto req_by_index = [this](int32_t idx) -> const server_scheduler::RequestState * {
+            if (idx < 0 || idx >= (int32_t) paged_requests.size()) {
+                return nullptr;
+            }
+            return &paged_requests[(size_t) idx];
+        };
+
+        const auto hit = lineage_mgr_->check_hit(
+            task.lineage_key,
+            task.tokens.get_tokens(),
+            req_by_index,
+            now_us);
+
+        if (!hit.ok) {
+            SRV_DBG("[paged-lineage] miss key=%s reason=%s request_id=%d\n",
+                    task.lineage_key.c_str(), hit.miss_reason ? hit.miss_reason : "unknown", task.id);
+            return nullptr;
+        }
+
+        // Verified hit: cached_tokens is a prefix of new_tokens, entry is idle.
+        paged_request_state & req = paged_requests[(size_t) hit.request_index];
+
+        // Retrieve cached tokens from the lineage lease before activation removes the entry.
+        const std::vector<llama_token> * cached_toks = lineage_mgr_->cached_tokens_for(task.lineage_key);
+        GGML_ASSERT(cached_toks != nullptr && !cached_toks->empty());
+        const size_t n_cached = cached_toks->size();
+
+        SRV_INF("[paged-lineage] hit key=%s seq_id=%d request_id=%d old_tokens=%zu new_tokens=%zu\n",
+                task.lineage_key.c_str(), hit.seq_id, task.id,
+                n_cached, task.tokens.get_tokens().size());
+
+        // Re-lease the seq_id: with prefix_cache_ active, seq was returned to free pool on
+        // the previous request's finish. Re-acquire it so it becomes active again.
+        const int32_t re_leased = paged_seq_leases.lease_specific(hit.seq_id);
+        if (re_leased < 0) {
+            SRV_WRN("[paged-lineage] miss key=%s reason=lease-failed seq_id=%d\n",
+                    task.lineage_key.c_str(), hit.seq_id);
+            lineage_mgr_->on_evict(task.lineage_key, hit.seq_id, "lease-failed");
+            return nullptr;
+        }
+
+        // Activate: remove from lineage idle map (now an active request).
+        lineage_mgr_->on_activate(task.lineage_key);
+        SRV_INF("[paged-lineage] activate seq_id=%d key=%s\n", hit.seq_id, task.lineage_key.c_str());
+
+        // Restore seq_id and cached tokens on the request entry.
+        req.seq_id  = hit.seq_id;
+        req.n_ctx   = n_ctx_slot_;
+        req.prompt.tokens.has_mtmd = mctx != nullptr;
+        req.prompt.tokens.clear();
+        for (const llama_token tok : *cached_toks) {
+            req.prompt.tokens.push_back(tok);
+        }
+
+        req.same_lineage_verified_for_launch = true;
+        req.lineage_key = task.lineage_key;
+        return &req;
+    }
+
     // Find or create a paged_request_state ready for a new task.
     // Returns nullptr if KV pool is exhausted or seq_id pool is empty.
     // In paged mode, cached prompt/KV must be reused via prefix plan, not by
@@ -1515,6 +1596,9 @@ private:
                     continue;
                 }
                 SRV_WRN("[paged] reclaim cached request seq_id=%d reason=%s\n", cached_req.seq_id, reason);
+                if (lineage_mgr_) {
+                    lineage_mgr_->on_seq_reclaimed(cached_req.seq_id);
+                }
                 prefix_cache_invalidate(cached_req.seq_id);
                 (void) server_scheduler::BlockManager::clear_destination_sequence(cached_req);
                 paged_seq_leases.release_uncached(cached_req.seq_id);
@@ -1793,6 +1877,9 @@ private:
             if (req.prompt.n_tokens() == 0 && req.seq_id >= 0) {
                 SRV_WRN("[paged] purging idle req seq_id=%d\n", req.seq_id);
                 if (req.seq_id >= 0) {
+                    if (lineage_mgr_) {
+                        lineage_mgr_->on_seq_reclaimed(req.seq_id);
+                    }
                     prefix_cache_invalidate(req.seq_id);
                     (void) server_scheduler::BlockManager::clear_destination_sequence(req);
                     paged_seq_leases.release_uncached(req.seq_id);
@@ -1921,6 +2008,16 @@ private:
             // Phase 6: release runtime seq_id immediately; block-entry cache retains KV blocks.
             // cached_seq_ids kept only as transitional fallback when no block-entry cache exists.
             if (prefix_cache_) {
+                // Register lineage lease BEFORE prompt tokens are cleared.
+                if (lineage_mgr_ && !req->lineage_key.empty() && !req->prompt.tokens.empty()) {
+                    const int32_t req_index = (int32_t)(req - paged_requests.data());
+                    lineage_mgr_->on_release_cached(
+                        req->lineage_key,
+                        seq_id,
+                        req_index,
+                        ggml_time_us(),
+                        req->prompt.tokens.get_tokens());
+                }
                 SRV_INF("[paged-lifecycle] release runtime seq request_id=%d seq_id=%d\n",
                         req ? req->request_id : -1, seq_id);
                 prepare_empty_sequence_for_prefix_copy(*req, "release-cached-seq");
@@ -2193,9 +2290,15 @@ private:
             }
         };
 
-        // same-seq append is a narrow optimization reserved for verified lineage.
-        // New HTTP requests are treated as fresh lineage in phase-1 bugfix mode.
-        const bool allow_same_seq_append = false;
+        // same-seq append only when dispatch verified this is a same-lineage continuation.
+        const bool allow_same_seq_append = req.same_lineage_verified_for_launch;
+        if (allow_same_seq_append) {
+            SRV_INF("[paged-prefix] lookup request_id=%d mode=same-seq key=%s cached_tokens=%zu suffix_tokens=%zu\n",
+                    task.id, req.lineage_key.c_str(),
+                    req.prompt.tokens.get_tokens().size(),
+                    task.tokens.get_tokens().size() > req.prompt.tokens.get_tokens().size()
+                        ? task.tokens.get_tokens().size() - req.prompt.tokens.get_tokens().size() : 0);
+        }
         execute_prefix_reuse_plan(req, task, allow_same_seq_append);
         reset_runtime_state_for_new_request(req, "launch");
 
@@ -3218,7 +3321,14 @@ private:
                     // ---- paged scheduler: work directly with paged_request_state ----
                     if (params_base.scheduler == "paged") {
                         if (id_slot != -1) {
-                            SRV_DBG("[paged] ignoring requested slot id %d; admission selects request\n", id_slot);
+                            // In paged mode id_slot is repurposed as a lineage key, not a
+                            // slot index. Same-lineage reuse is handled by try_lineage_reuse().
+                            SRV_DBG("[paged-lineage] using id_slot=%d as lineage key request_id=%d\n",
+                                    id_slot, id_task);
+                        }
+                        if (!task.lineage_key.empty()) {
+                            SRV_DBG("[paged-lineage] derive request_id=%d key=%s\n",
+                                    id_task, task.lineage_key.c_str());
                         }
 
                         if (task.is_parent()) {
@@ -3273,7 +3383,11 @@ private:
                                 break;
                             }
                         } else {
-                            paged_request_state * req = get_or_create_paged_request(task);
+                            // Try same-lineage reuse before allocating a fresh seq.
+                            paged_request_state * req = try_lineage_reuse(task);
+                            if (!req) {
+                                req = get_or_create_paged_request(task);
+                            }
                             if (!req) {
                                 SRV_DBG("[paged] no capacity, defer id_task=%d\n", id_task);
                                 queue_tasks.defer(std::move(task));
@@ -3605,16 +3719,24 @@ private:
             // 0. periodic TTL/LRU sweep of cached KV blocks
             {
                 const int64_t now_us = ggml_time_us();
-                if (paged_kv_ttl_us_ > 0 && (now_us - paged_last_sweep_us_) >= PAGED_SWEEP_INTERVAL_US) {
+                const bool need_sweep = (paged_kv_ttl_us_ > 0 || lineage_mgr_) &&
+                                        (now_us - paged_last_sweep_us_) >= PAGED_SWEEP_INTERVAL_US;
+                if (need_sweep) {
                     paged_last_sweep_us_ = now_us;
                     // Sweep request-level KV: evict idle cached entries past TTL, then LRU under pressure.
-                    const int32_t n_free = llama_kv_cache_n_free_blocks(llama_get_memory(ctx));
-                    const bool pressure = paged_total_blocks_ > 0 && n_free < (paged_total_blocks_ / 4);
-                    const auto bev = server_scheduler::BlockManager::evict_expired_cached_blocks(
-                        paged_requests, now_us, paged_kv_ttl_us_, pressure, 0);
+                    server_scheduler::BlockManager::TTLEvictResult bev;
+                    if (paged_kv_ttl_us_ > 0) {
+                        const int32_t n_free = llama_kv_cache_n_free_blocks(llama_get_memory(ctx));
+                        const bool pressure = paged_total_blocks_ > 0 && n_free < (paged_total_blocks_ / 4);
+                        bev = server_scheduler::BlockManager::evict_expired_cached_blocks(
+                            paged_requests, now_us, paged_kv_ttl_us_, pressure, 0);
+                    }
                     if (bev.evicted_entries > 0) {
                         for (auto & req : paged_requests) {
                             if (!req.is_processing() && req.prompt.n_tokens() == 0 && req.seq_id >= 0) {
+                                if (lineage_mgr_) {
+                                    lineage_mgr_->on_seq_reclaimed(req.seq_id);
+                                }
                                 prefix_cache_invalidate(req.seq_id);
                                 (void) server_scheduler::BlockManager::clear_destination_sequence(req);
                                 paged_seq_leases.release_uncached(req.seq_id);
@@ -3626,6 +3748,15 @@ private:
                     // Sweep block-cache entries (PrefixReuseManager).
                     if (prefix_cache_) {
                         (void) prefix_cache_->sweep_expired(now_us, paged_kv_ttl_us_);
+                    }
+                    // Sweep lineage TTL: evict expired idle lineage leases.
+                    if (lineage_mgr_) {
+                        std::vector<std::string> evicted_keys;
+                        const auto lev = lineage_mgr_->sweep(now_us, evicted_keys);
+                        if (lev.evicted > 0) {
+                            SRV_INF("[paged-lineage] ttl-sweep evicted=%zu active=%zu\n",
+                                    lev.evicted, lineage_mgr_->size());
+                        }
                     }
                 }
             }
@@ -5496,6 +5627,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     meta->logit_bias_eog,
                     data);
             task.id_slot = json_value(data, "id_slot", -1);
+            // Derive lineage key for paged-mode same-seq reuse.
+            // id_slot >= 0 acts as stable lineage identifier; future explicit
+            // session_id/conversation_id fields can extend this.
+            task.lineage_key = server_scheduler::derive_lineage_key(task);
 
             // OAI-compat
             task.params.res_type          = res_type;

@@ -136,6 +136,11 @@ struct server_task {
     int id_target = -1;
     int id_slot   = -1;
 
+    // Stable logical lineage key for paged-mode same-seq reuse.
+    // Populated from id_slot (or future session_id) by the HTTP layer before dispatch.
+    // Empty string = no lineage (fresh seq will be assigned).
+    std::string lineage_key;
+
     // used by parallel sampling (multiple completions from same prompt)
     int id_parent  = -1;
     // temporary store of child tasks for scheduling
