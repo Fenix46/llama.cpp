@@ -3372,6 +3372,78 @@ void llama_kv_cache_rebuild_block_table(llama_memory_t mem, llama_seq_id seq_id)
     }
 }
 
+static llama_kv_cache * llama_kv_cache_from_memory(llama_memory_t mem) {
+    if (!mem) {
+        return nullptr;
+    }
+    if (auto * kvc = dynamic_cast<llama_kv_cache *>(mem)) {
+        return kvc;
+    }
+    if (auto * kvc_iswa = dynamic_cast<llama_kv_cache_iswa *>(mem)) {
+        return kvc_iswa->get_base();
+    }
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        return hybrid->get_mem_attn();
+    }
+    if (auto * hybrid_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(mem)) {
+        return hybrid_iswa->get_mem_attn()->get_base();
+    }
+    return nullptr;
+}
+
+int32_t llama_kv_cache_block_size(llama_memory_t mem) {
+    auto * kvc = llama_kv_cache_from_memory(mem);
+    if (!kvc) {
+        return 0;
+    }
+    return (int32_t) kvc->get_block_size_tokens();
+}
+
+int32_t llama_kv_cache_n_blocks(llama_memory_t mem) {
+    auto * kvc = llama_kv_cache_from_memory(mem);
+    if (!kvc) {
+        return 0;
+    }
+    return (int32_t) kvc->get_n_blocks();
+}
+
+bool llama_kv_cache_seq_get_block(llama_memory_t mem, llama_seq_id seq_id, uint32_t page, uint32_t * block_id_out) {
+    auto * kvc = llama_kv_cache_from_memory(mem);
+    if (!kvc || !block_id_out) {
+        return false;
+    }
+    uint32_t blk = 0;
+    const bool ok = kvc->get_seq_page_block(seq_id, page, blk);
+    if (ok) {
+        *block_id_out = blk;
+    }
+    return ok;
+}
+
+bool llama_kv_cache_seq_set_block(llama_memory_t mem, llama_seq_id seq_id, uint32_t page, uint32_t block_id) {
+    auto * kvc = llama_kv_cache_from_memory(mem);
+    if (!kvc) {
+        return false;
+    }
+    return kvc->set_seq_page_block(seq_id, page, block_id);
+}
+
+bool llama_kv_cache_block_retain(llama_memory_t mem, uint32_t block_id) {
+    auto * kvc = llama_kv_cache_from_memory(mem);
+    if (!kvc) {
+        return false;
+    }
+    return kvc->retain_block(block_id);
+}
+
+bool llama_kv_cache_block_release(llama_memory_t mem, uint32_t block_id) {
+    auto * kvc = llama_kv_cache_from_memory(mem);
+    if (!kvc) {
+        return false;
+    }
+    return kvc->release_block(block_id);
+}
+
 // llama state API
 
 // deprecated

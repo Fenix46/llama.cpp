@@ -6,6 +6,7 @@
 #include "server-task.h"
 
 #include <functional>
+#include <unordered_map>
 #include <string>
 #include <vector>
 
@@ -14,7 +15,8 @@ namespace server_scheduler {
 enum class PrefixReuseMode {
     None,
     SameSeqAppend,
-    CrossPrefixCopy,
+    SharedBlocks,
+    CrossPrefixCopyFallback,
     FutureSharedBlocks,
 };
 
@@ -34,6 +36,7 @@ struct PrefixReusePlan {
     size_t suffix_tokens = 0;
     bool same_lineage_verified = false;
     int32_t donor_seq_id = -1; // transitional internal field only
+    std::vector<int32_t> physical_block_ids;
     const char * reason = "no-prefix";
 
     BlockManager::PrefixReusePlan to_block_plan() const;
@@ -60,18 +63,37 @@ public:
 
     void register_raw(int32_t seq_id, const std::vector<llama_token> & tokens);
     kv_prefix_cache::lookup_result lookup_raw(const std::vector<llama_token> & tokens) const;
-    uint32_t block_size() const;
     void invalidate_seq(int32_t seq_id, const char * reason);
     void record_reuse(size_t n_tokens);
     kv_prefix_cache::stats get_stats() const;
+    int32_t block_size() const;
+
+    struct PrefixCacheEntry {
+        uint64_t prefix_hash = 0;
+        uint64_t model_hash = 0;
+        uint64_t adapter_hash = 0;
+        uint32_t block_size = 0;
+        size_t n_tokens = 0;
+        std::vector<int32_t> physical_block_ids;
+        uint32_t refcount = 0;
+        int64_t last_used_us = 0;
+    };
 
 private:
+    static uint64_t hash_u64(uint64_t cur, uint64_t v);
+    static uint64_t hash_tokens(const std::vector<llama_token> & toks, size_t n);
+    uint64_t metadata_hash(const PrefixReuseMetadata & md) const;
+    uint64_t prefix_hash(const std::vector<llama_token> & toks, const PrefixReuseMetadata & md) const;
+
     bool metadata_compatible(const PrefixReuseMetadata & md) const;
     std::string metadata_fingerprint(const PrefixReuseMetadata & md) const;
+    const PrefixCacheEntry * lookup_block_entry(const std::vector<llama_token> & toks, const PrefixReuseMetadata & md) const;
+    void register_block_entry(const std::vector<llama_token> & toks, const PrefixReuseMetadata & md, const std::vector<int32_t> & block_ids);
 
     PrefixReuseMetadata baseline_md_;
     bool baseline_set_ = false;
     kv_prefix_cache cache_;
+    std::unordered_map<uint64_t, PrefixCacheEntry> block_cache_;
 };
 
 } // namespace server_scheduler

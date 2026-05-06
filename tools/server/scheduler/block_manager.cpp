@@ -139,6 +139,9 @@ BlockManager::PrefixAttachResult BlockManager::attach_prefix(RequestState & req,
         out.ok = true;
         return out;
     }
+    if (plan.mode == PrefixReusePlan::Mode::SharedBlocks) {
+        return attach_shared_prefix(req, plan);
+    }
     if (plan.mode != PrefixReusePlan::Mode::CrossPrefixCopy) {
         out.failure_reason = "unsupported-mode";
         return out;
@@ -162,6 +165,43 @@ BlockManager::PrefixAttachResult BlockManager::attach_prefix(RequestState & req,
     }
     LOG_DBG("[paged-blocks] truncate-dst request_id=%d seq_id=%d tokens=%zu\n",
             req.request_id, req.seq_id, plan.cached_tokens);
+    out.ok = true;
+    return out;
+}
+
+BlockManager::PrefixAttachResult BlockManager::attach_shared_prefix(RequestState & req, const PrefixReusePlan & plan) {
+    PrefixAttachResult out;
+    out.cached_tokens = plan.cached_tokens;
+    out.suffix_tokens = plan.suffix_tokens;
+    if (!req.ctx || req.seq_id < 0) {
+        out.failure_reason = "invalid-dst";
+        return out;
+    }
+    if (plan.physical_block_ids.empty()) {
+        out.failure_reason = "missing-blocks";
+        return out;
+    }
+
+    llama_memory_t mem = llama_get_memory(req.ctx);
+    const int32_t bs = llama_kv_cache_block_size(mem);
+    if (bs <= 0) {
+        out.failure_reason = "no-paged-kv";
+        return out;
+    }
+    if (!clear_destination_sequence(req)) {
+        out.failure_reason = "clear-dst-failed";
+        return out;
+    }
+
+    for (size_t page = 0; page < plan.physical_block_ids.size(); ++page) {
+        const int32_t blk = plan.physical_block_ids[page];
+        if (blk < 0 || !llama_kv_cache_seq_set_block(mem, req.seq_id, (uint32_t) page, (uint32_t) blk)) {
+            out.failure_reason = "attach-shared-failed";
+            return out;
+        }
+    }
+    LOG_DBG("[paged-prefix-block] attach request_id=%d blocks=%zu refcount_inc=%zu\n",
+            req.request_id, plan.physical_block_ids.size(), plan.physical_block_ids.size());
     out.ok = true;
     return out;
 }

@@ -186,6 +186,12 @@ public:
     const llama_kv_block_table     & get_block_table() const;
     const paged_cow_stats          & get_paged_cow_stats() const;
     uint32_t get_block_table_max_mapped_page_plus1() const;
+    bool get_seq_page_block(llama_seq_id seq_id, uint32_t page, uint32_t & blk_id) const;
+    bool set_seq_page_block(llama_seq_id seq_id, uint32_t page, uint32_t blk_id);
+    bool retain_block(uint32_t blk_id);
+    bool release_block(uint32_t blk_id);
+    uint32_t get_block_size_tokens() const;
+    uint32_t get_n_blocks(uint32_t strm = 0) const;
 
     //
     // graph_build API

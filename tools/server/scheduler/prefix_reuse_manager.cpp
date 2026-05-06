@@ -1,8 +1,10 @@
 #include "prefix_reuse_manager.h"
 
+#include "common.h"
 #include "common/log.h"
 
 #include <algorithm>
+#include <cinttypes>
 
 namespace server_scheduler {
 
@@ -11,12 +13,14 @@ BlockManager::PrefixReusePlan PrefixReusePlan::to_block_plan() const {
     switch (mode) {
         case PrefixReuseMode::None: out.mode = BlockManager::PrefixReusePlan::Mode::None; break;
         case PrefixReuseMode::SameSeqAppend: out.mode = BlockManager::PrefixReusePlan::Mode::SameSeqAppend; break;
-        case PrefixReuseMode::CrossPrefixCopy: out.mode = BlockManager::PrefixReusePlan::Mode::CrossPrefixCopy; break;
+        case PrefixReuseMode::SharedBlocks: out.mode = BlockManager::PrefixReusePlan::Mode::SharedBlocks; break;
+        case PrefixReuseMode::CrossPrefixCopyFallback: out.mode = BlockManager::PrefixReusePlan::Mode::CrossPrefixCopy; break;
         case PrefixReuseMode::FutureSharedBlocks: out.mode = BlockManager::PrefixReusePlan::Mode::None; break;
     }
     out.donor_seq_id = donor_seq_id;
     out.cached_tokens = cached_tokens;
     out.suffix_tokens = suffix_tokens;
+    out.physical_block_ids = physical_block_ids;
     return out;
 }
 
@@ -39,6 +43,63 @@ bool PrefixReuseManager::metadata_compatible(const PrefixReuseMetadata & md) con
         baseline_md_.block_size == md.block_size &&
         baseline_md_.has_mtmd == md.has_mtmd &&
         baseline_md_.mtmd_hash == md.mtmd_hash;
+}
+
+uint64_t PrefixReuseManager::hash_u64(uint64_t cur, uint64_t v) {
+    cur ^= v + 0x9e3779b97f4a7c15ULL + (cur << 6) + (cur >> 2);
+    return cur;
+}
+
+uint64_t PrefixReuseManager::hash_tokens(const std::vector<llama_token> & toks, size_t n) {
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; i < n && i < toks.size(); ++i) {
+        h = hash_u64(h, (uint64_t) toks[i]);
+    }
+    return h;
+}
+
+uint64_t PrefixReuseManager::metadata_hash(const PrefixReuseMetadata & md) const {
+    uint64_t h = 1469598103934665603ULL;
+    h = hash_u64(h, std::hash<std::string>{}(md.model_id));
+    h = hash_u64(h, std::hash<std::string>{}(md.lora_id));
+    h = hash_u64(h, std::hash<std::string>{}(md.kv_dtype));
+    h = hash_u64(h, std::hash<std::string>{}(md.rope_cfg));
+    h = hash_u64(h, md.block_size);
+    h = hash_u64(h, md.has_mtmd ? md.mtmd_hash : 0);
+    return h;
+}
+
+uint64_t PrefixReuseManager::prefix_hash(const std::vector<llama_token> & toks, const PrefixReuseMetadata & md) const {
+    uint64_t h = metadata_hash(md);
+    h = hash_u64(h, toks.size());
+    return hash_u64(h, hash_tokens(toks, toks.size()));
+}
+
+const PrefixReuseManager::PrefixCacheEntry * PrefixReuseManager::lookup_block_entry(
+        const std::vector<llama_token> & toks,
+        const PrefixReuseMetadata & md) const {
+    const uint64_t h = prefix_hash(toks, md);
+    auto it = block_cache_.find(h);
+    if (it == block_cache_.end()) {
+        return nullptr;
+    }
+    return &it->second;
+}
+
+void PrefixReuseManager::register_block_entry(
+        const std::vector<llama_token> & toks,
+        const PrefixReuseMetadata & md,
+        const std::vector<int32_t> & block_ids) {
+    PrefixCacheEntry e;
+    e.prefix_hash = prefix_hash(toks, md);
+    e.model_hash = std::hash<std::string>{}(md.model_id);
+    e.adapter_hash = std::hash<std::string>{}(md.lora_id);
+    e.block_size = md.block_size;
+    e.n_tokens = toks.size();
+    e.physical_block_ids = block_ids;
+    e.refcount = 1;
+    e.last_used_us = ggml_time_us();
+    block_cache_[e.prefix_hash] = std::move(e);
 }
 
 PrefixReusePlan PrefixReuseManager::resolve(
@@ -77,37 +138,37 @@ PrefixReusePlan PrefixReuseManager::resolve(
         return plan;
     }
 
-    if (!can_use_prefix_copy) {
-        plan.reason = "copy-disabled";
-        LOG_DBG("[paged-prefix] reject request_id=%d reason=%s\n", task.id, plan.reason);
+    if (const auto * entry = lookup_block_entry(new_toks, md)) {
+        plan.mode = PrefixReuseMode::SharedBlocks;
+        plan.cached_tokens = entry->n_tokens;
+        plan.suffix_tokens = new_toks.size() - entry->n_tokens;
+        plan.physical_block_ids = entry->physical_block_ids;
+        plan.reason = "shared-block-hit";
+        LOG_DBG("[paged-prefix-block] hit request_id=%d cached_tokens=%zu blocks=%zu\n",
+                task.id, plan.cached_tokens, plan.physical_block_ids.size());
         return plan;
     }
 
-    auto hit = cache_.lookup(new_toks);
-    if (hit.donor_slot_id < 0 || hit.n_cached_tokens <= 0 || hit.donor_slot_id == req.seq_id) {
-        plan.reason = "no-prefix";
-        LOG_DBG("[paged-prefix] lookup request_id=%d mode=none cached_tokens=0 suffix_tokens=%zu\n",
-                task.id, plan.suffix_tokens);
-        return plan;
+    if (can_use_prefix_copy) {
+        auto hit = cache_.lookup(new_toks);
+        if (hit.donor_slot_id >= 0 && hit.n_cached_tokens > 0 && hit.donor_slot_id != req.seq_id) {
+            const RequestState * donor = lookup_req ? lookup_req(hit.donor_slot_id) : nullptr;
+            if (donor && !donor->is_processing() && !donor->prompt.tokens.has_mtmd &&
+                (int32_t) donor->prompt.tokens.get_tokens().size() >= hit.n_cached_tokens) {
+                plan.mode = PrefixReuseMode::CrossPrefixCopyFallback;
+                plan.donor_seq_id = donor->seq_id;
+                plan.cached_tokens = (size_t) hit.n_cached_tokens;
+                plan.suffix_tokens = new_toks.size() - (size_t) hit.n_cached_tokens;
+                plan.reason = "fallback-donor-copy";
+                LOG_DBG("[paged-prefix-block] fallback-donor-copy request_id=%d donor_seq=%d cached_tokens=%zu\n",
+                        task.id, plan.donor_seq_id, plan.cached_tokens);
+                return plan;
+            }
+        }
     }
 
-    const RequestState * donor = lookup_req ? lookup_req(hit.donor_slot_id) : nullptr;
-    if (!donor || donor->is_processing() || donor->prompt.tokens.has_mtmd ||
-        (int32_t) donor->prompt.tokens.get_tokens().size() < hit.n_cached_tokens) {
-        plan.reason = "donor-unavailable";
-        LOG_DBG("[paged-prefix] reject request_id=%d reason=%s\n", task.id, plan.reason);
-        return plan;
-    }
-
-    plan.mode = PrefixReuseMode::CrossPrefixCopy;
-    plan.donor_seq_id = donor->seq_id;
-    plan.cached_tokens = (size_t) hit.n_cached_tokens;
-    plan.suffix_tokens = new_toks.size() - (size_t) hit.n_cached_tokens;
-    plan.reason = "cross-prefix-copy";
-    LOG_DBG("[paged-prefix] lookup request_id=%d mode=copy cached_tokens=%zu suffix_tokens=%zu\n",
-            task.id, plan.cached_tokens, plan.suffix_tokens);
-    LOG_DBG("[paged-prefix] donor-selected request_id=%d donor_seq=%d cached_tokens=%zu\n",
-            task.id, plan.donor_seq_id, plan.cached_tokens);
+    plan.reason = "no-prefix";
+    LOG_DBG("[paged-prefix-block] fallback-fresh request_id=%d\n", task.id);
     return plan;
 }
 
@@ -128,7 +189,30 @@ bool PrefixReuseManager::register_finished_request(
         LOG_DBG("[paged-prefix] reject request_id=%d reason=metadata-mismatch\n", req.request_id);
         return false;
     }
-    cache_.register_slot(req.seq_id, req.prompt.tokens.get_tokens());
+    const auto & toks = req.prompt.tokens.get_tokens();
+    const size_t n_blocks = toks.size() / std::max<size_t>(1, md.block_size);
+    if (n_blocks == 0 || n_blocks * md.block_size != toks.size()) {
+        LOG_DBG("[paged-prefix-block] reject request_id=%d reason=partial-block\n", req.request_id);
+    } else {
+        std::vector<int32_t> blocks;
+        blocks.reserve(n_blocks);
+        for (size_t page = 0; page < n_blocks; ++page) {
+            uint32_t blk_id = 0;
+            if (!llama_kv_cache_seq_get_block(llama_get_memory(req.ctx), req.seq_id, (uint32_t) page, &blk_id)) {
+                LOG_DBG("[paged-prefix-block] reject request_id=%d reason=missing-block\n", req.request_id);
+                blocks.clear();
+                break;
+            }
+            blocks.push_back((int32_t) blk_id);
+        }
+        if (!blocks.empty()) {
+            register_block_entry(toks, md, blocks);
+            LOG_DBG("[paged-prefix-block] register entry hash=%" PRIu64 " tokens=%zu blocks=%zu\n",
+                    prefix_hash(toks, md), toks.size(), blocks.size());
+        }
+    }
+
+    cache_.register_slot(req.seq_id, toks);
     LOG_DBG("[paged-prefix] register request_id=%d tokens=%zu cacheable=1\n",
             req.request_id, req.prompt.tokens.size());
     return true;
@@ -142,8 +226,8 @@ kv_prefix_cache::lookup_result PrefixReuseManager::lookup_raw(const std::vector<
     return const_cast<kv_prefix_cache &>(cache_).lookup(tokens);
 }
 
-uint32_t PrefixReuseManager::block_size() const {
-    return cache_.block_size();
+int32_t PrefixReuseManager::block_size() const {
+    return (int32_t) cache_.block_size();
 }
 
 void PrefixReuseManager::invalidate_seq(int32_t seq_id, const char * reason) {

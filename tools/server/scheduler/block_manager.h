@@ -11,6 +11,7 @@ public:
         enum class Mode {
             None,
             SameSeqAppend,
+            SharedBlocks,
             CrossPrefixCopy,
         };
 
@@ -18,6 +19,7 @@ public:
         int32_t donor_seq_id = -1;
         size_t cached_tokens = 0;
         size_t suffix_tokens = 0;
+        std::vector<int32_t> physical_block_ids;
     };
 
     struct PrefixAttachResult {
@@ -70,6 +72,7 @@ public:
     static float pressure_ratio(const Stats & stats, int32_t total_blocks);
 
     static bool prepare_fresh_sequence(RequestState & req);
+    static PrefixAttachResult attach_shared_prefix(RequestState & req, const PrefixReusePlan & plan);
     static PrefixAttachResult attach_prefix(RequestState & req, const PrefixReusePlan & plan);
     static bool allocate_for_prefill(RequestState & req, size_t n_tokens);
     static bool allocate_for_decode(RequestState & req, size_t n_tokens);

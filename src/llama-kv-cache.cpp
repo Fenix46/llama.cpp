@@ -1838,6 +1838,73 @@ const llama_kv_block_table & llama_kv_cache::get_block_table() const {
     return block_table;
 }
 
+bool llama_kv_cache::get_seq_page_block(llama_seq_id seq_id, uint32_t page, uint32_t & blk_id) const {
+    if (!paged || seq_id < 0 || (size_t) seq_id >= n_seq_max) {
+        return false;
+    }
+    blk_id = block_table.lookup(seq_id, page);
+    return blk_id != LLAMA_KV_BLOCK_ID_NONE;
+}
+
+bool llama_kv_cache::set_seq_page_block(llama_seq_id seq_id, uint32_t page, uint32_t blk_id) {
+    if (!paged || seq_id < 0 || (size_t) seq_id >= n_seq_max || v_block_alloc.empty()) {
+        return false;
+    }
+    auto & alloc = v_block_alloc[0];
+    if (blk_id >= alloc.n_blocks()) {
+        return false;
+    }
+
+    const uint32_t old = block_table.lookup(seq_id, page);
+    if (old == blk_id) {
+        return true;
+    }
+    if (old != LLAMA_KV_BLOCK_ID_NONE) {
+        alloc.free(old);
+        block_table.erase_page(seq_id, page);
+    }
+
+    alloc.acquire_specific(blk_id);
+    block_table.insert(seq_id, page, blk_id);
+    mark_block_table_dirty_seq(seq_id);
+    return true;
+}
+
+bool llama_kv_cache::retain_block(uint32_t blk_id) {
+    if (!paged || v_block_alloc.empty()) {
+        return false;
+    }
+    auto & alloc = v_block_alloc[0];
+    if (blk_id >= alloc.n_blocks()) {
+        return false;
+    }
+    alloc.acquire_specific(blk_id);
+    return true;
+}
+
+bool llama_kv_cache::release_block(uint32_t blk_id) {
+    if (!paged || v_block_alloc.empty()) {
+        return false;
+    }
+    auto & alloc = v_block_alloc[0];
+    if (blk_id >= alloc.n_blocks()) {
+        return false;
+    }
+    alloc.free(blk_id);
+    return true;
+}
+
+uint32_t llama_kv_cache::get_block_size_tokens() const {
+    return block_size;
+}
+
+uint32_t llama_kv_cache::get_n_blocks(uint32_t strm) const {
+    if (!paged || strm >= v_block_alloc.size()) {
+        return 0;
+    }
+    return v_block_alloc[strm].n_blocks();
+}
+
 const llama_kv_cache::paged_cow_stats & llama_kv_cache::get_paged_cow_stats() const {
     return cow_stats;
 }

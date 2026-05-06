@@ -770,6 +770,14 @@ extern "C" {
     // No-op if the memory does not use the paged allocator.
     LLAMA_API void llama_kv_cache_rebuild_block_table(llama_memory_t mem, llama_seq_id seq_id);
 
+    // Paged KV helpers for block-entry prefix reuse. Return false/0 when unsupported.
+    LLAMA_API int32_t llama_kv_cache_block_size(llama_memory_t mem);
+    LLAMA_API int32_t llama_kv_cache_n_blocks(llama_memory_t mem);
+    LLAMA_API bool llama_kv_cache_seq_get_block(llama_memory_t mem, llama_seq_id seq_id, uint32_t page, uint32_t * block_id_out);
+    LLAMA_API bool llama_kv_cache_seq_set_block(llama_memory_t mem, llama_seq_id seq_id, uint32_t page, uint32_t block_id);
+    LLAMA_API bool llama_kv_cache_block_retain(llama_memory_t mem, uint32_t block_id);
+    LLAMA_API bool llama_kv_cache_block_release(llama_memory_t mem, uint32_t block_id);
+
     //
     // State / sessions
     //
