@@ -78,12 +78,21 @@ uint64_t PrefixReuseManager::prefix_hash(const std::vector<llama_token> & toks, 
 const PrefixReuseManager::PrefixCacheEntry * PrefixReuseManager::lookup_block_entry(
         const std::vector<llama_token> & toks,
         const PrefixReuseMetadata & md) const {
-    const uint64_t h = prefix_hash(toks, md);
-    auto it = block_cache_.find(h);
-    if (it == block_cache_.end()) {
-        return nullptr;
+    // Longest-prefix-match: probe each block-aligned prefix length from largest to smallest.
+    // Avoids allocating prefix vectors by computing the hash directly over a subrange.
+    const size_t bs  = std::max<size_t>(1, md.block_size);
+    const uint64_t meta_h = metadata_hash(md);
+    for (size_t nb = toks.size() / bs; nb >= 1; --nb) {
+        const size_t n = nb * bs;
+        uint64_t h = meta_h;
+        h = hash_u64(h, n);                      // incorporate prefix length
+        h = hash_u64(h, hash_tokens(toks, n));   // hash only first n tokens
+        auto it = block_cache_.find(h);
+        if (it != block_cache_.end()) {
+            return &it->second;
+        }
     }
-    return &it->second;
+    return nullptr;
 }
 
 void PrefixReuseManager::register_block_entry(
@@ -203,25 +212,36 @@ bool PrefixReuseManager::register_finished_request(
         return false;
     }
     const auto & toks = req.prompt.tokens.get_tokens();
-    const size_t n_blocks = toks.size() / std::max<size_t>(1, md.block_size);
-    if (n_blocks == 0 || n_blocks * md.block_size != toks.size()) {
-        LOG_DBG("[paged-prefix-block] reject request_id=%d reason=partial-block\n", req.request_id);
+    // Register the largest block-aligned prefix. A trailing partial block is common
+    // (prompt length rarely equals an exact multiple of block_size), so we must not
+    // reject the whole entry — we register floor(n_tokens / block_size) * block_size
+    // tokens, which covers all fully-written blocks whose KV is stable.
+    const size_t bs = std::max<size_t>(1, md.block_size);
+    const size_t n_blocks = toks.size() / bs;
+    const size_t n_aligned_toks = n_blocks * bs;
+    if (n_blocks == 0) {
+        LOG_DBG("[paged-prefix-block] reject request_id=%d reason=too-short tokens=%zu block_size=%zu\n",
+                req.request_id, toks.size(), bs);
     } else {
+        // Use only the aligned prefix for the block-entry key.
+        const std::vector<llama_token> aligned_toks(toks.begin(), toks.begin() + (int32_t)n_aligned_toks);
         std::vector<int32_t> blocks;
         blocks.reserve(n_blocks);
         for (size_t page = 0; page < n_blocks; ++page) {
             uint32_t blk_id = 0;
             if (!llama_kv_cache_seq_get_block(llama_get_memory(req.ctx), req.seq_id, (uint32_t) page, &blk_id)) {
-                LOG_DBG("[paged-prefix-block] reject request_id=%d reason=missing-block\n", req.request_id);
+                LOG_DBG("[paged-prefix-block] reject request_id=%d reason=missing-block page=%zu\n",
+                        req.request_id, page);
                 blocks.clear();
                 break;
             }
             blocks.push_back((int32_t) blk_id);
         }
         if (!blocks.empty()) {
-            register_block_entry(toks, md, blocks);
-            LOG_DBG("[paged-prefix-block] register entry hash=%" PRIu64 " tokens=%zu blocks=%zu\n",
-                    prefix_hash(toks, md), toks.size(), blocks.size());
+            register_block_entry(aligned_toks, md, blocks);
+            LOG_DBG("[paged-prefix-block] register entry hash=%" PRIu64 " tokens=%zu blocks=%zu (total_tokens=%zu partial=%zu)\n",
+                    prefix_hash(aligned_toks, md), aligned_toks.size(), blocks.size(),
+                    toks.size(), toks.size() - n_aligned_toks);
         }
     }
 
