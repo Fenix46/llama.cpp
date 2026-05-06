@@ -75,9 +75,33 @@ public:
         uint32_t block_size = 0;
         size_t n_tokens = 0;
         std::vector<int32_t> physical_block_ids;
-        uint32_t refcount = 0;
+        uint32_t refcount = 0;        // total refs
+        uint32_t active_refcount = 0; // refs from active (in-flight) requests
+        uint32_t cache_refcount = 0;  // refs from completed but cached requests
         int64_t last_used_us = 0;
+        int64_t created_us = 0;
+        bool is_evictable() const { return active_refcount == 0; }
     };
+
+    struct EvictExpiredResult {
+        size_t evicted_entries = 0;
+        size_t freed_blocks    = 0;
+    };
+
+    EvictExpiredResult evict_expired(int64_t now_us, int64_t ttl_us);
+    size_t n_cached_entries() const { return block_cache_.size(); }
+
+    // Combined TTL+LRU sweep: call from orchestrator as `prefix_cache_->sweep_expired(now_us)`.
+    // Evicts expired block-cache entries; request-level KV eviction is done via BlockManager.
+    EvictExpiredResult sweep_expired(int64_t now_us, int64_t ttl_us) {
+        return evict_expired(now_us, ttl_us);
+    }
+
+    void add_active_ref(uint64_t hash);
+    void release_active_ref(uint64_t hash);
+    uint64_t entry_hash(const std::vector<llama_token> & toks, const PrefixReuseMetadata & md) const {
+        return prefix_hash(toks, md);
+    }
 
 private:
     static uint64_t hash_u64(uint64_t cur, uint64_t v);

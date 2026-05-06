@@ -88,6 +88,18 @@ public:
     static bool truncate_seq_tail(llama_context * ctx, int32_t seq_id, llama_pos from_pos);
     static llama_pos seq_pos_min(llama_context * ctx, int32_t seq_id);
     static llama_pos seq_pos_max(llama_context * ctx, int32_t seq_id);
+
+    struct TTLEvictResult {
+        size_t evicted_entries = 0;
+        size_t freed_blocks    = 0;
+    };
+
+    static TTLEvictResult evict_expired_cached_blocks(
+            std::vector<RequestState> & reqs,
+            int64_t now_us,
+            int64_t ttl_us,
+            bool lru_fallback,
+            size_t target_free_blocks);
 };
 
 } // namespace server_scheduler

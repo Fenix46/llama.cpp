@@ -711,6 +711,9 @@ private:
     int32_t  paged_max_full_ctx_concurrency_ = 0;
     int32_t  paged_total_blocks_ = 0;
     uint64_t paged_truncate_failed_ = 0;  // truncate_seq_tail failures since last kv_sched tick
+    int64_t  paged_kv_ttl_us_ = 0;        // TTL for cached KV blocks (0 = disabled)
+    int64_t  paged_last_sweep_us_ = 0;     // last time TTL/LRU sweep ran
+    static constexpr int64_t PAGED_SWEEP_INTERVAL_US = 10'000'000LL; // sweep every 10s
 
     int slots_debug = 0;
     int n_empty_consecutive = 0;
@@ -1269,6 +1272,12 @@ private:
             if (params_base.scheduler == "paged") {
                 SRV_INF("[paged-scheduler] enabled: block_size=%d, kv_pool_ctx=%d, per_request_ctx=%d, total_blocks=%d, blocks_per_seq=%d, max_full_ctx_concurrency=%d, n_seq_max=%d\n",
                         bs, llama_n_ctx(ctx), n_ctx_slot, paged_total_blocks, blks_per_full_ctx, paged_max_full_ctx_concurrency, seq_max);
+                {
+                    const char * ttl_env = std::getenv("LLAMA_PAGED_KV_CACHE_TTL_SEC");
+                    const int64_t ttl_sec = ttl_env ? (int64_t) std::atoll(ttl_env) : 1800LL;
+                    paged_kv_ttl_us_ = ttl_sec > 0 ? ttl_sec * 1'000'000LL : 0LL;
+                    SRV_INF("[paged-cache-ttl] configured ttl_sec=%" PRId64 "\n", ttl_sec);
+                }
             }
 
             SRV_INF("[dynamic-slots] enabled: initial=%d, max=%d (n_seq_max), free_blocks=%d\n",
@@ -1888,10 +1897,25 @@ private:
             params_base.cache_ram_mib);
 
         if (can_cache) {
+            // Register block-entry cache (primary: physical block IDs survive seq release).
             if (prefix_cache_) {
+                prefix_cache_->register_finished_request(*req, build_prefix_reuse_metadata(*req), true);
+                // Also keep legacy donor-seq index for CrossPrefixCopy fallback.
                 prefix_cache_->register_raw(seq_id, req->prompt.tokens.get_tokens());
             }
-            paged_seq_leases.mark_cached(seq_id);
+            // Phase 6: release runtime seq_id immediately; block-entry cache retains KV blocks.
+            // cached_seq_ids kept only as transitional fallback when no block-entry cache exists.
+            if (prefix_cache_) {
+                SRV_INF("[paged-lifecycle] release runtime seq request_id=%d seq_id=%d\n",
+                        req ? req->request_id : -1, seq_id);
+                prepare_empty_sequence_for_prefix_copy(*req, "release-cached-seq");
+                reset_runtime_state_for_new_request(*req, "release-cached-seq");
+                paged_seq_leases.release_uncached(seq_id);
+                req->seq_id = -1;
+                req->prompt.checkpoints.clear();
+            } else {
+                paged_seq_leases.mark_cached(seq_id);
+            }
         } else {
             if (req != nullptr) {
                 prepare_empty_sequence_for_prefix_copy(*req, "release-uncached");
@@ -3544,6 +3568,34 @@ private:
         // no server_slot involved. Early-returns after handling everything.
         // ----------------------------------------------------------------
         if (params_base.scheduler == "paged") {
+            // 0. periodic TTL/LRU sweep of cached KV blocks
+            {
+                const int64_t now_us = ggml_time_us();
+                if (paged_kv_ttl_us_ > 0 && (now_us - paged_last_sweep_us_) >= PAGED_SWEEP_INTERVAL_US) {
+                    paged_last_sweep_us_ = now_us;
+                    // Sweep request-level KV: evict idle cached entries past TTL, then LRU under pressure.
+                    const int32_t n_free = llama_kv_cache_n_free_blocks(llama_get_memory(ctx));
+                    const bool pressure = paged_total_blocks_ > 0 && n_free < (paged_total_blocks_ / 4);
+                    const auto bev = server_scheduler::BlockManager::evict_expired_cached_blocks(
+                        paged_requests, now_us, paged_kv_ttl_us_, pressure, 0);
+                    if (bev.evicted_entries > 0) {
+                        for (auto & req : paged_requests) {
+                            if (!req.is_processing() && req.prompt.n_tokens() == 0 && req.seq_id >= 0) {
+                                prefix_cache_invalidate(req.seq_id);
+                                (void) server_scheduler::BlockManager::clear_destination_sequence(req);
+                                paged_seq_leases.release_uncached(req.seq_id);
+                                req.seq_id = -1;
+                                req.prompt.checkpoints.clear();
+                            }
+                        }
+                    }
+                    // Sweep block-cache entries (PrefixReuseManager).
+                    if (prefix_cache_) {
+                        (void) prefix_cache_->sweep_expired(now_us, paged_kv_ttl_us_);
+                    }
+                }
+            }
+
             // 1. all-idle check
             {
                 bool all_idle = true;

@@ -200,6 +200,10 @@ BlockManager::PrefixAttachResult BlockManager::attach_shared_prefix(RequestState
             return out;
         }
     }
+    // COW invariant: shared prefix blocks are read-only; suffix tokens must be
+    // written to freshly-allocated blocks beyond the shared prefix range.
+    LOG_DBG("[paged-cache-cow] shared_attach request_id=%d blocks=%zu — suffix writes must use new blocks\n",
+            req.request_id, plan.physical_block_ids.size());
     LOG_DBG("[paged-prefix-block] attach request_id=%d blocks=%zu refcount_inc=%zu\n",
             req.request_id, plan.physical_block_ids.size(), plan.physical_block_ids.size());
     out.ok = true;
@@ -256,6 +260,76 @@ BlockManager::EvictionResult BlockManager::evict_idle_cache(
     }
     LOG_DBG("[paged-blocks] eviction freed_blocks=%zu evicted_entries=%zu reason=%s\n",
             out.freed_blocks, out.evicted_entries, out.reason);
+    return out;
+}
+
+BlockManager::TTLEvictResult BlockManager::evict_expired_cached_blocks(
+        std::vector<RequestState> & reqs,
+        int64_t now_us,
+        int64_t ttl_us,
+        bool lru_fallback,
+        size_t target_free_blocks) {
+    TTLEvictResult out;
+
+    // Collect eviction candidates: idle, non-processing, with KV data.
+    struct Candidate {
+        size_t idx;
+        int64_t last_used_us;
+        bool expired;
+    };
+    std::vector<Candidate> candidates;
+    for (size_t i = 0; i < reqs.size(); ++i) {
+        const auto & req = reqs[i];
+        if (req.is_processing()) {
+            continue;
+        }
+        if (req.prompt.n_tokens() == 0) {
+            continue;
+        }
+        const bool expired = ttl_us > 0 && req.t_last_used >= 0 &&
+                             (now_us - req.t_last_used) > ttl_us;
+        candidates.push_back({i, req.t_last_used, expired});
+    }
+
+    // Sort: expired first, then by LRU (oldest last_used first).
+    std::sort(candidates.begin(), candidates.end(), [](const Candidate & a, const Candidate & b) {
+        if (a.expired != b.expired) return a.expired > b.expired;
+        return a.last_used_us < b.last_used_us;
+    });
+
+    for (const auto & c : candidates) {
+        if (!c.expired && !lru_fallback) {
+            break;
+        }
+        if (out.freed_blocks >= target_free_blocks && target_free_blocks > 0 && !c.expired) {
+            break;
+        }
+        auto & req = reqs[c.idx];
+        const size_t n_tok = (size_t) req.prompt.n_tokens();
+        const char * reason = c.expired ? "ttl-expired" : "lru-pressure";
+        if (c.expired) {
+            LOG_INF("[paged-cache-ttl] evict entry=%d age_sec=%.1f freed_blocks=%zu reason=%s\n",
+                    req.seq_id,
+                    (double)(now_us - req.t_last_used) / 1e6,
+                    n_tok,
+                    reason);
+        } else {
+            LOG_INF("[paged-cache-lru] evict entry=%d age_sec=%.1f freed_blocks=%zu reason=%s\n",
+                    req.seq_id,
+                    req.t_last_used >= 0 ? (double)(now_us - req.t_last_used) / 1e6 : -1.0,
+                    n_tok,
+                    reason);
+        }
+        req.prompt_clear(false);
+        release_blocks(req);
+        out.evicted_entries++;
+        out.freed_blocks += n_tok;
+    }
+
+    if (out.evicted_entries > 0) {
+        LOG_INF("[paged-cache-ttl] sweep expired_entries=%zu freed_blocks=%zu\n",
+                out.evicted_entries, out.freed_blocks);
+    }
     return out;
 }
 

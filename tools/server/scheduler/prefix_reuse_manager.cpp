@@ -98,7 +98,10 @@ void PrefixReuseManager::register_block_entry(
     e.n_tokens = toks.size();
     e.physical_block_ids = block_ids;
     e.refcount = 1;
+    e.active_refcount = 0;
+    e.cache_refcount = 1;
     e.last_used_us = ggml_time_us();
+    e.created_us = e.last_used_us;
     block_cache_[e.prefix_hash] = std::move(e);
 }
 
@@ -144,6 +147,16 @@ PrefixReusePlan PrefixReuseManager::resolve(
         plan.suffix_tokens = new_toks.size() - entry->n_tokens;
         plan.physical_block_ids = entry->physical_block_ids;
         plan.reason = "shared-block-hit";
+        // touch LRU timestamp and bump active refcount
+        const uint64_t h = entry->prefix_hash;
+        auto it = block_cache_.find(h);
+        if (it != block_cache_.end()) {
+            it->second.last_used_us = ggml_time_us();
+            it->second.active_refcount++;
+            it->second.refcount++;
+            LOG_DBG("[paged-cache-ref] block=%" PRIu64 " refcount=%u active=%u cached=%u\n",
+                    h, it->second.refcount, it->second.active_refcount, it->second.cache_refcount);
+        }
         LOG_DBG("[paged-prefix-block] hit request_id=%d cached_tokens=%zu blocks=%zu\n",
                 task.id, plan.cached_tokens, plan.physical_block_ids.size());
         return plan;
@@ -216,6 +229,61 @@ bool PrefixReuseManager::register_finished_request(
     LOG_DBG("[paged-prefix] register request_id=%d tokens=%zu cacheable=1\n",
             req.request_id, req.prompt.tokens.size());
     return true;
+}
+
+PrefixReuseManager::EvictExpiredResult PrefixReuseManager::evict_expired(int64_t now_us, int64_t ttl_us) {
+    EvictExpiredResult out;
+    if (ttl_us <= 0) {
+        return out;
+    }
+    auto it = block_cache_.begin();
+    while (it != block_cache_.end()) {
+        const auto & e = it->second;
+        if (!e.is_evictable()) {
+            ++it;
+            continue;
+        }
+        const bool expired = e.last_used_us >= 0 && (now_us - e.last_used_us) > ttl_us;
+        if (!expired) {
+            ++it;
+            continue;
+        }
+        LOG_INF("[paged-cache-ttl] evict block-entry hash=%" PRIu64 " tokens=%zu blocks=%zu age_sec=%.1f\n",
+                e.prefix_hash, e.n_tokens, e.physical_block_ids.size(),
+                (double)(now_us - e.last_used_us) / 1e6);
+        out.freed_blocks += e.physical_block_ids.size();
+        out.evicted_entries++;
+        it = block_cache_.erase(it);
+    }
+    return out;
+}
+
+void PrefixReuseManager::add_active_ref(uint64_t hash) {
+    auto it = block_cache_.find(hash);
+    if (it == block_cache_.end()) {
+        return;
+    }
+    it->second.active_refcount++;
+    it->second.refcount++;
+    LOG_DBG("[paged-cache-ref] block=%" PRIu64 " refcount=%u active=%u cached=%u\n",
+            hash, it->second.refcount, it->second.active_refcount, it->second.cache_refcount);
+}
+
+void PrefixReuseManager::release_active_ref(uint64_t hash) {
+    auto it = block_cache_.find(hash);
+    if (it == block_cache_.end()) {
+        return;
+    }
+    auto & e = it->second;
+    if (e.active_refcount > 0) {
+        e.active_refcount--;
+    }
+    if (e.refcount > 0) {
+        e.refcount--;
+    }
+    e.last_used_us = ggml_time_us();
+    LOG_DBG("[paged-cache-ref] block=%" PRIu64 " refcount=%u active=%u cached=%u\n",
+            hash, e.refcount, e.active_refcount, e.cache_refcount);
 }
 
 void PrefixReuseManager::register_raw(int32_t seq_id, const std::vector<llama_token> & tokens) {
