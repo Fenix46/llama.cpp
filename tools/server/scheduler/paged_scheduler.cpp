@@ -72,6 +72,13 @@ void PagedScheduler::begin_prefill(RequestState & req, int32_t n_past, int64_t t
     req.n_prompt_tokens_cache = n_past;
     req.n_prompt_tokens_processed = 0;
     req.prompt.tokens.keep_first(n_past);
+    if (req.task) {
+        const int32_t total = req.task->n_tokens();
+        GGML_ASSERT(req.n_prompt_tokens_cache >= 0);
+        GGML_ASSERT(req.n_prompt_tokens_cache <= total);
+        LOG_DBG("[paged-prefill-plan] request_id=%d seq=%d total=%d cached=%d suffix=%d\n",
+                req.request_id, req.seq_id, total, req.n_prompt_tokens_cache, total - req.n_prompt_tokens_cache);
+    }
 }
 
 void PagedScheduler::mark_prompt_done(RequestState & req, llama_batch & batch) {
@@ -82,6 +89,16 @@ void PagedScheduler::mark_prompt_done(RequestState & req, llama_batch & batch) {
     req.n_decoded = 0;
     req.i_batch = batch.n_tokens - 1;
     req.init_sampler();
+    if (req.task) {
+        const int32_t total = req.task->n_tokens();
+        GGML_ASSERT(req.n_prompt_tokens_cache + req.n_prompt_tokens_processed == total);
+        if (req.n_prompt_tokens_cache > 0) {
+            GGML_ASSERT(req.n_prompt_tokens_processed < total &&
+                        "prefix reuse regression: cached request should not re-prefill full prompt");
+        }
+        LOG_DBG("[paged-prefill-done] request_id=%d seq=%d total=%d cached=%d processed=%d\n",
+                req.request_id, req.seq_id, total, req.n_prompt_tokens_cache, req.n_prompt_tokens_processed);
+    }
 }
 
 bool PagedScheduler::should_break_for_checkpoint(

@@ -7,6 +7,32 @@ namespace server_scheduler {
 
 class BlockManager {
 public:
+    struct PrefixReusePlan {
+        enum class Mode {
+            None,
+            SameSeqAppend,
+            CrossPrefixCopy,
+        };
+
+        Mode mode = Mode::None;
+        int32_t donor_seq_id = -1;
+        size_t cached_tokens = 0;
+        size_t suffix_tokens = 0;
+    };
+
+    struct PrefixAttachResult {
+        bool ok = false;
+        size_t cached_tokens = 0;
+        size_t suffix_tokens = 0;
+        const char * failure_reason = "none";
+    };
+
+    struct EvictionResult {
+        size_t freed_blocks = 0;
+        size_t evicted_entries = 0;
+        const char * reason = "none";
+    };
+
     struct PolicyContext {
         std::vector<RequestState> * reqs = nullptr;
         int64_t now_us = 0;
@@ -42,6 +68,16 @@ public:
     static FitDecision can_fit_request_full(const RequestState & req, const FitContext & ctx);
     static FitDecision can_fit_tokens_delta(const RequestState & req, int32_t delta_tokens, const FitContext & ctx);
     static float pressure_ratio(const Stats & stats, int32_t total_blocks);
+
+    static bool prepare_fresh_sequence(RequestState & req);
+    static PrefixAttachResult attach_prefix(RequestState & req, const PrefixReusePlan & plan);
+    static bool allocate_for_prefill(RequestState & req, size_t n_tokens);
+    static bool allocate_for_decode(RequestState & req, size_t n_tokens);
+    static bool commit_prefill(RequestState & req, size_t n_tokens);
+    static bool commit_decode(RequestState & req, size_t n_tokens);
+    static void release_runtime_sequence(RequestState & req);
+    static bool clear_destination_sequence(RequestState & req);
+    static EvictionResult evict_idle_cache(std::vector<RequestState> & reqs, int64_t now_us, int64_t idle_thold_us, size_t target_blocks = 0);
 
     static bool clear_sequence(llama_context * ctx, int32_t seq_id);
     static bool copy_sequence(llama_context * ctx, int32_t src_seq_id, int32_t dst_seq_id);

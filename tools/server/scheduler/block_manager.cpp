@@ -1,6 +1,7 @@
 #include "block_manager.h"
 
 #include "llama.h"
+#include "common/log.h"
 
 namespace server_scheduler {
 
@@ -115,6 +116,107 @@ float BlockManager::pressure_ratio(const Stats & stats, int32_t total_blocks) {
         return 0.0f;
     }
     return (float) stats.reserved_blocks / (float) total_blocks;
+}
+
+bool BlockManager::prepare_fresh_sequence(RequestState & req) {
+    LOG_DBG("[paged-blocks] prepare-fresh request_id=%d seq_id=%d\n", req.request_id, req.seq_id);
+    return clear_destination_sequence(req);
+}
+
+BlockManager::PrefixAttachResult BlockManager::attach_prefix(RequestState & req, const PrefixReusePlan & plan) {
+    PrefixAttachResult out;
+    out.cached_tokens = plan.cached_tokens;
+    out.suffix_tokens = plan.suffix_tokens;
+
+    LOG_DBG("[paged-blocks] attach-prefix request_id=%d seq_id=%d mode=%d cached_tokens=%zu suffix_tokens=%zu donor_seq=%d\n",
+            req.request_id, req.seq_id, (int) plan.mode, plan.cached_tokens, plan.suffix_tokens, plan.donor_seq_id);
+
+    if (!req.ctx || req.seq_id < 0) {
+        out.failure_reason = "invalid-dst";
+        return out;
+    }
+    if (plan.mode == PrefixReusePlan::Mode::None || plan.mode == PrefixReusePlan::Mode::SameSeqAppend) {
+        out.ok = true;
+        return out;
+    }
+    if (plan.mode != PrefixReusePlan::Mode::CrossPrefixCopy) {
+        out.failure_reason = "unsupported-mode";
+        return out;
+    }
+    if (plan.donor_seq_id < 0 || plan.donor_seq_id == req.seq_id) {
+        out.failure_reason = "invalid-donor";
+        return out;
+    }
+
+    if (!clear_destination_sequence(req)) {
+        out.failure_reason = "clear-dst-failed";
+        return out;
+    }
+
+    LOG_DBG("[paged-blocks] copy-prefix donor_seq=%d dst_seq=%d tokens=%zu\n",
+            plan.donor_seq_id, req.seq_id, plan.cached_tokens);
+    llama_memory_seq_cp(llama_get_memory(req.ctx), plan.donor_seq_id, req.seq_id, -1, -1);
+    if (!truncate_seq_tail(req.ctx, req.seq_id, (llama_pos) plan.cached_tokens)) {
+        out.failure_reason = "truncate-dst-failed";
+        return out;
+    }
+    LOG_DBG("[paged-blocks] truncate-dst request_id=%d seq_id=%d tokens=%zu\n",
+            req.request_id, req.seq_id, plan.cached_tokens);
+    out.ok = true;
+    return out;
+}
+
+bool BlockManager::allocate_for_prefill(RequestState & req, size_t n_tokens) {
+    const int32_t blocks = (int32_t) std::max<size_t>(1, n_tokens);
+    LOG_DBG("[paged-blocks] allocate-prefill request_id=%d tokens=%zu blocks=%d\n", req.request_id, n_tokens, blocks);
+    req.reserved_blocks = std::max(req.reserved_blocks, blocks);
+    return true;
+}
+
+bool BlockManager::allocate_for_decode(RequestState & req, size_t n_tokens) {
+    const int32_t blocks = (int32_t) std::max<size_t>(1, n_tokens);
+    LOG_DBG("[paged-blocks] allocate-decode request_id=%d tokens=%zu blocks=%d\n", req.request_id, n_tokens, blocks);
+    req.reserved_blocks = std::max(req.reserved_blocks, blocks);
+    return true;
+}
+
+bool BlockManager::commit_prefill(RequestState & req, size_t n_tokens) {
+    LOG_DBG("[paged-blocks] commit-prefill request_id=%d tokens=%zu\n", req.request_id, n_tokens);
+    (void) req; (void) n_tokens;
+    return true;
+}
+
+bool BlockManager::commit_decode(RequestState & req, size_t n_tokens) {
+    LOG_DBG("[paged-blocks] commit-decode request_id=%d tokens=%zu\n", req.request_id, n_tokens);
+    (void) req; (void) n_tokens;
+    return true;
+}
+
+void BlockManager::release_runtime_sequence(RequestState & req) {
+    LOG_DBG("[paged-blocks] release-runtime request_id=%d seq_id=%d\n", req.request_id, req.seq_id);
+    req.reserved_blocks = 0;
+}
+
+bool BlockManager::clear_destination_sequence(RequestState & req) {
+    return clear_sequence(req.ctx, req.seq_id);
+}
+
+BlockManager::EvictionResult BlockManager::evict_idle_cache(
+        std::vector<RequestState> & reqs,
+        int64_t now_us,
+        int64_t idle_thold_us,
+        size_t target_blocks) {
+    EvictionResult out;
+    (void) target_blocks;
+    if (evict_idle_request(reqs, now_us, idle_thold_us)) {
+        out.evicted_entries = 1;
+        out.reason = "idle";
+    } else {
+        out.reason = "none";
+    }
+    LOG_DBG("[paged-blocks] eviction freed_blocks=%zu evicted_entries=%zu reason=%s\n",
+            out.freed_blocks, out.evicted_entries, out.reason);
+    return out;
 }
 
 bool BlockManager::clear_sequence(llama_context * ctx, int32_t seq_id) {
