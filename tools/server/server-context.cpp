@@ -2129,7 +2129,14 @@ private:
         return md;
     }
 
-    void execute_prefix_reuse_plan(paged_request_state & req, const server_task & task) {
+    void execute_prefix_reuse_plan(paged_request_state & req) {
+        if (!req.task) {
+            SRV_WRN("[paged-prefix] skip request_id=%d reason=missing-task-before-plan\n", req.request_id);
+            (void) server_scheduler::BlockManager::prepare_fresh_sequence(req);
+            return;
+        }
+        const server_task & task = *req.task;
+
         if (!paged_enable_block_prefix_cache_ || !prefix_cache_) {
             (void) server_scheduler::BlockManager::prepare_fresh_sequence(req);
             return;
@@ -2144,6 +2151,11 @@ private:
             [this](int32_t seq_id) -> const server_scheduler::RequestState * {
                 return get_paged_request_by_seq_id(seq_id);
             });
+
+        if (plan.mode == server_scheduler::PrefixReuseMode::None || plan.cached_tokens == 0) {
+            (void) server_scheduler::BlockManager::prepare_fresh_sequence(req);
+            return;
+        }
 
         server_scheduler::BlockManager::PrefixCacheEntryView view;
         view.n_tokens = plan.cached_tokens;
@@ -2362,30 +2374,7 @@ private:
             }
         };
 
-        // same-seq append only when dispatch verified this is a same-lineage continuation.
-        if (paged_enable_same_seq_append_ && req.same_lineage_verified_for_launch) {
-            SRV_INF("[paged-prefix] lookup request_id=%d mode=same-seq key=%s cached_tokens=%zu suffix_tokens=%zu\n",
-                    task.id, req.lineage_key.c_str(),
-                    req.prompt.tokens.get_tokens().size(),
-                    task.tokens.get_tokens().size() > req.prompt.tokens.get_tokens().size()
-                        ? task.tokens.get_tokens().size() - req.prompt.tokens.get_tokens().size() : 0);
-        }
-        execute_prefix_reuse_plan(req, task);
         reset_runtime_state_for_new_request(req, "launch");
-
-        // sampler
-        if (task.need_sampling()) {
-            try {
-                req.smpl.reset(common_sampler_init(model, task.params.sampling));
-            } catch (std::exception & e) {
-                send_error(task, std::string("Failed to initialize samplers: ") + e.what(), ERROR_TYPE_INVALID_REQUEST);
-                return false;
-            }
-            llama_set_sampler(ctx, req.seq_id, nullptr);
-        } else {
-            req.smpl.reset();
-        }
-
         req.request_id = task.id;
         req.parent_id  = task.id_parent;
         req.phase      = task.is_child() ? PAGED_REQUEST_WAIT_PARENT : PAGED_REQUEST_STARTED;
@@ -2395,7 +2384,32 @@ private:
         req.t_prefill_done_us = 0;
         req.t_first_token_us = 0;
         req.t_last_token_us = 0;
-        req.task       = std::make_unique<const server_task>(std::move(task));
+        req.task = std::make_unique<const server_task>(std::move(task));
+
+        // same-seq append only when dispatch verified this is a same-lineage continuation.
+        if (paged_enable_same_seq_append_ && req.same_lineage_verified_for_launch) {
+            SRV_INF("[paged-prefix] lookup request_id=%d mode=same-seq key=%s cached_tokens=%zu suffix_tokens=%zu\n",
+                    req.request_id, req.lineage_key.c_str(),
+                    req.prompt.tokens.get_tokens().size(),
+                    req.task->tokens.get_tokens().size() > req.prompt.tokens.get_tokens().size()
+                        ? req.task->tokens.get_tokens().size() - req.prompt.tokens.get_tokens().size() : 0);
+        }
+        execute_prefix_reuse_plan(req);
+
+        // sampler
+        if (req.task->need_sampling()) {
+            try {
+                auto sampling_params = req.task->params.sampling;
+                req.smpl.reset(common_sampler_init(model, sampling_params));
+            } catch (std::exception & e) {
+                send_error(*req.task, std::string("Failed to initialize samplers: ") + e.what(), ERROR_TYPE_INVALID_REQUEST);
+                return false;
+            }
+            llama_set_sampler(ctx, req.seq_id, nullptr);
+        } else {
+            req.smpl.reset();
+        }
+
         if (paged_lifecycle && req.task) {
             paged_lifecycle->on_create(req, *req.task);
             paged_lifecycle->on_admit(req);
