@@ -2849,6 +2849,12 @@ private:
                 (long long) prefill_ms,
                 (long long) decode_ms,
                 (long long) total_ms);
+
+        const int64_t ttft_us      = std::max<int64_t>(0, first_token_us - req.t_arrival_us);
+        const int64_t queue_wait_us_val = std::max<int64_t>(0, admitted_us - req.t_arrival_us);
+        const int64_t prefill_us   = std::max<int64_t>(0, prefill_done_us - prefill_start_us);
+        const int64_t decode_us    = std::max<int64_t>(0, last_token_us - first_token_us);
+        paged_metrics_.throughput.record_completion(ttft_us, queue_wait_us_val, prefill_us, decode_us);
     }
 
     // --- end paged overloads ---
@@ -3063,10 +3069,22 @@ private:
         return server_scheduler::BlockManager::total_reserved_blocks(paged_requests);
     }
 
-    server_scheduler::AdmissionDecision paged_admission_decision(const server_task & task) const {
+    server_scheduler::AdmissionDecision paged_admission_decision(const server_task & task) {
         const auto blk_stats = server_scheduler::BlockManager::stats(paged_requests);
         const int32_t running = blk_stats.active_requests;
-        auto decision = server_scheduler::paged_admission_available(
+
+        server_scheduler::AdmissionCapacityCtx cap_ctx;
+        cap_ctx.total_blocks    = paged_total_blocks_;
+        cap_ctx.free_blocks     = llama_kv_cache_n_free_blocks(llama_get_memory(ctx));
+        cap_ctx.reserved_blocks = server_scheduler::BlockManager::total_reserved_blocks(paged_requests);
+        cap_ctx.try_evict_idle  = [this]() -> int32_t {
+            const int32_t before = llama_kv_cache_n_free_blocks(llama_get_memory(ctx));
+            try_clear_idle_paged_requests();
+            const int32_t after  = llama_kv_cache_n_free_blocks(llama_get_memory(ctx));
+            return std::max(0, after - before);
+        };
+
+        auto decision = server_scheduler::paged_admission_with_capacity(
             task,
             params_base,
             paged_requests,
@@ -3075,7 +3093,8 @@ private:
             paged_total_blocks_,
             paged_blocks_per_seq_,
             n_ctx_slot_,
-            running);
+            running,
+            cap_ctx);
 
         if (!decision.accepted) {
             SRV_DBG("[paged-scheduler] admission deferred: reason=%s, active_requests=%d, policy=%s\n",
@@ -3085,7 +3104,7 @@ private:
         return decision;
     }
 
-    bool paged_admission_available(const server_task & task) const {
+    bool paged_admission_available(const server_task & task) {
         return paged_admission_decision(task).accepted;
     }
 
@@ -4136,6 +4155,10 @@ private:
                 /*allow_multi_seq=*/sched_policy_cfg_.multi_seq_decode,
                 /*scheduled_decode_seqs=*/planned_decode_rows_tick);
 
+            if (!decode_outcome.fatal && batch.n_tokens > 0) {
+                paged_metrics_.throughput.record_decode_step(batch.n_tokens);
+            }
+
             if (split_mixed_batch && !decode_outcome.fatal && sched_prefill_toks_tick > 0) {
                 const int32_t executed_decode_tokens = batch.n_tokens;
                 const int32_t executed_prefill_tokens = 0;
@@ -4224,6 +4247,7 @@ private:
                     const int32_t executed_prefill_tokens = batch.n_tokens;
                     GGML_ASSERT(executed_decode_tokens == 0);
                     GGML_ASSERT(batch.n_tokens == executed_prefill_tokens);
+                    paged_metrics_.throughput.record_chunk(executed_prefill_tokens);
                     // Long-prefill background slice resets burst counters.
                     if (n_decode_active == 0 || paged_decode_burst_steps >= sched_policy_cfg_.decode_burst_tokens) {
                         paged_decode_burst_steps = 0;
@@ -4283,6 +4307,9 @@ private:
                     }
                 } else if (decode_tokens_in_batch == 0) {
                     // Prefill-only turn: update burst counters based on prefill class.
+                    if (sched_prefill_toks_tick > 0) {
+                        paged_metrics_.throughput.record_chunk(sched_prefill_toks_tick);
+                    }
                     const bool has_long = (sched_prefill_toks_tick > 0 && sched_decode_toks_tick == 0 &&
                                            decode_ready_reqs_tick == 0);
                     if (has_long) {
@@ -4292,6 +4319,11 @@ private:
                     if (std::getenv("LLAMA_PAGED_SCHED_TRACE")) {
                         SRV_WRN("[paged-sched-phase] phase=prefill_only class=%s\n",
                                 has_long ? "long" : "short");
+                    }
+                } else {
+                    // Mixed decode+prefill single pass (no split).
+                    if (sched_prefill_toks_tick > 0) {
+                        paged_metrics_.throughput.record_chunk(sched_prefill_toks_tick);
                     }
                 }
             }

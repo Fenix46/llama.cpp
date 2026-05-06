@@ -3,6 +3,8 @@
 #include "prefill_policy.h"
 #include "request_state.h"
 
+#include "common/log.h"
+
 #include <cstdint>
 #include <cstdlib>
 #include <string>
@@ -106,6 +108,20 @@ struct SchedulerPolicyConfig {
     bool is_balanced() const   { return policy == Policy::Balanced; }
 };
 
+// Per-request chunk decision: what and why for each prefill candidate this tick.
+struct ChunkedPrefillDecision {
+    int32_t seq_id                   = -1;
+    int32_t chunk_size               = 0;
+    int32_t remaining_prompt_tokens  = 0;
+    int32_t cached_prefix_tokens     = 0;
+    int32_t suffix_tokens            = 0;
+    bool    is_short_prefill         = false;
+    bool    is_long_prefill          = false;
+    bool    active_decode_present    = false;
+    bool    starvation_override      = false; // admitted due to starvation guard
+    const char * reason              = "none";
+};
+
 // Output of the prefill priority ordering + budget capping step.
 struct PrefillPolicyDecision {
     std::vector<size_t> ordered_candidates;
@@ -115,6 +131,8 @@ struct PrefillPolicyDecision {
     bool    long_prefill_slice      = false;
     bool    short_prefill_priority  = false;
     bool    split_mixed_batch       = false;
+    bool    starvation_override     = false; // prefill forced to prevent starvation
+    std::vector<ChunkedPrefillDecision> chunk_decisions;
 };
 
 struct PrefillPolicyInput {
@@ -185,10 +203,16 @@ inline PrefillPolicyDecision apply_prefill_policy(
 
     // Latency mode: decide whether to suppress long prefill this tick.
     if (cfg.is_latency() && in.n_decode_active > 0 && has_long && !has_short) {
-        const bool allow_long = (in.decode_burst_steps  >= cfg.decode_burst_tokens) ||
-                                (in.decode_steps_since_long_prefill >= cfg.prefill_every_n_decode_steps);
-        out.decode_burst_only = !allow_long;
-        out.long_prefill_slice = allow_long;
+        const bool burst_done   = in.decode_burst_steps >= cfg.decode_burst_tokens;
+        const bool starved      = in.decode_steps_since_long_prefill >= cfg.prefill_every_n_decode_steps;
+        const bool allow_long   = burst_done || starved;
+        out.decode_burst_only  = !allow_long;
+        out.long_prefill_slice  = allow_long;
+        if (starved && allow_long) {
+            out.starvation_override = true;
+            LOG_INF("[paged-scheduler] starvation-guard triggered: long prefill allowed after %d decode steps\n",
+                    in.decode_steps_since_long_prefill);
+        }
     }
     out.short_prefill_priority = cfg.is_latency() && has_short;
 
@@ -220,6 +244,54 @@ inline PrefillPolicyDecision apply_prefill_policy(
     out.split_mixed_batch = cfg.latency_mode &&
                             in.sched_decode_toks > 0 &&
                             in.sched_prefill_toks > 0;
+
+    // Populate explicit per-request chunk decisions and emit chunk logs.
+    if (!out.decode_burst_only) {
+        out.chunk_decisions.reserve(out.ordered_candidates.size());
+        for (const size_t ridx : out.ordered_candidates) {
+            const auto & req = reqs[ridx];
+            const int32_t total  = req.task ? req.task->n_tokens() : 0;
+            const int32_t done   = req.prompt.n_tokens();
+            const int32_t remain = std::max(0, total - done);
+            const bool is_short  = total <= cfg.short_prefill_threshold;
+            const int32_t chunk  = std::min(remain, out.prefill_per_req_budget);
+
+            const char * reason;
+            if (out.starvation_override) {
+                reason = "starvation-guard";
+            } else if (in.n_decode_active > 0 && !is_short) {
+                reason = "active-decode-long";
+            } else if (in.n_decode_active > 0) {
+                reason = "active-decode-short";
+            } else if (is_short) {
+                reason = "idle-short";
+            } else {
+                reason = "idle-long";
+            }
+
+            ChunkedPrefillDecision cd;
+            cd.seq_id                  = req.seq_id;
+            cd.chunk_size              = chunk;
+            cd.remaining_prompt_tokens = remain;
+            cd.cached_prefix_tokens    = req.n_prompt_tokens_cache;
+            cd.suffix_tokens           = remain;
+            cd.is_short_prefill        = is_short;
+            cd.is_long_prefill         = !is_short;
+            cd.active_decode_present   = in.n_decode_active > 0;
+            cd.starvation_override     = out.starvation_override;
+            cd.reason                  = reason;
+            out.chunk_decisions.push_back(cd);
+
+            LOG_DBG("[paged-scheduler] prefill-chunk seq_id=%d tokens=%d reason=%s"
+                    " remaining=%d cached=%d is_short=%d active_decode=%d\n",
+                    cd.seq_id, cd.chunk_size, cd.reason,
+                    cd.remaining_prompt_tokens, cd.cached_prefix_tokens,
+                    cd.is_short_prefill ? 1 : 0, cd.active_decode_present ? 1 : 0);
+        }
+    } else {
+        LOG_DBG("[paged-scheduler] decode-burst tokens=%d (prefill suppressed, steps=%d/%d)\n",
+                in.sched_decode_toks, in.decode_burst_steps, cfg.decode_burst_tokens);
+    }
 
     return out;
 }
