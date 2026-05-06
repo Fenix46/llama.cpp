@@ -188,6 +188,9 @@ bool RequestLifecycle::register_prefix_cache_on_release(
         if (!registered) {
             std::fprintf(stderr, "[paged-prefix] reject request_id=%d reason=manager-register-rejected\n", req ? req->request_id : -1);
         }
+        if (ops_.lineage_register_cached) {
+            ops_.lineage_register_cached(*req, seq_id, ops_.now_us ? ops_.now_us() : 0);
+        }
         if (ops_.seq_mark_cached) {
             ops_.seq_mark_cached(seq_id);
         }

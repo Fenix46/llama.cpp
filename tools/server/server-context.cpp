@@ -1164,6 +1164,33 @@ private:
                 }
                 return prefix_cache_->register_finished_request(req, build_prefix_reuse_metadata(req), cacheable);
             };
+            lifecycle_ops.lineage_register_cached =
+                [this](const server_scheduler::RequestState & req, int32_t seq_id, int64_t now_us) {
+                    if (!lineage_mgr_ || req.lineage_key.empty() || req.prompt.tokens.empty()) {
+                        return;
+                    }
+
+                    int32_t req_index = -1;
+                    for (size_t i = 0; i < paged_requests.size(); ++i) {
+                        if (&paged_requests[i] == &req) {
+                            req_index = (int32_t) i;
+                            break;
+                        }
+                    }
+
+                    if (req_index < 0) {
+                        SRV_WRN("[paged-lineage] register failed key=%s seq_id=%d reason=req-index-not-found\n",
+                                req.lineage_key.c_str(), seq_id);
+                        return;
+                    }
+
+                    lineage_mgr_->on_release_cached(
+                        req.lineage_key,
+                        seq_id,
+                        req_index,
+                        now_us,
+                        req.prompt.tokens.get_tokens());
+                };
             lifecycle_ops.clear_sequence = [this](int32_t seq_id) {
                 return server_scheduler::BlockManager::clear_sequence(ctx, seq_id);
             };
@@ -1644,6 +1671,8 @@ private:
                 req.seq_id = seq_id;
                 req.n_ctx  = n_ctx_slot_;
                 req.prompt.tokens.has_mtmd = mctx != nullptr;
+                req.lineage_key = task.lineage_key;
+                req.same_lineage_verified_for_launch = false;
 
                 SRV_INF("[paged] reusing request entry with fresh seq_id=%d\n", seq_id);
                 return &req;
@@ -1663,6 +1692,8 @@ private:
         req.seq_id = seq_id;
         req.n_ctx  = n_ctx_slot_;
         req.prompt.tokens.has_mtmd = mctx != nullptr;
+        req.lineage_key = task.lineage_key;
+        req.same_lineage_verified_for_launch = false;
 
         SRV_INF("[paged] created request entry seq_id=%d (free_blocks=%d, seq_cap=%d)\n",
                 seq_id, n_free_blk, seq_cap);
@@ -5627,10 +5658,18 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     meta->logit_bias_eog,
                     data);
             task.id_slot = json_value(data, "id_slot", -1);
-            // Derive lineage key for paged-mode same-seq reuse.
-            // id_slot >= 0 acts as stable lineage identifier; future explicit
-            // session_id/conversation_id fields can extend this.
-            task.lineage_key = server_scheduler::derive_lineage_key(task);
+            const std::string cache_key       = json_value(data, "cache_key", std::string());
+            const std::string session_id      = json_value(data, "session_id", std::string());
+            const std::string conversation_id = json_value(data, "conversation_id", std::string());
+            if (!cache_key.empty()) {
+                task.lineage_key = "cache_key:" + cache_key;
+            } else if (!session_id.empty()) {
+                task.lineage_key = "session:" + session_id;
+            } else if (!conversation_id.empty()) {
+                task.lineage_key = "conversation:" + conversation_id;
+            } else {
+                task.lineage_key = server_scheduler::derive_lineage_key(task);
+            }
 
             // OAI-compat
             task.params.res_type          = res_type;
