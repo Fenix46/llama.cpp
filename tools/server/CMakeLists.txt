@@ -32,6 +32,8 @@ add_library(${TARGET} STATIC
     scheduler/admission_controller.h
     scheduler/paged_request_allocator.cpp
     scheduler/paged_request_allocator.h
+    scheduler/paged_prefix_reuse.cpp
+    scheduler/paged_prefix_reuse.h
     scheduler/reservation_model.cpp
     scheduler/reservation_model.h
     scheduler/block_manager.cpp

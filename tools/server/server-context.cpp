@@ -14,6 +14,7 @@
 #include "scheduler/prefill_policy.h"
 #include "scheduler/paged_scheduler.h"
 #include "scheduler/paged_request_allocator.h"
+#include "scheduler/paged_prefix_reuse.h"
 #include "scheduler/reservation_model.h"
 #include "scheduler/request_lifecycle.h"
 #include "scheduler/sampling_executor.h"
@@ -1898,10 +1899,6 @@ private:
         req.drop_cache_on_release = true;
     }
 
-    bool can_use_prefix_copy(const paged_request_state & req) const {
-        return req.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
-    }
-
     void reset_runtime_state_for_new_request(paged_request_state & req, const char * reason) {
         if (paged_lifecycle) {
             paged_lifecycle->reset_runtime_state_for_new_request(req, reason);
@@ -2027,74 +2024,29 @@ private:
         }
     }
 
-    server_scheduler::PrefixReuseMetadata build_prefix_reuse_metadata(const paged_request_state & req) const {
-        server_scheduler::PrefixReuseMetadata md;
-        md.model_id = model_name;
-        md.lora_id = req.lora.empty() ? "none" : std::to_string(req.lora.size());
-        md.kv_dtype = "TODO-kv-dtype";
-        md.rope_cfg = "TODO-rope";
-        md.block_size = (uint32_t) params_base.kv_block_size;
-        md.has_mtmd = req.prompt.tokens.has_mtmd;
-        md.mtmd_hash = 0; // TODO: wire real multimodal hash
-        return md;
+    server_scheduler::PagedPrefixReuse make_paged_prefix_reuse() {
+        return server_scheduler::PagedPrefixReuse({
+            /*params_base=*/&params_base,
+            /*prefix_cache=*/prefix_cache_.get(),
+            /*model_name=*/model_name,
+            /*paged_block_prefix_supported=*/paged_block_prefix_supported_,
+            /*paged_enable_block_prefix_cache=*/paged_enable_block_prefix_cache_,
+            /*paged_enable_same_seq_append=*/paged_enable_same_seq_append_,
+            /*paged_enable_donor_seq_fallback=*/paged_enable_donor_seq_fallback_,
+            /*find_request_by_seq_id=*/[this](int32_t seq_id) -> server_scheduler::RequestState * {
+                return get_paged_request_by_seq_id(seq_id);
+            },
+        });
+    }
+
+    server_scheduler::PrefixReuseMetadata build_prefix_reuse_metadata(const paged_request_state & req) {
+        auto prefix_reuse = make_paged_prefix_reuse();
+        return prefix_reuse.build_metadata(req);
     }
 
     void execute_prefix_reuse_plan(paged_request_state & req) {
-        if (!paged_block_prefix_supported_) {
-            SRV_WRN("%s", "[paged-prefix-block] disabled reason=recurrent-memory-not-supported\n");
-            (void) server_scheduler::BlockManager::prepare_fresh_sequence(req);
-            return;
-        }
-        if (!req.task) {
-            SRV_WRN("[paged-prefix] skip request_id=%d reason=missing-task-before-plan\n", req.request_id);
-            (void) server_scheduler::BlockManager::prepare_fresh_sequence(req);
-            return;
-        }
-        const server_task & task = *req.task;
-
-        if (!paged_enable_block_prefix_cache_ || !prefix_cache_) {
-            (void) server_scheduler::BlockManager::prepare_fresh_sequence(req);
-            return;
-        }
-
-        const auto plan = prefix_cache_->resolve(
-            task,
-            req,
-            build_prefix_reuse_metadata(req),
-            paged_enable_same_seq_append_ && req.same_lineage_verified_for_launch,
-            paged_enable_donor_seq_fallback_ && can_use_prefix_copy(req),
-            [this](int32_t seq_id) -> const server_scheduler::RequestState * {
-                return get_paged_request_by_seq_id(seq_id);
-            });
-
-        if (plan.mode == server_scheduler::PrefixReuseMode::None || plan.cached_tokens == 0) {
-            (void) server_scheduler::BlockManager::prepare_fresh_sequence(req);
-            return;
-        }
-
-        server_scheduler::BlockManager::PrefixCacheEntryView view;
-        view.n_tokens = plan.cached_tokens;
-        view.physical_block_ids = plan.physical_block_ids;
-        const auto attach = server_scheduler::BlockManager::attach_cached_blocks(req, view);
-        if (!attach.ok) {
-            SRV_WRN("[paged-blocks] attach-failed request_id=%d reason=%s\n",
-                    task.id, attach.failure_reason ? attach.failure_reason : "unknown");
-            (void) server_scheduler::BlockManager::prepare_fresh_sequence(req);
-            return;
-        }
-        if (attach.cached_tokens > 0) {
-            prefix_cache_->record_reuse(attach.cached_tokens);
-            req.prompt.tokens.clear();
-            const auto & new_toks = task.tokens.get_tokens();
-            for (size_t i = 0; i < attach.cached_tokens && i < new_toks.size(); ++i) {
-                req.prompt.tokens.push_back(new_toks[(int32_t) i]);
-            }
-            SRV_INF("[paged-prefill] request_id=%d prefill_start=%zu prefill_tokens=%zu\n",
-                    req.request_id, attach.cached_tokens, attach.suffix_tokens);
-        } else {
-            SRV_INF("[paged-prefill] request_id=%d prefill_start=0 prefill_tokens=%zu\n",
-                    req.request_id, task.tokens.get_tokens().size());
-        }
+        auto prefix_reuse = make_paged_prefix_reuse();
+        prefix_reuse.execute_plan(req);
     }
 
     std::vector<common_adapter_lora_info> construct_lora_list(const std::map<int, float> & config) const {
