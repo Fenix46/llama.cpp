@@ -13,6 +13,7 @@
 #include "scheduler/block_manager.h"
 #include "scheduler/prefill_policy.h"
 #include "scheduler/paged_scheduler.h"
+#include "scheduler/paged_request_allocator.h"
 #include "scheduler/reservation_model.h"
 #include "scheduler/request_lifecycle.h"
 #include "scheduler/sampling_executor.h"
@@ -1652,96 +1653,27 @@ private:
     // Returns nullptr if KV pool is exhausted or seq_id pool is empty.
     // In paged mode, cached prompt/KV must be reused via prefix plan, not by
     // arbitrarily reactivating a cached seq_id here.
+    server_scheduler::PagedRequestAllocator make_paged_request_allocator() {
+        return server_scheduler::PagedRequestAllocator({
+            /*params_base=*/&params_base,
+            /*ctx=*/ctx,
+            /*mctx=*/mctx,
+            /*paged_requests=*/&paged_requests,
+            /*paged_seq_leases=*/&paged_seq_leases,
+            /*lineage_mgr=*/lineage_mgr_.get(),
+            /*n_ctx_slot=*/n_ctx_slot_,
+            /*paged_blocks_per_seq=*/paged_blocks_per_seq_,
+            /*paged_max_full_ctx_concurrency=*/paged_max_full_ctx_concurrency_,
+            /*paged_total_blocks=*/paged_total_blocks_,
+            /*prefix_cache_invalidate=*/[this](int32_t seq_id) {
+                prefix_cache_invalidate(seq_id);
+            },
+        });
+    }
+
     paged_request_state * get_or_create_paged_request(const server_task & task) {
-        const int32_t seq_max     = (int32_t) llama_n_seq_max(ctx);
-        const int32_t blks_needed = paged_task_reserved_blocks(task);
-        const int32_t seq_cap     = params_base.paged_admission != "actual-len"
-            ? std::min(seq_max, paged_max_full_ctx_concurrency_)
-            : seq_max;
-        auto reclaim_cached_seq_for_lease = [this](const char * reason) -> bool {
-            for (auto & cached_req : paged_requests) {
-                if (cached_req.is_processing() || cached_req.seq_id < 0) {
-                    continue;
-                }
-                if (paged_seq_leases.is_active(cached_req.seq_id) || cached_req.prompt.n_tokens() == 0) {
-                    continue;
-                }
-                SRV_WRN("[paged] reclaim cached request seq_id=%d reason=%s\n", cached_req.seq_id, reason);
-                if (lineage_mgr_) {
-                    lineage_mgr_->on_seq_reclaimed(cached_req.seq_id);
-                }
-                prefix_cache_invalidate(cached_req.seq_id);
-                (void) server_scheduler::BlockManager::clear_destination_sequence(cached_req);
-                paged_seq_leases.release_uncached(cached_req.seq_id);
-                cached_req.seq_id = -1;
-                cached_req.prompt.tokens.clear();
-                cached_req.prompt.checkpoints.clear();
-                return true;
-            }
-            return false;
-        };
-
-        // check cap and KV availability before creating a new entry
-        const int32_t n_active = paged_seq_leases.n_active();
-        if (n_active >= seq_cap) {
-            SRV_DBG("[paged] request cap reached: active=%d, seq_cap=%d\n", n_active, seq_cap);
-            return nullptr;
-        }
-
-        int32_t n_free_blk = llama_kv_cache_n_free_blocks(llama_get_memory(ctx));
-        if (n_free_blk < blks_needed) {
-            if (try_clear_idle_paged_requests()) {
-                n_free_blk = llama_kv_cache_n_free_blocks(llama_get_memory(ctx));
-                SRV_INF("[paged] evicted idle KV, free_blocks now=%d\n", n_free_blk);
-            }
-        }
-
-        if (n_free_blk < blks_needed) {
-            SRV_WRN("[paged] KV pool exhausted: free_blocks=%d < needed=%d\n", n_free_blk, blks_needed);
-            return nullptr;
-        }
-
-        for (auto & req : paged_requests) {
-            if (!req.is_processing() && req.seq_id < 0) {
-                int32_t seq_id = paged_seq_leases.lease();
-                if (seq_id < 0 && reclaim_cached_seq_for_lease("lease-reclaim")) {
-                    seq_id = paged_seq_leases.lease();
-                }
-                if (seq_id < 0) {
-                    SRV_WRN("%s", "[paged] no free seq_id lease\n");
-                    return nullptr;
-                }
-
-                req.seq_id = seq_id;
-                req.n_ctx  = n_ctx_slot_;
-                req.prompt.tokens.has_mtmd = mctx != nullptr;
-                req.lineage_key = task.lineage_key;
-                req.same_lineage_verified_for_launch = false;
-
-                SRV_INF("[paged] reusing request entry with fresh seq_id=%d\n", seq_id);
-                return &req;
-            }
-        }
-
-        int32_t seq_id = paged_seq_leases.lease();
-        if (seq_id < 0 && reclaim_cached_seq_for_lease("lease-reclaim")) {
-            seq_id = paged_seq_leases.lease();
-        }
-        if (seq_id < 0) {
-            SRV_WRN("%s", "[paged] no free seq_id lease\n");
-            return nullptr;
-        }
-
-        auto & req = paged_requests.emplace_back();
-        req.seq_id = seq_id;
-        req.n_ctx  = n_ctx_slot_;
-        req.prompt.tokens.has_mtmd = mctx != nullptr;
-        req.lineage_key = task.lineage_key;
-        req.same_lineage_verified_for_launch = false;
-
-        SRV_INF("[paged] created request entry seq_id=%d (free_blocks=%d, seq_cap=%d)\n",
-                seq_id, n_free_blk, seq_cap);
-        return &req;
+        auto allocator = make_paged_request_allocator();
+        return allocator.get_or_create(task);
     }
 
     server_slot * get_available_slot(const server_task & task) {
@@ -1936,45 +1868,13 @@ private:
     }
 
     bool try_clear_idle_paged_requests() {
-        if (!params_base.kv_unified) {
-            return false;
-        }
-        const auto ev = server_scheduler::BlockManager::evict_idle_cache(
-            paged_requests, ggml_time_us(), 0, 0);
-        const bool evicted = ev.evicted_entries > 0;
-        if (!evicted) {
-            return false;
-        }
-        for (auto & req : paged_requests) {
-            if (req.is_processing()) {
-                continue;
-            }
-            if (req.prompt.n_tokens() == 0 && req.seq_id >= 0) {
-                SRV_WRN("[paged] purging idle req seq_id=%d\n", req.seq_id);
-                if (req.seq_id >= 0) {
-                    if (lineage_mgr_) {
-                        lineage_mgr_->on_seq_reclaimed(req.seq_id);
-                    }
-                    prefix_cache_invalidate(req.seq_id);
-                    (void) server_scheduler::BlockManager::clear_destination_sequence(req);
-                    paged_seq_leases.release_uncached(req.seq_id);
-                    req.seq_id = -1;
-                }
-                req.prompt.tokens.clear();
-                req.prompt.checkpoints.clear();
-                return true;
-            }
-        }
-        return true;
+        auto allocator = make_paged_request_allocator();
+        return allocator.try_clear_idle_requests();
     }
 
     paged_request_state * get_paged_request_by_seq_id(int32_t seq_id) {
-        for (auto & req : paged_requests) {
-            if (req.seq_id == seq_id) {
-                return &req;
-            }
-        }
-        return nullptr;
+        auto allocator = make_paged_request_allocator();
+        return allocator.find_by_seq_id(seq_id);
     }
 
     void assert_paged_seq_cleared(const paged_request_state & req) {
@@ -3283,42 +3183,13 @@ private:
     }
 
     server_scheduler::AdmissionDecision paged_admission_decision(const server_task & task) {
-        const auto blk_stats = server_scheduler::BlockManager::stats(paged_requests);
-        const int32_t running = blk_stats.active_requests;
-
-        server_scheduler::AdmissionCapacityCtx cap_ctx;
-        cap_ctx.total_blocks    = paged_total_blocks_;
-        cap_ctx.free_blocks     = llama_kv_cache_n_free_blocks(llama_get_memory(ctx));
-        cap_ctx.reserved_blocks = server_scheduler::BlockManager::total_reserved_blocks(paged_requests);
-        cap_ctx.try_evict_idle  = [this]() -> int32_t {
-            const int32_t before = llama_kv_cache_n_free_blocks(llama_get_memory(ctx));
-            try_clear_idle_paged_requests();
-            const int32_t after  = llama_kv_cache_n_free_blocks(llama_get_memory(ctx));
-            return std::max(0, after - before);
-        };
-
-        auto decision = server_scheduler::paged_admission_with_capacity(
-            task,
-            params_base,
-            paged_requests,
-            ctx,
-            paged_max_full_ctx_concurrency_,
-            paged_total_blocks_,
-            paged_blocks_per_seq_,
-            n_ctx_slot_,
-            running,
-            cap_ctx);
-
-        if (!decision.accepted) {
-            SRV_DBG("[paged-scheduler] admission deferred: reason=%s, active_requests=%d, policy=%s\n",
-                    decision.reason.c_str(), running, params_base.paged_admission.c_str());
-        }
-
-        return decision;
+        auto allocator = make_paged_request_allocator();
+        return allocator.admission_decision(task);
     }
 
     bool paged_admission_available(const server_task & task) {
-        return paged_admission_decision(task).accepted;
+        auto allocator = make_paged_request_allocator();
+        return allocator.admission_available(task);
     }
 
     // launch multiple slots for parent + child tasks
