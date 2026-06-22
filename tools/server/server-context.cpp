@@ -15,6 +15,7 @@
 #include "scheduler/paged_scheduler.h"
 #include "scheduler/paged_request_allocator.h"
 #include "scheduler/paged_prefix_reuse.h"
+#include "scheduler/paged_request_launcher.h"
 #include "scheduler/reservation_model.h"
 #include "scheduler/request_lifecycle.h"
 #include "scheduler/sampling_executor.h"
@@ -2182,60 +2183,40 @@ private:
         return true;
     }
 
+    server_scheduler::PagedRequestLauncher make_paged_request_launcher() {
+        return server_scheduler::PagedRequestLauncher({
+            /*params_base=*/&params_base,
+            /*model=*/model,
+            /*ctx=*/ctx,
+            /*mctx=*/mctx,
+            /*ctx_seq_rm_type=*/ctx_seq_rm_type_,
+            /*n_ctx_slot=*/n_ctx_slot_,
+            /*paged_blocks_per_seq=*/paged_blocks_per_seq_,
+            /*construct_lora_list=*/[this](const std::map<int, float> & config) {
+                return construct_lora_list(config);
+            },
+            /*prepare_empty_sequence_for_prefix_copy=*/[this](paged_request_state & r, const char * reason) {
+                prepare_empty_sequence_for_prefix_copy(r, reason);
+            },
+            /*reset_runtime_state_for_new_request=*/[this](paged_request_state & r, const char * reason) {
+                reset_runtime_state_for_new_request(r, reason);
+            },
+            /*send_error=*/[this](const server_task & t, const std::string & msg, error_type type) {
+                send_error(t, msg, type);
+            },
+        });
+    }
+
     // Populate a paged_request_state directly from a task (paged-scheduler primary launch path).
     // The leased seq_id and all request runtime state live in paged_request_state.
     bool launch_paged_request(paged_request_state & req, server_task && task) {
         GGML_ASSERT(params_base.scheduler == "paged");
 
-        // lora
-        if (!task.params.lora.empty()) {
-            auto task_loras = construct_lora_list(task.params.lora);
-            if (!are_lora_equal(task_loras, req.lora)) {
-                if (lora_should_clear_cache(req.lora, task_loras)) {
-                    prepare_empty_sequence_for_prefix_copy(req, "lora-change");
-                }
-                req.lora = task_loras;
-            }
-        } else {
-            req.lora = params_base.lora_adapters;
-        }
-
-        // alora invocation start
-        size_t alora_invocation_start = task.tokens.size();
-        if (lora_all_alora(req.lora)) {
-            const auto & enabled_ids = lora_get_enabled_ids(req.lora);
-            if (enabled_ids.size() != 1) {
-                send_error(task, "Cannot run multiple aLoRAs in a single request", ERROR_TYPE_INVALID_REQUEST);
-                return false;
-            }
-            const auto & lora_ptr = req.lora[enabled_ids[0]].ptr;
-            const uint64_t      n_inv = llama_adapter_get_alora_n_invocation_tokens(lora_ptr);
-            const llama_token * inv   = llama_adapter_get_alora_invocation_tokens(lora_ptr);
-            int match_idx = (int) n_inv - 1;
-            for (int i = (int) task.tokens.size() - 1; i >= 0; --i) {
-                if (task.tokens[i] == inv[match_idx]) {
-                    if (match_idx == 0) { alora_invocation_start = i; break; }
-                    --match_idx;
-                } else {
-                    match_idx = (int) n_inv - 1;
-                }
-            }
-            if (alora_invocation_start == task.tokens.size()) {
-                req.lora[enabled_ids[0]].scale = 0.0f;
-            }
-        }
-
-        if (!task.tokens.validate(ctx)) {
-            send_error(task, "Prompt contains invalid tokens", ERROR_TYPE_INVALID_REQUEST);
+        auto launcher = make_paged_request_launcher();
+        if (!launcher.prepare_base(req, std::move(task))) {
             return false;
         }
 
-        req.ctx              = ctx;
-        req.mctx             = mctx;
-        req.ctx_seq_rm_type  = ctx_seq_rm_type_;
-        req.alora_invocation_start = (int32_t) alora_invocation_start;
-        req.reserved_blocks  = paged_task_reserved_blocks(task);
-        req.drop_cache_on_release = false;
         req.callback_on_release = [this](int32_t sid) {
             register_paged_prefix_cache_on_release(sid);
             paged_request_state * rel = get_paged_request_by_seq_id(sid);
@@ -2246,18 +2227,6 @@ private:
             }
         };
 
-        reset_runtime_state_for_new_request(req, "launch");
-        req.request_id = task.id;
-        req.parent_id  = task.id_parent;
-        req.phase      = task.is_child() ? PAGED_REQUEST_WAIT_PARENT : PAGED_REQUEST_STARTED;
-        req.t_arrival_us = ggml_time_us();
-        req.t_admitted_us = 0;
-        req.t_first_prefill_start_us = 0;
-        req.t_prefill_done_us = 0;
-        req.t_first_token_us = 0;
-        req.t_last_token_us = 0;
-        req.task = std::make_unique<const server_task>(std::move(task));
-
         // same-seq append only when dispatch verified this is a same-lineage continuation.
         if (paged_enable_same_seq_append_ && req.same_lineage_verified_for_launch) {
             SRV_INF("[paged-prefix] lookup request_id=%d mode=same-seq key=%s cached_tokens=%zu suffix_tokens=%zu\n",
@@ -2267,20 +2236,6 @@ private:
                         ? req.task->tokens.get_tokens().size() - req.prompt.tokens.get_tokens().size() : 0);
         }
         execute_prefix_reuse_plan(req);
-
-        // sampler
-        if (req.task->need_sampling()) {
-            try {
-                auto sampling_params = req.task->params.sampling;
-                req.smpl.reset(common_sampler_init(model, sampling_params));
-            } catch (std::exception & e) {
-                send_error(*req.task, std::string("Failed to initialize samplers: ") + e.what(), ERROR_TYPE_INVALID_REQUEST);
-                return false;
-            }
-            llama_set_sampler(ctx, req.seq_id, nullptr);
-        } else {
-            req.smpl.reset();
-        }
 
         if (paged_lifecycle && req.task) {
             paged_lifecycle->on_create(req, *req.task);
