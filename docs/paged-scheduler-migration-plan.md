@@ -280,8 +280,9 @@ Reason: questi componenti formano il nucleo allocation/admission e hanno meno di
 
 Stato parziale: prefix reuse estratto in `server_scheduler::PagedPrefixReuse` in `tools/server/scheduler/paged_prefix_reuse.{h,cpp}`. `server_context_impl` mantiene wrapper sottili per `build_prefix_reuse_metadata()` ed `execute_prefix_reuse_plan()`.
 
-- [ ] `launch_paged_request()` completo.
+- [x] `launch_paged_request()` completo: `server_context_impl` ora delega a `PagedRequestLauncher::launch()` e mantiene solo reset del contatore empty/log finale.
 - [x] Preparazione base launch paged estratta in `server_scheduler::PagedRequestLauncher` (`tools/server/scheduler/paged_request_launcher.{h,cpp}`).
+- [x] Release callback, prefix reuse call e lifecycle create/admit spostati in `PagedRequestLauncher::launch()`.
 - [x] `execute_prefix_reuse_plan()`.
 - [x] `build_prefix_reuse_metadata()`.
 - [ ] `register_paged_prefix_cache_on_release()` solo se prima si chiarisce ownership con `RequestLifecycle`.

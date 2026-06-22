@@ -2192,6 +2192,8 @@ private:
             /*ctx_seq_rm_type=*/ctx_seq_rm_type_,
             /*n_ctx_slot=*/n_ctx_slot_,
             /*paged_blocks_per_seq=*/paged_blocks_per_seq_,
+            /*paged_enable_same_seq_append=*/paged_enable_same_seq_append_,
+            /*lifecycle_enabled=*/paged_lifecycle != nullptr,
             /*construct_lora_list=*/[this](const std::map<int, float> & config) {
                 return construct_lora_list(config);
             },
@@ -2204,6 +2206,30 @@ private:
             /*send_error=*/[this](const server_task & t, const std::string & msg, error_type type) {
                 send_error(t, msg, type);
             },
+            /*register_prefix_cache_on_release=*/[this](int32_t seq_id) {
+                register_paged_prefix_cache_on_release(seq_id);
+            },
+            /*find_request_by_seq_id=*/[this](int32_t seq_id) -> server_scheduler::RequestState * {
+                return get_paged_request_by_seq_id(seq_id);
+            },
+            /*lifecycle_release_request=*/[this](paged_request_state & r) {
+                paged_lifecycle->release_request(r);
+            },
+            /*core_on_request_finished=*/[this](int32_t seq_id) {
+                paged_core.on_request_finished(seq_id);
+            },
+            /*lifecycle_on_create=*/[this](paged_request_state & r, const server_task & t) {
+                paged_lifecycle->on_create(r, t);
+            },
+            /*lifecycle_on_admit=*/[this](paged_request_state & r) {
+                paged_lifecycle->on_admit(r);
+            },
+            /*core_on_request_started=*/[this](int32_t seq_id) {
+                paged_core.on_request_started(seq_id);
+            },
+            /*execute_prefix_reuse_plan=*/[this](paged_request_state & r) {
+                execute_prefix_reuse_plan(r);
+            },
         });
     }
 
@@ -2213,41 +2239,13 @@ private:
         GGML_ASSERT(params_base.scheduler == "paged");
 
         auto launcher = make_paged_request_launcher();
-        if (!launcher.prepare_base(req, std::move(task))) {
+        if (!launcher.launch(req, std::move(task))) {
             return false;
-        }
-
-        req.callback_on_release = [this](int32_t sid) {
-            register_paged_prefix_cache_on_release(sid);
-            paged_request_state * rel = get_paged_request_by_seq_id(sid);
-            if (paged_lifecycle && rel) {
-                paged_lifecycle->release_request(*rel);
-            } else {
-                paged_core.on_request_finished(sid);
-            }
-        };
-
-        // same-seq append only when dispatch verified this is a same-lineage continuation.
-        if (paged_enable_same_seq_append_ && req.same_lineage_verified_for_launch) {
-            SRV_INF("[paged-prefix] lookup request_id=%d mode=same-seq key=%s cached_tokens=%zu suffix_tokens=%zu\n",
-                    req.request_id, req.lineage_key.c_str(),
-                    req.prompt.tokens.get_tokens().size(),
-                    req.task->tokens.get_tokens().size() > req.prompt.tokens.get_tokens().size()
-                        ? req.task->tokens.get_tokens().size() - req.prompt.tokens.get_tokens().size() : 0);
-        }
-        execute_prefix_reuse_plan(req);
-
-        if (paged_lifecycle && req.task) {
-            paged_lifecycle->on_create(req, *req.task);
-            paged_lifecycle->on_admit(req);
         }
 
         n_empty_consecutive = 0;
         SRV_INF("[paged] launched request seq_id=%d, task=%d, is_child=%d\n",
                 req.seq_id, req.request_id, req.task->is_child() ? 1 : 0);
-        if (!paged_lifecycle) {
-            paged_core.on_request_started(req.seq_id);
-        }
         return true;
     }
 

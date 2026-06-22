@@ -88,6 +88,53 @@ bool PagedRequestLauncher::prepare_base(RequestState & req, server_task && task)
     return true;
 }
 
+bool PagedRequestLauncher::launch(RequestState & req, server_task && task) const {
+    if (!prepare_base(req, std::move(task))) {
+        return false;
+    }
+
+    auto register_prefix_cache_on_release = config_.register_prefix_cache_on_release;
+    auto find_request_by_seq_id = config_.find_request_by_seq_id;
+    auto lifecycle_release_request = config_.lifecycle_release_request;
+    auto core_on_request_finished = config_.core_on_request_finished;
+    const bool lifecycle_enabled = config_.lifecycle_enabled;
+    req.callback_on_release = [
+            register_prefix_cache_on_release,
+            find_request_by_seq_id,
+            lifecycle_release_request,
+            core_on_request_finished,
+            lifecycle_enabled](int32_t seq_id) {
+        if (register_prefix_cache_on_release) {
+            register_prefix_cache_on_release(seq_id);
+        }
+        RequestState * rel = find_request_by_seq_id ? find_request_by_seq_id(seq_id) : nullptr;
+        if (lifecycle_enabled && rel) {
+            lifecycle_release_request(*rel);
+        } else if (core_on_request_finished) {
+            core_on_request_finished(seq_id);
+        }
+    };
+
+    if (config_.paged_enable_same_seq_append && req.same_lineage_verified_for_launch) {
+        SRV_INF("[paged-prefix] lookup request_id=%d mode=same-seq key=%s cached_tokens=%zu suffix_tokens=%zu\n",
+                req.request_id, req.lineage_key.c_str(),
+                req.prompt.tokens.get_tokens().size(),
+                req.task->tokens.get_tokens().size() > req.prompt.tokens.get_tokens().size()
+                    ? req.task->tokens.get_tokens().size() - req.prompt.tokens.get_tokens().size() : 0);
+    }
+
+    config_.execute_prefix_reuse_plan(req);
+
+    if (config_.lifecycle_enabled && req.task) {
+        config_.lifecycle_on_create(req, *req.task);
+        config_.lifecycle_on_admit(req);
+    } else if (config_.core_on_request_started) {
+        config_.core_on_request_started(req.seq_id);
+    }
+
+    return true;
+}
+
 int32_t PagedRequestLauncher::task_reserved_blocks(const server_task & task) const {
     return paged_task_reserved_blocks(
         task,
