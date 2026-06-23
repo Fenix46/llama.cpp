@@ -16,6 +16,7 @@
 #include "scheduler/paged_request_allocator.h"
 #include "scheduler/paged_prefix_reuse.h"
 #include "scheduler/paged_request_launcher.h"
+#include "scheduler/scheduler_backend.h"
 #include "scheduler/paged_cache_sweeper.h"
 #include "scheduler/paged_schedule_builder.h"
 #include "scheduler/paged_prefill_decode_policy.h"
@@ -748,6 +749,11 @@ private:
     std::unique_ptr<server_scheduler::RequestLifecycle> paged_lifecycle;
     bool paged_orchestrator_v2_ = true;
 
+    // Scheduler backend boundary (migration Fase 1). A thin wrapper that routes
+    // launch/cancel/tick to either the paged or legacy slot path. Created in
+    // init() once the scheduler mode is known.
+    std::unique_ptr<server_scheduler::ServerSchedulerBackend> backend_;
+
     // Experimental cross-slot KV prefix cache (--kv-prefix-cache).
     // Null when flag is off. Registered on slot release, invalidated on eviction.
     std::unique_ptr<server_scheduler::PrefixReuseManager> prefix_cache_;
@@ -1440,12 +1446,31 @@ private:
         GGML_ASSERT(model != nullptr);
         GGML_ASSERT(!sleeping);
 
+        // select scheduler backend (migration Fase 1): thin wrappers that route
+        // launch/cancel/tick to the paged or legacy slot path. The hot loop now
+        // dispatches through this boundary instead of branching inline.
+        if (params_base.scheduler == "paged") {
+            backend_ = std::make_unique<server_scheduler::CallbackSchedulerBackend>(
+                server_scheduler::CallbackSchedulerBackend::Callbacks{
+                    /*launch_completion=*/[this](server_task && t) { launch_completion_paged(std::move(t)); },
+                    /*cancel=*/[this](int id_target) { cancel_paged(id_target); },
+                    /*tick=*/[this]() { update_slots(); },
+                });
+        } else {
+            backend_ = std::make_unique<server_scheduler::CallbackSchedulerBackend>(
+                server_scheduler::CallbackSchedulerBackend::Callbacks{
+                    /*launch_completion=*/[this](server_task && t) { launch_completion_legacy(std::move(t)); },
+                    /*cancel=*/[this](int id_target) { cancel_legacy(id_target); },
+                    /*tick=*/[this]() { update_slots(); },
+                });
+        }
+
         // wiring up server queues
         queue_tasks.on_new_task([this](server_task && task) {
             process_single_task(std::move(task));
         });
         queue_tasks.on_update_slots([this]() {
-            update_slots();
+            backend_->tick();
         });
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
@@ -3541,6 +3566,167 @@ private:
                 cur.pos_max, cur.n_tokens, (float) cur.data.size() / 1024 / 1024);
     }
 
+    // Paged-scheduler launch path for a COMPLETION/INFILL/EMBEDDING/RERANK task.
+    // Handles admission/defer and launch directly on paged_request_state.
+    void launch_completion_paged(server_task && task) {
+        const int id_slot = task.id_slot;
+        const int id_task = task.id;
+
+        if (!paged_admission_available(task)) {
+            queue_tasks.defer(std::move(task));
+            return;
+        }
+
+        if (id_slot != -1) {
+            // In paged mode id_slot is repurposed as a lineage key, not a
+            // slot index. Same-lineage reuse is handled by try_lineage_reuse().
+            SRV_DBG("[paged-lineage] using id_slot=%d as lineage key request_id=%d\n",
+                    id_slot, id_task);
+        }
+        if (!task.lineage_key.empty()) {
+            SRV_DBG("[paged-lineage] derive request_id=%d key=%s\n",
+                    id_task, task.lineage_key.c_str());
+        }
+
+        if (task.is_parent()) {
+            const size_t n_children = task.child_tasks.size();
+            const int    id_parent  = task.id;
+
+            // acquire entries for all children + parent
+            std::vector<paged_request_state *> child_reqs;
+            child_reqs.reserve(n_children);
+            bool ok = true;
+            for (size_t ci = 0; ci < n_children; ++ci) {
+                paged_request_state * cr = get_or_create_paged_request(task.child_tasks[ci]);
+                if (!cr) {
+                    SRV_DBG("[paged] not enough capacity for child tasks, defer id_task=%d\n", id_task);
+                    ok = false;
+                    break;
+                }
+                child_reqs.push_back(cr);
+            }
+            if (!ok) {
+                queue_tasks.defer(std::move(task));
+                return;
+            }
+
+            paged_request_state * parent_req = get_or_create_paged_request(task);
+            if (!parent_req) {
+                SRV_DBG("[paged] not enough capacity for parent task, defer id_task=%d\n", id_task);
+                queue_tasks.defer(std::move(task));
+                return;
+            }
+
+            auto release_acquired = [&]() {
+                for (auto & req : paged_requests) {
+                    if (req.is_processing() && (
+                            req.request_id == id_parent ||
+                            req.parent_id  == id_parent)) {
+                        req.release();
+                    }
+                }
+            };
+
+            for (size_t ci = 0; ci < n_children; ++ci) {
+                if (!launch_paged_request(*child_reqs[ci], std::move(task.child_tasks[ci]))) {
+                    SRV_ERR("[paged] failed to launch child task ci=%zu\n", ci);
+                    release_acquired();
+                    return;
+                }
+            }
+            if (!launch_paged_request(*parent_req, std::move(task))) {
+                SRV_ERR("[paged] failed to launch parent task id=%d\n", id_parent);
+                release_acquired();
+                return;
+            }
+        } else {
+            paged_request_state * req = get_or_create_paged_request(task);
+            if (!req) {
+                SRV_DBG("[paged] no capacity, defer id_task=%d\n", id_task);
+                queue_tasks.defer(std::move(task));
+                return;
+            }
+            if (!launch_paged_request(*req, std::move(task))) {
+                SRV_ERR("[paged] failed to launch task id=%d\n", id_task);
+                return;
+            }
+        }
+    }
+
+    // Legacy slot-based launch path for a COMPLETION/INFILL/EMBEDDING/RERANK task.
+    void launch_completion_legacy(server_task && task) {
+        const int id_slot = task.id_slot;
+        const int id_task = task.id;
+
+        if (!paged_admission_available(task)) {
+            queue_tasks.defer(std::move(task));
+            return;
+        }
+
+        server_slot * slot = id_slot != -1 ? get_slot_by_id(id_slot) : get_available_slot(task);
+
+        if (slot == nullptr) {
+            SRV_DBG("no slot is available, defer task, id_task = %d\n", id_task);
+            queue_tasks.defer(std::move(task));
+            return;
+        }
+
+        if (slot->is_processing()) {
+            SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", id_task);
+            queue_tasks.defer(std::move(task));
+            return;
+        }
+
+        if (task.is_parent()) {
+            size_t n_child_tasks = task.child_tasks.size();
+            std::vector<server_slot *> child_slots = get_free_slots(n_child_tasks, slot->seq_id());
+            if (child_slots.size() < n_child_tasks) {
+                SRV_DBG("not enough free slots for child tasks, n_free = %zu, n_children = %zu, defer task, id_task = %d\n", child_slots.size(), n_child_tasks, id_task);
+                queue_tasks.defer(std::move(task));
+                return;
+            }
+            if (!launch_slots_with_parent_task(*slot, child_slots, std::move(task))) {
+                SRV_ERR("failed to launch slot with parent task, id_task = %d\n", id_task);
+                return;
+            }
+        } else if (!launch_slot_with_task(*slot, std::move(task))) {
+            SRV_ERR("failed to launch slot with task, id_task = %d\n", id_task);
+            return;
+        }
+
+        if (params_base.cache_idle_slots) {
+            for (auto & s : slots) {
+                if (!s.is_processing()) {
+                    slot_save_and_clear(s);
+                }
+            }
+        }
+    }
+
+    void cancel_paged(int id_target) {
+        for (auto & req : paged_requests) {
+            if (req.task && req.task->id == id_target) {
+                // Defer KV teardown to the normal release path.
+                if (paged_lifecycle) {
+                    paged_lifecycle->abort_request(req, "cancelled");
+                } else {
+                    mark_request_uncacheable(req, "cancelled");
+                }
+                req.release();
+                break;
+            }
+        }
+    }
+
+    void cancel_legacy(int id_target) {
+        for (auto & slot : slots) {
+            if (slot.task && slot.task->id == id_target) {
+                slot.release();
+                break;
+            }
+        }
+    }
+
     void process_single_task(server_task && task) {
         switch (task.type) {
             case SERVER_TASK_TYPE_COMPLETION:
@@ -3556,156 +3742,11 @@ private:
                         }
                     }
 
-                    const int id_slot = task.id_slot;
-                    const int id_task = task.id;
-
-                    if (!paged_admission_available(task)) {
-                        queue_tasks.defer(std::move(task));
-                        break;
-                    }
-
-                    // ---- paged scheduler: work directly with paged_request_state ----
-                    if (params_base.scheduler == "paged") {
-                        if (id_slot != -1) {
-                            // In paged mode id_slot is repurposed as a lineage key, not a
-                            // slot index. Same-lineage reuse is handled by try_lineage_reuse().
-                            SRV_DBG("[paged-lineage] using id_slot=%d as lineage key request_id=%d\n",
-                                    id_slot, id_task);
-                        }
-                        if (!task.lineage_key.empty()) {
-                            SRV_DBG("[paged-lineage] derive request_id=%d key=%s\n",
-                                    id_task, task.lineage_key.c_str());
-                        }
-
-                        if (task.is_parent()) {
-                            const size_t n_children = task.child_tasks.size();
-                            const int    id_parent  = task.id;
-
-                            // acquire entries for all children + parent
-                            std::vector<paged_request_state *> child_reqs;
-                            child_reqs.reserve(n_children);
-                            bool ok = true;
-                            for (size_t ci = 0; ci < n_children; ++ci) {
-                                paged_request_state * cr = get_or_create_paged_request(task.child_tasks[ci]);
-                                if (!cr) {
-                                    SRV_DBG("[paged] not enough capacity for child tasks, defer id_task=%d\n", id_task);
-                                    ok = false;
-                                    break;
-                                }
-                                child_reqs.push_back(cr);
-                            }
-                            if (!ok) {
-                                queue_tasks.defer(std::move(task));
-                                break;
-                            }
-
-                            paged_request_state * parent_req = get_or_create_paged_request(task);
-                            if (!parent_req) {
-                                SRV_DBG("[paged] not enough capacity for parent task, defer id_task=%d\n", id_task);
-                                queue_tasks.defer(std::move(task));
-                                break;
-                            }
-
-                            auto release_acquired = [&]() {
-                                for (auto & req : paged_requests) {
-                                    if (req.is_processing() && (
-                                            req.request_id == id_parent ||
-                                            req.parent_id  == id_parent)) {
-                                        req.release();
-                                    }
-                                }
-                            };
-
-                            for (size_t ci = 0; ci < n_children; ++ci) {
-                                if (!launch_paged_request(*child_reqs[ci], std::move(task.child_tasks[ci]))) {
-                                    SRV_ERR("[paged] failed to launch child task ci=%zu\n", ci);
-                                    release_acquired();
-                                    break;
-                                }
-                            }
-                            if (!launch_paged_request(*parent_req, std::move(task))) {
-                                SRV_ERR("[paged] failed to launch parent task id=%d\n", id_parent);
-                                release_acquired();
-                                break;
-                            }
-                        } else {
-                            paged_request_state * req = get_or_create_paged_request(task);
-                            if (!req) {
-                                SRV_DBG("[paged] no capacity, defer id_task=%d\n", id_task);
-                                queue_tasks.defer(std::move(task));
-                                break;
-                            }
-                            if (!launch_paged_request(*req, std::move(task))) {
-                                SRV_ERR("[paged] failed to launch task id=%d\n", id_task);
-                                break;
-                            }
-                        }
-                        break; // done with paged dispatch
-                    }
-
-                    // ---- legacy slot-based scheduler ----
-                    server_slot * slot = id_slot != -1 ? get_slot_by_id(id_slot) : get_available_slot(task);
-
-                    if (slot == nullptr) {
-                        SRV_DBG("no slot is available, defer task, id_task = %d\n", id_task);
-                        queue_tasks.defer(std::move(task));
-                        break;
-                    }
-
-                    if (slot->is_processing()) {
-                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", id_task);
-                        queue_tasks.defer(std::move(task));
-                        break;
-                    }
-
-                    if (task.is_parent()) {
-                        size_t n_child_tasks = task.child_tasks.size();
-                        std::vector<server_slot *> child_slots = get_free_slots(n_child_tasks, slot->seq_id());
-                        if (child_slots.size() < n_child_tasks) {
-                            SRV_DBG("not enough free slots for child tasks, n_free = %zu, n_children = %zu, defer task, id_task = %d\n", child_slots.size(), n_child_tasks, id_task);
-                            queue_tasks.defer(std::move(task));
-                            break;
-                        }
-                        if (!launch_slots_with_parent_task(*slot, child_slots, std::move(task))) {
-                            SRV_ERR("failed to launch slot with parent task, id_task = %d\n", id_task);
-                            break;
-                        }
-                    } else if (!launch_slot_with_task(*slot, std::move(task))) {
-                        SRV_ERR("failed to launch slot with task, id_task = %d\n", id_task);
-                        break;
-                    }
-
-                    if (params_base.cache_idle_slots) {
-                        for (auto & s : slots) {
-                            if (!s.is_processing()) {
-                                slot_save_and_clear(s);
-                            }
-                        }
-                    }
+                    backend_->launch_completion(std::move(task));
                 } break;
             case SERVER_TASK_TYPE_CANCEL:
                 {
-                    if (params_base.scheduler == "paged") {
-                        for (auto & req : paged_requests) {
-                            if (req.task && req.task->id == task.id_target) {
-                                // Defer KV teardown to the normal release path.
-                                if (paged_lifecycle) {
-                                    paged_lifecycle->abort_request(req, "cancelled");
-                                } else {
-                                    mark_request_uncacheable(req, "cancelled");
-                                }
-                                req.release();
-                                break;
-                            }
-                        }
-                    } else {
-                        for (auto & slot : slots) {
-                            if (slot.task && slot.task->id == task.id_target) {
-                                slot.release();
-                                break;
-                            }
-                        }
-                    }
+                    backend_->cancel(task.id_target);
                 } break;
             case SERVER_TASK_TYPE_NEXT_RESPONSE:
                 {
