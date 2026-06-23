@@ -4149,7 +4149,7 @@ private:
                 ctx,
                 batch,
                 n_batch,
-                params_base.scheduler == "paged",
+                /*paged_scheduler=*/true, // update_paged_tick() is the paged-only path
                 make_paged_decode_callbacks(
                     /*on_segment_decoded=*/make_paged_decode_metrics_callback(schedule_decision),
                     /*on_segment_sample=*/on_segment_sample_paged,
@@ -4221,7 +4221,7 @@ private:
                         ctx,
                         batch,
                         n_batch,
-                        params_base.scheduler == "paged",
+                        /*paged_scheduler=*/true, // update_paged_tick() is the paged-only path
                         make_paged_decode_callbacks(
                             /*on_segment_decoded=*/[]() {},
                             /*on_segment_sample=*/on_segment_sample_paged,
@@ -4373,7 +4373,10 @@ private:
         int32_t n_batch  = llama_n_batch(ctx);
         int32_t n_ubatch = llama_n_ubatch(ctx);
 
-        const bool is_paged_scheduler = params_base.scheduler == "paged";
+        // update_slots() is the legacy slot-only path; the paged scheduler runs
+        // entirely in update_paged_tick(). Kept as a named constant so the
+        // paged-specific budget branches below are trivially dead-eliminated.
+        const bool is_paged_scheduler = false;
         const int32_t decode_tokens_in_batch = batch.n_tokens;
         const int32_t prefill_budget = is_paged_scheduler ? std::max(0, n_batch - decode_tokens_in_batch) : n_batch;
         int32_t prefill_added = 0;
