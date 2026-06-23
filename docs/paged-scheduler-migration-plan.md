@@ -561,26 +561,51 @@ Ridurre callback sparse e rendere `RequestLifecycle` il punto centrale delle tra
 
 ### Task
 
-- [ ] Definire ownership per:
-  - create
-  - admit
-  - mark prefill
-  - mark decode
-  - finish
-  - abort
-  - release cached
-  - release uncached
-- [ ] Spostare aggiornamenti `paged_core` nel lifecycle dove possibile.
-- [ ] Spostare aggiornamenti `paged_seq_leases` nel lifecycle dove possibile.
-- [x] Spostare registrazione/release prefix cache nel lifecycle dove possibile; invalidation resta via callback dal lifecycle al server layer.
-- [ ] Spostare integrazione lineage nel lifecycle dove possibile.
-- [ ] Ridurre callback `callback_on_release` a un singolo entrypoint lifecycle.
+- [x] Definire ownership per ogni transizione: tutte passano da `RequestLifecycle`
+      (`request_lifecycle.{h,cpp}`):
+  - create → `on_create`
+  - admit → `on_admit` (chiama `scheduler_on_request_started` → `paged_core`)
+  - mark prefill → `mark_prefilling`
+  - mark decode → `mark_decoding`
+  - finish → `finish_request`
+  - abort → `abort_request` (mark-uncacheable + status Aborted)
+  - release cached/uncached → `release_request` + `register_prefix_cache_on_release`
+- [x] Spostare aggiornamenti `paged_core` nel lifecycle: `on_admit`/`release_request`
+      invocano `scheduler_on_request_started/finished` via ops, che aggiornano `paged_core`.
+- [x] Spostare aggiornamenti `paged_seq_leases` nel lifecycle: `register_prefix_cache_on_release`
+      chiama `seq_mark_cached`/`seq_release_uncached` via ops.
+- [x] Spostare registrazione/release prefix cache nel lifecycle; invalidation resta via callback dal lifecycle al server layer.
+- [x] Spostare integrazione lineage nel lifecycle: `lineage_register_cached` via ops da
+      `register_prefix_cache_on_release`.
+- [x] **Rimuovere i fallback legacy morti**: in paged mode `paged_lifecycle` è sempre
+      costruito (init), quindi i pattern `if (paged_lifecycle) { ... } else { <legacy> }`
+      erano codice morto irraggiungibile. Eliminati: 6 wrapper (`mark_request_uncacheable`,
+      `reset_runtime_state_for_new_request`, `clear_sequence_kv`,
+      `prepare_empty_sequence_for_prefix_copy`, `reset_paged_request_for_reprefill`,
+      `register_paged_prefix_cache_on_release`), la funzione
+      `register_paged_prefix_cache_on_release_legacy()` (~84 righe), e i guard in
+      `on_preempt_kv`, prefill `on_request_begin`/`on_hard_reset`, le 3 `finish_request`
+      (cmpl/embd/rerank) e `cancel_paged`.
+
+### Stato
+
+`RequestLifecycle` è ora l'unico owner delle transizioni paged. Le slot/lease/core/cache
+update passano tutte dalle sue ops. Verificato runtime (LFM2.5-1.2B, paged) che la
+release segue una sola pipeline ordinata:
+`status Prefilling→Decoding→Finished` → `finish` → `status Finished→Released` →
+`release` → `release-cache-check` → `release-runtime`. Cancel, concorrenza x4 e
+prefix reuse ok, server stabile.
+
+Nota: resta `lifecycle_enabled = (paged_lifecycle != nullptr)` passato al
+`PagedRequestLauncher` config (sempre true in paged mode) — semplificabile insieme al
+launcher in un passo successivo, non è un branch morto in `server-context.cpp`.
 
 ### Criteri di completamento
 
-- [ ] Una release paged segue una sola pipeline chiara.
-- [ ] Non ci sono doppi update inconsistenti tra core, leases e cache.
-- [ ] Cancel/preemption/release normale condividono percorsi prevedibili.
+- [x] Una release paged segue una sola pipeline chiara (verificato dai log lifecycle).
+- [x] Non ci sono doppi update inconsistenti tra core, leases e cache (single owner).
+- [x] Cancel/preemption/release normale condividono percorsi prevedibili (tutti via
+      `abort_request`/`finish_request`/`release_request`).
 
 ---
 

@@ -2045,142 +2045,35 @@ private:
         GGML_ASSERT(pos_min == -1 && pos_max == -1 && "paged seq clear invariant violated");
     }
 
+    // Paged-mode lifecycle wrappers. In paged mode `paged_lifecycle` is always
+    // constructed (see init()), so RequestLifecycle is the single owner of these
+    // transitions; these thin wrappers preserve existing call sites.
     void mark_request_uncacheable(paged_request_state & req, const char * reason) {
-        if (paged_lifecycle) {
-            paged_lifecycle->mark_uncacheable(req, reason);
-            return;
-        }
-        req.drop_cache_on_release = true;
+        paged_lifecycle->mark_uncacheable(req, reason);
     }
 
     void reset_runtime_state_for_new_request(paged_request_state & req, const char * reason) {
-        if (paged_lifecycle) {
-            paged_lifecycle->reset_runtime_state_for_new_request(req, reason);
-            return;
-        }
-        req.spec.clear_runtime();
-        req.output.reset();
+        paged_lifecycle->reset_runtime_state_for_new_request(req, reason);
     }
 
     void clear_sequence_kv(paged_request_state & req, const char * reason) {
-        if (paged_lifecycle) {
-            paged_lifecycle->clear_sequence_kv(req, reason);
-            return;
-        }
-        (void) reason;
+        paged_lifecycle->clear_sequence_kv(req, reason);
     }
 
     void prepare_empty_sequence_for_prefix_copy(paged_request_state & req, const char * reason) {
-        if (paged_lifecycle) {
-            paged_lifecycle->prepare_empty_sequence_for_prefix_copy(req, reason);
-            return;
-        }
-        clear_sequence_kv(req, reason);
+        paged_lifecycle->prepare_empty_sequence_for_prefix_copy(req, reason);
     }
 
     void reset_paged_request_for_reprefill(paged_request_state & req, const char * reason) {
-        if (paged_lifecycle) {
-            paged_lifecycle->reset_for_reprefill(req, reason);
-            return;
-        }
-        prepare_empty_sequence_for_prefix_copy(req, reason);
-        reset_runtime_state_for_new_request(req, reason);
+        paged_lifecycle->reset_for_reprefill(req, reason);
     }
 
     void register_paged_prefix_cache_on_release(int32_t seq_id) {
         paged_request_state * req = get_paged_request_by_seq_id(seq_id);
-        if (paged_lifecycle) {
-            (void) paged_lifecycle->register_prefix_cache_on_release(
-                req, seq_id, prefix_cache_ != nullptr, params_base.cache_ram_mib);
-            return;
-        }
-        register_paged_prefix_cache_on_release_legacy(seq_id, req);
+        (void) paged_lifecycle->register_prefix_cache_on_release(
+            req, seq_id, prefix_cache_ != nullptr, params_base.cache_ram_mib);
     }
 
-    void register_paged_prefix_cache_on_release_legacy(int32_t seq_id, paged_request_state * req) {
-        const bool cacheable_task =
-            req != nullptr &&
-            req->task &&
-            (req->task->type == SERVER_TASK_TYPE_COMPLETION || req->task->need_sampling());
-        const bool can_cache =
-            seq_id >= 0 &&
-            req != nullptr &&
-            req->task &&
-            !req->drop_cache_on_release &&
-            req->task->params.cache_prompt &&
-            cacheable_task &&
-            !req->prompt.tokens.has_mtmd &&
-            !req->prompt.tokens.empty();
-
-        SRV_WRN(
-            "[paged-release-cache-check] seq_id=%d req=%p task=%p can_cache=%d "
-            "drop=%d cache_prompt=%d task_type=%d has_mtmd=%d prompt_tokens=%zu "
-            "prefix_cache=%d cache_ram_mib=%d\n",
-            seq_id,
-            (void *) req,
-            req ? (const void *) req->task.get() : nullptr,
-            can_cache ? 1 : 0,
-            req ? (req->drop_cache_on_release ? 1 : 0) : -1,
-            (req && req->task) ? (req->task->params.cache_prompt ? 1 : 0) : -1,
-            (req && req->task) ? (int) req->task->type : -1,
-            req ? (req->prompt.tokens.has_mtmd ? 1 : 0) : -1,
-            req ? req->prompt.tokens.size() : 0,
-            prefix_cache_ ? 1 : 0,
-            params_base.cache_ram_mib);
-
-        if (can_cache) {
-            // Register block-entry cache (primary: physical block IDs survive seq release).
-            if (prefix_cache_) {
-                const std::vector<int32_t> seq_blocks =
-                    server_scheduler::BlockManager::get_physical_blocks_for_sequence(req->ctx, req->seq_id);
-                if (server_scheduler::BlockManager::retain_blocks_for_cache(req->ctx, seq_blocks)) {
-                    (void) prefix_cache_->register_finished_request(*req, build_prefix_reuse_metadata(*req), true, seq_blocks);
-                }
-                // Also keep legacy donor-seq index for CrossPrefixCopy fallback.
-                prefix_cache_->register_raw(seq_id, req->prompt.tokens.get_tokens());
-            }
-            // Phase 6: release runtime seq_id immediately; block-entry cache retains KV blocks.
-            // cached_seq_ids kept only as transitional fallback when no block-entry cache exists.
-            if (prefix_cache_) {
-                // Register lineage lease BEFORE prompt tokens are cleared.
-                if (lineage_mgr_ && !req->lineage_key.empty() && !req->prompt.tokens.empty()) {
-                    const int32_t req_index = (int32_t)(req - paged_requests.data());
-                    lineage_mgr_->on_release_cached(
-                        req->lineage_key,
-                        seq_id,
-                        req_index,
-                        ggml_time_us(),
-                        req->prompt.tokens.get_tokens());
-                }
-                SRV_INF("[paged-lifecycle] release runtime seq request_id=%d seq_id=%d\n",
-                        req ? req->request_id : -1, seq_id);
-                prepare_empty_sequence_for_prefix_copy(*req, "release-cached-seq");
-                reset_runtime_state_for_new_request(*req, "release-cached-seq");
-                paged_seq_leases.release_uncached(seq_id);
-                req->seq_id = -1;
-                req->prompt.checkpoints.clear();
-            } else {
-                paged_seq_leases.mark_cached(seq_id);
-            }
-        } else {
-            if (req != nullptr) {
-                prepare_empty_sequence_for_prefix_copy(*req, "release-uncached");
-                reset_runtime_state_for_new_request(*req, "release-uncached");
-            } else if (seq_id >= 0) {
-                prefix_cache_invalidate(seq_id);
-                server_scheduler::RequestState tmp;
-                tmp.ctx = ctx;
-                tmp.seq_id = seq_id;
-                (void) server_scheduler::BlockManager::clear_destination_sequence(tmp);
-                GGML_ASSERT(server_scheduler::BlockManager::seq_pos_min(ctx, seq_id) == -1);
-                GGML_ASSERT(server_scheduler::BlockManager::seq_pos_max(ctx, seq_id) == -1);
-            }
-            paged_seq_leases.release_uncached(seq_id);
-            if (req != nullptr) {
-                req->seq_id = -1;
-            }
-        }
-    }
 
     server_scheduler::PagedCacheSweeper make_paged_cache_sweeper() {
         return server_scheduler::PagedCacheSweeper({
@@ -2216,11 +2109,7 @@ private:
             /*on_preempt_kv=*/[this](int32_t preempted_seq_id) {
                 paged_request_state * victim = get_paged_request_by_seq_id(preempted_seq_id);
                 if (victim) {
-                    if (paged_lifecycle) {
-                        paged_lifecycle->abort_request(*victim, "kv-preemption");
-                    } else {
-                        mark_request_uncacheable(*victim, "kv-preemption");
-                    }
+                    paged_lifecycle->abort_request(*victim, "kv-preemption");
                     reset_paged_request_for_reprefill(*victim, "kv-preemption");
                     server_scheduler::BlockManager::release_runtime_sequence(*victim);
                     PGD_WRN(*victim, "preempted by scheduler due to KV pressure, seq_id=%d\n", preempted_seq_id);
@@ -2236,9 +2125,7 @@ private:
     server_scheduler::PrefillPassCallbacks make_paged_prefill_callbacks() {
         return server_scheduler::PrefillPassCallbacks{
             /*on_request_begin=*/[this](paged_request_state & r) {
-                if (paged_lifecycle) {
-                    paged_lifecycle->mark_prefilling(r);
-                }
+                paged_lifecycle->mark_prefilling(r);
                 PGD_INF(r, "new prompt, n_ctx=%d, n_keep=%d, task.n_tokens=%d\n",
                         r.n_ctx, r.task->params.n_keep, r.task->n_tokens());
             },
@@ -2279,11 +2166,7 @@ private:
                 /*on_hard_reset=*/[this](paged_request_state & r, const char * reason) {
                     if (reason && std::string_view(reason) == "truncate-failed") {
                         ++paged_truncate_failed_;
-                        if (paged_lifecycle) {
-                            paged_lifecycle->abort_request(r, "truncate-failed");
-                        } else {
-                            mark_request_uncacheable(r, "truncate-failed");
-                        }
+                        paged_lifecycle->abort_request(r, "truncate-failed");
                     }
                     reset_paged_request_for_reprefill(r, reason);
                 },
@@ -3293,9 +3176,7 @@ private:
     }
 
     void send_final_response(paged_request_state & req) {
-        if (paged_lifecycle) {
-            paged_lifecycle->finish_request(req);
-        }
+        paged_lifecycle->finish_request(req);
         auto res = std::make_unique<server_task_result_cmpl_final>();
 
         res->id      = req.task->id;
@@ -3392,9 +3273,7 @@ private:
     // --- end paged overloads ---
 
     void send_embedding(const paged_request_state & req, const llama_batch & batch) {
-        if (paged_lifecycle) {
-            paged_lifecycle->finish_request(req);
-        }
+        paged_lifecycle->finish_request(req);
         auto res = std::make_unique<server_task_result_embd>();
         res->id        = req.task->id;
         res->index     = req.task->index;
@@ -3432,9 +3311,7 @@ private:
     }
 
     void send_rerank(const paged_request_state & req, const llama_batch & batch) {
-        if (paged_lifecycle) {
-            paged_lifecycle->finish_request(req);
-        }
+        paged_lifecycle->finish_request(req);
         auto res = std::make_unique<server_task_result_rerank>();
         res->id       = req.task->id;
         res->index    = req.task->index;
@@ -3829,11 +3706,7 @@ private:
         for (auto & req : paged_requests) {
             if (req.task && req.task->id == id_target) {
                 // Defer KV teardown to the normal release path.
-                if (paged_lifecycle) {
-                    paged_lifecycle->abort_request(req, "cancelled");
-                } else {
-                    mark_request_uncacheable(req, "cancelled");
-                }
+                paged_lifecycle->abort_request(req, "cancelled");
                 req.release();
                 break;
             }
