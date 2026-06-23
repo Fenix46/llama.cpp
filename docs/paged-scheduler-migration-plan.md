@@ -363,8 +363,8 @@ Boundary introdotta (commit `dfaf210e2`). `server_context_impl` ora dispatcha la
 ### Criteri di completamento
 
 - [x] Il server compila.
-- [ ] Legacy scheduler mantiene completions base. (build OK; runtime smoke test non eseguito — modello non disponibile)
-- [ ] Paged scheduler mantiene completions base. (build OK; runtime smoke test non eseguito — modello non disponibile)
+- [x] Legacy scheduler mantiene completions base. Verificato runtime (gemma-4-E2B): non-stream, stream (10 chunk), concorrenza x2, `/slots` ok.
+- [x] Paged scheduler mantiene completions base. Verificato runtime (gemma-4-E2B): non-stream, stream (10 chunk), concorrenza x3, cancel (server sopravvive, abort_request loggato).
 - [x] `server_context_impl` sceglie un backend, anche se la logica è ancora parzialmente delegata.
 
 ---
