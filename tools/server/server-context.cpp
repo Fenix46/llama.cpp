@@ -16,6 +16,7 @@
 #include "scheduler/paged_request_allocator.h"
 #include "scheduler/paged_prefix_reuse.h"
 #include "scheduler/paged_request_launcher.h"
+#include "scheduler/paged_cache_sweeper.h"
 #include "scheduler/reservation_model.h"
 #include "scheduler/request_lifecycle.h"
 #include "scheduler/sampling_executor.h"
@@ -2029,6 +2030,23 @@ private:
         }
     }
 
+    server_scheduler::PagedCacheSweeper make_paged_cache_sweeper() {
+        return server_scheduler::PagedCacheSweeper({
+            /*ctx=*/ctx,
+            /*paged_requests=*/&paged_requests,
+            /*paged_seq_leases=*/&paged_seq_leases,
+            /*prefix_cache=*/prefix_cache_.get(),
+            /*lineage_mgr=*/lineage_mgr_.get(),
+            /*paged_kv_ttl_us=*/paged_kv_ttl_us_,
+            /*paged_last_sweep_us=*/&paged_last_sweep_us_,
+            /*sweep_interval_us=*/PAGED_SWEEP_INTERVAL_US,
+            /*paged_total_blocks=*/paged_total_blocks_,
+            /*prefix_cache_invalidate=*/[this](int32_t seq_id) {
+                prefix_cache_invalidate(seq_id);
+            },
+        });
+    }
+
     server_scheduler::PagedPrefixReuse make_paged_prefix_reuse() {
         return server_scheduler::PagedPrefixReuse({
             /*params_base=*/&params_base,
@@ -3603,49 +3621,7 @@ private:
         // ----------------------------------------------------------------
         if (params_base.scheduler == "paged") {
             // 0. periodic TTL/LRU sweep of cached KV blocks
-            {
-                const int64_t now_us = ggml_time_us();
-                const bool need_sweep = (paged_kv_ttl_us_ > 0 || lineage_mgr_) &&
-                                        (now_us - paged_last_sweep_us_) >= PAGED_SWEEP_INTERVAL_US;
-                if (need_sweep) {
-                    paged_last_sweep_us_ = now_us;
-                    // Sweep request-level KV: evict idle cached entries past TTL, then LRU under pressure.
-                    server_scheduler::BlockManager::TTLEvictResult bev;
-                    if (paged_kv_ttl_us_ > 0) {
-                        const int32_t n_free = llama_kv_cache_n_free_blocks(llama_get_memory(ctx));
-                        const bool pressure = paged_total_blocks_ > 0 && n_free < (paged_total_blocks_ / 4);
-                        bev = server_scheduler::BlockManager::evict_expired_cached_blocks(
-                            paged_requests, now_us, paged_kv_ttl_us_, pressure, 0);
-                    }
-                    if (bev.evicted_entries > 0) {
-                        for (auto & req : paged_requests) {
-                            if (!req.is_processing() && req.prompt.n_tokens() == 0 && req.seq_id >= 0) {
-                                if (lineage_mgr_) {
-                                    lineage_mgr_->on_seq_reclaimed(req.seq_id);
-                                }
-                                prefix_cache_invalidate(req.seq_id);
-                                (void) server_scheduler::BlockManager::clear_destination_sequence(req);
-                                paged_seq_leases.release_uncached(req.seq_id);
-                                req.seq_id = -1;
-                                req.prompt.checkpoints.clear();
-                            }
-                        }
-                    }
-                    // Sweep block-cache entries (PrefixReuseManager).
-                    if (prefix_cache_) {
-                        (void) prefix_cache_->sweep_expired(now_us, paged_kv_ttl_us_);
-                    }
-                    // Sweep lineage TTL: evict expired idle lineage leases.
-                    if (lineage_mgr_) {
-                        std::vector<std::string> evicted_keys;
-                        const auto lev = lineage_mgr_->sweep(now_us, evicted_keys);
-                        if (lev.evicted > 0) {
-                            SRV_INF("[paged-lineage] ttl-sweep evicted=%zu active=%zu\n",
-                                    lev.evicted, lineage_mgr_->size());
-                        }
-                    }
-                }
-            }
+            make_paged_cache_sweeper().maybe_sweep();
 
             // 1. all-idle check
             {

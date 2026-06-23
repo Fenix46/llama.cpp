@@ -426,7 +426,7 @@ Rimuovere il grosso branch paged da `update_slots()`.
 ### Task
 
 - [ ] Creare metodo `PagedSchedulerBackend::tick()`.
-- [ ] Spostare sweep TTL/LRU paged.
+- [x] Spostare sweep TTL/LRU paged in `server_scheduler::PagedCacheSweeper` (`tools/server/scheduler/paged_cache_sweeper.{h,cpp}`).
 - [ ] Spostare costruzione schedule decision.
 - [ ] Spostare policy prefill/decode.
 - [ ] Spostare callbacks di prefill.

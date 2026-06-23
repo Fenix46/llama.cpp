@@ -36,6 +36,8 @@ add_library(${TARGET} STATIC
     scheduler/paged_prefix_reuse.h
     scheduler/paged_request_launcher.cpp
     scheduler/paged_request_launcher.h
+    scheduler/paged_cache_sweeper.cpp
+    scheduler/paged_cache_sweeper.h
     scheduler/reservation_model.cpp
     scheduler/reservation_model.h
     scheduler/block_manager.cpp
