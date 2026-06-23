@@ -883,6 +883,131 @@ private:
         }
     }
 
+    // Paged-mode slot actions operate directly on a leased llama sequence id.
+    // In paged mode the public /slots handle (`id_slot`) is the runtime seq_id,
+    // not a persistent slot index (there are no server_slot objects).
+    // Returns true if the action was handled (result/error already sent).
+    bool handle_paged_slot_action(server_task & task) {
+        const int seq_id = task.slot_action.id_slot;
+
+        switch (task.type) {
+            case SERVER_TASK_TYPE_SLOT_SAVE:
+                {
+                    // Save requires a live KV state: the seq must be active
+                    // (an in-flight request) or cached (released-but-retained).
+                    const bool live = paged_seq_leases.is_active(seq_id) ||
+                                      paged_seq_leases.cached_seq_ids.count(seq_id) > 0;
+                    if (seq_id < 0 || !live) {
+                        send_error(task,
+                            "seq_id has no live KV state to save (not active or cached)",
+                            ERROR_TYPE_INVALID_REQUEST);
+                        return true;
+                    }
+
+                    const int64_t t_start = ggml_time_us();
+
+                    // Token count and token data come from the active request if
+                    // present; a cached seq has no live token vector, so we save
+                    // whatever llama holds and report the byte count.
+                    paged_request_state * req = get_paged_request_by_seq_id(seq_id);
+                    llama_tokens         empty;
+                    const llama_tokens & tokens =
+                        (req != nullptr) ? req->prompt.tokens.get_tokens() : empty;
+                    const size_t token_count = tokens.size();
+
+                    const size_t nwrite = llama_state_seq_save_file(
+                        ctx, task.slot_action.filepath.c_str(), seq_id,
+                        tokens.data(), token_count);
+
+                    const double t_save_ms = (ggml_time_us() - t_start) / 1000.0;
+
+                    auto res      = std::make_unique<server_task_result_slot_save_load>();
+                    res->id       = task.id;
+                    res->id_slot  = seq_id;
+                    res->filename = task.slot_action.filename;
+                    res->is_save  = true;
+                    res->n_tokens = token_count;
+                    res->n_bytes  = nwrite;
+                    res->t_ms     = t_save_ms;
+                    queue_results.send(std::move(res));
+                    SRV_INF("[paged-slot] save seq_id=%d tokens=%zu bytes=%zu\n",
+                            seq_id, token_count, nwrite);
+                    return true;
+                }
+            case SERVER_TASK_TYPE_SLOT_RESTORE:
+                {
+                    // Restore leases the requested seq from the free pool, loads
+                    // the KV state, then marks it cached for future lineage reuse.
+                    if (paged_seq_leases.lease_specific(seq_id) != seq_id) {
+                        send_error(task,
+                            "seq_id busy or out of range (cannot lease for restore)",
+                            ERROR_TYPE_INVALID_REQUEST);
+                        return true;
+                    }
+
+                    const int64_t t_start = ggml_time_us();
+
+                    llama_tokens tokens;
+                    tokens.resize(std::max(1, n_ctx_slot_));
+                    size_t token_count = 0;
+                    const size_t nread = llama_state_seq_load_file(
+                        ctx, task.slot_action.filepath.c_str(), seq_id,
+                        tokens.data(), tokens.size(), &token_count);
+
+                    if (nread == 0) {
+                        // Loading failed: drop any partial KV and free the lease.
+                        llama_memory_seq_rm(llama_get_memory(ctx), seq_id, -1, -1);
+                        paged_seq_leases.release_uncached(seq_id);
+                        send_error(task,
+                            "Unable to restore seq: no KV space or invalid save file",
+                            ERROR_TYPE_INVALID_REQUEST);
+                        return true;
+                    }
+
+                    // Retain the restored KV as a cached seq, available for reuse.
+                    paged_seq_leases.mark_cached(seq_id);
+
+                    const double t_restore_ms = (ggml_time_us() - t_start) / 1000.0;
+
+                    auto res      = std::make_unique<server_task_result_slot_save_load>();
+                    res->id       = task.id;
+                    res->id_slot  = seq_id;
+                    res->filename = task.slot_action.filename;
+                    res->is_save  = false;
+                    res->n_tokens = token_count;
+                    res->n_bytes  = nread;
+                    res->t_ms     = t_restore_ms;
+                    queue_results.send(std::move(res));
+                    SRV_INF("[paged-slot] restore seq_id=%d tokens=%zu bytes=%zu\n",
+                            seq_id, token_count, nread);
+                    return true;
+                }
+            case SERVER_TASK_TYPE_SLOT_ERASE:
+                {
+                    if (paged_seq_leases.is_active(seq_id)) {
+                        send_error(task,
+                            "seq_id is active (in-flight request); cancel it before erase",
+                            ERROR_TYPE_INVALID_REQUEST);
+                        return true;
+                    }
+
+                    prefix_cache_invalidate(seq_id);
+                    llama_memory_seq_rm(llama_get_memory(ctx), seq_id, -1, -1);
+                    paged_seq_leases.release_uncached(seq_id);
+
+                    auto res      = std::make_unique<server_task_result_slot_erase>();
+                    res->id       = task.id;
+                    res->id_slot  = seq_id;
+                    res->n_erased = 0; // paged seq has no live token count to report
+                    queue_results.send(std::move(res));
+                    SRV_INF("[paged-slot] erase seq_id=%d\n", seq_id);
+                    return true;
+                }
+            default:
+                return false;
+        }
+    }
+
     // Initialize (or re-initialize) a slot's fields and callback.
     // Called both from the initial slot setup loop and from dynamic slot creation.
     void init_slot(server_slot & slot, int id, int n_ctx_slot, common_context_seq_rm_type ctx_seq_rm_type) {
@@ -3835,6 +3960,10 @@ private:
                     if (!check_no_mtmd(task.id)) {
                         break;
                     }
+                    if (params_base.scheduler == "paged") {
+                        handle_paged_slot_action(task);
+                        break;
+                    }
 
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
@@ -3874,6 +4003,10 @@ private:
             case SERVER_TASK_TYPE_SLOT_RESTORE:
                 {
                     if (!check_no_mtmd(task.id)) break;
+                    if (params_base.scheduler == "paged") {
+                        handle_paged_slot_action(task);
+                        break;
+                    }
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
@@ -3921,6 +4054,10 @@ private:
             case SERVER_TASK_TYPE_SLOT_ERASE:
                 {
                     if (!check_no_mtmd(task.id)) {
+                        break;
+                    }
+                    if (params_base.scheduler == "paged") {
+                        handle_paged_slot_action(task);
                         break;
                     }
                     const int id_slot = task.slot_action.id_slot;
@@ -5796,10 +5933,9 @@ void server_routes::init_routes() {
 
     this->post_slots = [this](const server_http_req & req) {
         auto res = create_response();
-        if (params.scheduler == "paged") {
-            res->error(format_error_response("Slot save/restore/erase is not supported in paged scheduler mode", ERROR_TYPE_NOT_SUPPORTED));
-            return res;
-        }
+        // Paged mode: save/restore/erase are supported and operate on the
+        // runtime seq_id (the id_slot param is interpreted as the llama seq id),
+        // not on a persistent server_slot. Handled by handle_paged_slot_action().
         if (params.slot_save_path.empty()) {
             res->error(format_error_response("This server does not support slots action. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
             return res;

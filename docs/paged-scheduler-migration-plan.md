@@ -482,31 +482,74 @@ Fase 5 completata. Il paged backend consuma `lineage_key` già normalizzata e no
 
 Rendere save/restore/erase indipendenti dal runtime legacy.
 
-### Decisione richiesta
+### Decisione presa
 
-Per paged mode scegliere una delle opzioni:
+**Opzione 1 — supporto reale su `seq_id`.** Le slot action paged operano direttamente
+sullo stato KV di una sequenza llama, senza passare da `server_slot`.
 
-1. Supporto reale su `paged_request_state`/`seq_id`.
-2. Endpoint compatibile che mappa request/seq handle.
-3. Errore esplicito: unsupported in paged scheduler.
+### Stato iniziale (pre-Fase 6)
+
+A livello HTTP entrambi gli endpoint già rifiutavano paged con errore esplicito:
+
+- `GET /slots` → `NOT_SUPPORTED` (`server-context.cpp:5752`).
+- `POST /slots?action=save|restore|erase` → `NOT_SUPPORTED` (`server-context.cpp:5799`).
+
+I `case SERVER_TASK_TYPE_SLOT_*` nel task handler non avevano guard paged: erano
+irraggiungibili solo perché gli endpoint li bloccavano prima. In paged mode `slots`
+è vuoto (`initial_slot_count()`→0), quindi `get_slot_by_id()` ritorna sempre `nullptr`
+→ "Invalid slot ID" fuorviante se mai raggiunti.
+
+### Semantica paged scelta
+
+In paged mode l'handle pubblico `id_slot` dell'API `/slots` è interpretato come
+**`seq_id`** runtime (coerente con il commento in `get_slot_by_id()`: in paged mode
+l'id richiesto è già il llama sequence id, non un indice di slot).
+
+- **save** (`POST /slots?action=save&id_slot=<seq_id>`): salva lo stato KV di
+  `seq_id` con `llama_state_seq_save_file`. Richiede che `seq_id` sia attualmente
+  **active** o **cached** nel lease pool (cioè una request/lineage lo possiede o lo
+  ha lasciato in cache). Se `seq_id` è free/sconosciuto → errore chiaro
+  (`seq_id has no live KV state`), non "Invalid slot ID".
+  - n_tokens: ricavato dallo stato della request attiva (`paged_request_state`) se
+    presente, altrimenti dal numero di token scritti riportato da llama.
+- **restore** (`POST /slots?action=restore&id_slot=<seq_id>`): leasa lo `seq_id`
+  richiesto dal pool free (`lease_specific`), carica il file con
+  `llama_state_seq_load_file`, poi marca lo `seq_id` come **cached** così una
+  request futura lo può riattivare via lineage/prefix. Se lo `seq_id` non è
+  disponibile nel pool free → errore (`seq_id busy or out of range`).
+- **erase** (`POST /slots?action=erase&id_slot=<seq_id>`): invalida il prefix
+  cache per `seq_id`, rimuove il KV (`llama_memory_seq_rm`) e libera lo `seq_id`
+  nel pool (`release_uncached`). No-op tollerato se già libero.
+
+`GET /slots` resta `NOT_SUPPORTED`: la lista slot non ha analogo paged stabile (le
+request sono effimere). La capacità/occupazione si osserva via `/metrics` e
+`/props` paged. Rivalutabile in Fase 9 se serve introspezione delle sequenze cached.
 
 ### Task
 
-- [ ] Definire comportamento ufficiale per paged mode.
-- [ ] Se supportato:
-  - [ ] Implementare save state da `paged_request_state`.
-  - [ ] Implementare restore state su `paged_request_state` con lease corretto.
-  - [ ] Implementare erase state su `paged_request_state` e block manager.
-- [ ] Se non supportato:
-  - [ ] Restituire errore chiaro prima di chiamare `get_slot_by_id()`.
-- [ ] Aggiornare metrics slots/request data.
-- [ ] Aggiornare Web UI/API types se necessario.
+- [x] Definire comportamento ufficiale per paged mode (Opzione 1, semantica sopra).
+- [x] Guard difensivo paged nei `case SERVER_TASK_TYPE_SLOT_*`: in paged mode i tre
+      case dispatchano a `handle_paged_slot_action()` (`server-context.cpp`) invece
+      di `get_slot_by_id()`/`server_slot`.
+- [x] Implementare save state da `seq_id` (active/cached) via `llama_state_seq_save_file`.
+      Token data/count dalla request attiva se presente, altrimenti byte count llama.
+- [x] Implementare restore state: `lease_specific()` + `llama_state_seq_load_file` +
+      `mark_cached()`. Su fallimento load: `seq_rm` + `release_uncached`.
+- [x] Implementare erase state: rifiuta seq active, poi prefix invalidate +
+      `llama_memory_seq_rm` + `release_uncached`.
+- [x] Sbloccare `POST /slots` in paged mode per le tre action (rimosso il guard HTTP;
+      `GET /slots` resta `NOT_SUPPORTED`).
+- [x] Errori chiari e specifici per seq non-live / busy / out-of-range / active-on-erase.
+- [x] Verifica runtime (LFM2.5-1.2B, paged, gpu-mem-util 0.5): save (13 tok, 324 KB) →
+      erase → restore (13 tok) ok; errori chiari per seq non-live e out-of-range;
+      `GET /slots` 501; nessuna regressione su completion singola e concorrenza x2.
 
 ### Criteri di completamento
 
-- [ ] Nessuna slot action paged passa da `server_slot`.
-- [ ] Comportamento documentato.
-- [ ] Errori chiari per feature non supportate.
+- [x] Nessuna slot action paged passa da `server_slot` (dispatch dedicato seq-based).
+- [x] Save/restore/erase operano sul lease pool seq-id e sul KV llama direttamente.
+- [x] Comportamento documentato (semantica sopra + matrice Fase 9 da aggiornare).
+- [x] Errori chiari e non fuorvianti per input non validi (verificato runtime).
 
 ---
 
@@ -584,7 +627,7 @@ Rendere esplicito e verificato cosa il paged scheduler supporta.
 | Streaming | Supportata, da verificare | Supportata |
 | Cancel | Supportata, da verificare | Supportata |
 | Metrics | Ibrida slot/request | Request-native |
-| `/slots` save/restore/erase | Slot-centriche | Supporto reale o errore chiaro |
+| `/slots` save/restore/erase | Supporto reale seq-based (Fase 6) | Supportata; `GET /slots` resta unsupported |
 | Embedding | Presente nel path | Verificata |
 | Rerank | Presente nel path | Verificata |
 | Parent/child tasks | Presente nel path | Verificata |
