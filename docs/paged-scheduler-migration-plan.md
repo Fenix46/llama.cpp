@@ -454,21 +454,25 @@ Eliminare ambiguità semantiche interne.
 
 ### Task
 
-- [ ] Introdurre tipo interno per handle request/session.
-- [ ] Separare chiaramente:
-  - API `id_slot` legacy
-  - runtime `seq_id`
-  - logical `lineage_key`
-  - task id
-- [ ] Rimuovere uso di `id_slot` come lineage key nella logica paged interna.
-- [ ] Spostare mapping API compatibility in un adapter HTTP/server layer.
-- [ ] Aggiornare logging per distinguere `slot_id`, `seq_id`, `request_id`, `lineage_key`.
+- [x] Introdurre tipo interno minimo per handle API legacy: `server_api_slot_id` + helper `lineage_key_from_api_slot()` in `tools/server/server-task.h`.
+- [x] Separare chiaramente:
+  - API `id_slot` legacy: resta `server_task::id_slot`, consumato dal legacy scheduler e convertito dal layer HTTP se serve compatibilità paged.
+  - runtime `seq_id`: resta in `paged_request_state::seq_id` / lease pool ed è usato solo per llama KV runtime.
+  - logical `lineage_key`: resta `server_task::lineage_key` / `paged_request_state::lineage_key`, già normalizzata prima del backend paged.
+  - task id: resta `server_task::id` / `request_id` nei log paged.
+- [x] Rimuovere uso di `id_slot` come lineage key nella logica paged interna: `launch_completion_paged()` non legge più `task.id_slot`, e `derive_lineage_key()` non fa più fallback su `id_slot`.
+- [x] Spostare mapping API compatibility in un adapter HTTP/server layer: `handle_completions_impl()` converte `id_slot` in `lineage_key_from_api_slot(server_api_slot_id{...})` solo se non sono presenti `cache_key`, `session_id`, `conversation_id`.
+- [x] Aggiornare logging per distinguere `slot_id`, `seq_id`, `request_id`, `lineage_key`: audit completo dei log/metrics paged. Convenzione uniforme adottata: `seq_id=` per il seq runtime llama (mai `seq=`), `request_id=` per il task id paged (mai `task=`/`req=` ambigui), `key=` per il `lineage_key`, `slot` riservato al path legacy. Normalizzati: `[paged-prefill] done/progress`, `[paged-latency]`, `[paged-release-cache-check]`, `[paged] launched request`, `[paged-sample]`, `[paged-prefill-plan]`, `[paged-prefill-done]`, `[truncate-debug]`, `[truncate-debug-after]`, `[paged-batch-final]`. Nota: `donor_slot_id` in `kv-prefix-cache.h`/`prefix_reuse_manager.cpp` è un campo della struttura prefix-cache (contiene di fatto un `seq_id` in paged mode) e resta col nome storico — non è un log e non confonde `id_slot`/lineage.
+
+### Stato
+
+Fase 5 completata. Il paged backend consuma `lineage_key` già normalizzata e non interpreta più `id_slot`; la boundary API → scheduler converte `id_slot` legacy in `lineage_key` solo nel layer HTTP. I log/metrics paged usano una nomenclatura uniforme che distingue `seq_id` / `request_id` / `lineage_key`. La compatibilità legacy `id_slot` resta confinata nel layer HTTP e nel backend legacy.
 
 ### Criteri di completamento
 
-- [ ] Nessuna funzione paged interna interpreta `id_slot` come lineage key.
-- [ ] Log paged leggibili e non ambigui.
-- [ ] API legacy continua a funzionare o restituisce errore documentato.
+- [x] Nessuna funzione paged interna interpreta `id_slot` come lineage key nel launch path.
+- [x] Log paged leggibili e non ambigui: convenzione `seq_id`/`request_id`/`key` applicata all'intero path paged (launch, prefill, decode/sample, release, latency, truncate).
+- [x] API legacy continua a funzionare o restituisce errore documentato: legacy conserva `id_slot`; `/slots` e slot actions in paged restituiscono errore esplicito.
 
 ---
 

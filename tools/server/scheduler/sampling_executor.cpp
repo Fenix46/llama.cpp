@@ -50,7 +50,7 @@ SamplingExecutor::SampleDecision SamplingExecutor::sample_token(RequestState & r
 
     const int tok_idx = req.i_batch - i;
     if (std::getenv("LLAMA_PAGED_TRACE")) {
-        SRV_WRN("[paged-sample] seq=%d global_i_batch=%d segment_start=%d local_tok_idx=%d phase=%d n_decoded=%d\n",
+        SRV_WRN("[paged-sample] seq_id=%d global_i_batch=%d segment_start=%d local_tok_idx=%d phase=%d n_decoded=%d\n",
                 req.seq_id,
                 req.i_batch,
                 i,

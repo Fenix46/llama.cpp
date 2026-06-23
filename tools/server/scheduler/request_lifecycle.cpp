@@ -170,7 +170,7 @@ bool RequestLifecycle::register_prefix_cache_on_release(
             !req->prompt.tokens.empty();
 
     std::fprintf(stderr,
-            "[paged-release-cache-check] seq=%d req=%p task=%p can_cache=%d drop=%d cache_prompt=%d task_type=%d has_mtmd=%d prompt_tokens=%zu prefix_cache=%d cache_ram_mib=%d\n",
+            "[paged-release-cache-check] seq_id=%d req=%p task=%p can_cache=%d drop=%d cache_prompt=%d task_type=%d has_mtmd=%d prompt_tokens=%zu prefix_cache=%d cache_ram_mib=%d\n",
             seq_id,
             (void *) req,
             req ? (const void *) req->task.get() : nullptr,

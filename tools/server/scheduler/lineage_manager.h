@@ -14,19 +14,9 @@
 namespace server_scheduler {
 
 // A lineage key identifies a stable logical conversation/agent session.
-// Sources in priority order:
-//   1. task.lineage_key   (explicit field set by HTTP layer from id_slot or future session_id)
-//   2. task.id_slot >= 0  (legacy slot hint, repurposed as lineage key in paged mode)
-//   3. task.id_parent     (for child tasks, inherit parent's lineage)
-// Returns empty string if no lineage can be determined.
+// It must be normalized by the API/server layer before paged scheduling.
 inline std::string derive_lineage_key(const server_task & task) {
-    if (!task.lineage_key.empty()) {
-        return task.lineage_key;
-    }
-    if (task.id_slot >= 0) {
-        return "id_slot:" + std::to_string(task.id_slot);
-    }
-    return "";
+    return task.lineage_key;
 }
 
 struct PagedLineageLease {

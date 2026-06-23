@@ -87,7 +87,7 @@ void PagedScheduler::begin_prefill(RequestState & req, int32_t n_past, int64_t t
         const int32_t total = req.task->n_tokens();
         GGML_ASSERT(req.n_prompt_tokens_cache >= 0);
         GGML_ASSERT(req.n_prompt_tokens_cache <= total);
-        LOG_DBG("[paged-prefill-plan] request_id=%d seq=%d total=%d cached=%d suffix=%d\n",
+        LOG_DBG("[paged-prefill-plan] request_id=%d seq_id=%d total=%d cached=%d suffix=%d\n",
                 req.request_id, req.seq_id, total, req.n_prompt_tokens_cache, total - req.n_prompt_tokens_cache);
     }
 }
@@ -107,7 +107,7 @@ void PagedScheduler::mark_prompt_done(RequestState & req, llama_batch & batch) {
             GGML_ASSERT(req.n_prompt_tokens_processed < total &&
                         "prefix reuse regression: cached request should not re-prefill full prompt");
         }
-        LOG_DBG("[paged-prefill-done] request_id=%d seq=%d total=%d cached=%d processed=%d\n",
+        LOG_DBG("[paged-prefill-done] request_id=%d seq_id=%d total=%d cached=%d processed=%d\n",
                 req.request_id, req.seq_id, total, req.n_prompt_tokens_cache, req.n_prompt_tokens_processed);
     }
 }
@@ -356,7 +356,7 @@ bool PagedScheduler::validate_prefill_truncate(llama_context * ctx, const Reques
     }
     const llama_pos pos_min_before = BlockManager::seq_pos_min(ctx, req.seq_id);
     const llama_pos pos_max_before = BlockManager::seq_pos_max(ctx, req.seq_id);
-    PGD_WRN(req, "[truncate-debug] seq=%d task=%d phase=%d old_prompt_tokens=%zu new_task_tokens=%d common_prefix=%d pos_next=%d seq_pos_min=%d seq_pos_max=%d ctx_seq_rm_type=%d\n",
+    PGD_WRN(req, "[truncate-debug] seq_id=%d request_id=%d phase=%d old_prompt_tokens=%zu new_task_tokens=%d common_prefix=%d pos_next=%d seq_pos_min=%d seq_pos_max=%d ctx_seq_rm_type=%d\n",
             req.seq_id,
             req.request_id,
             (int) req.phase,
@@ -370,7 +370,7 @@ bool PagedScheduler::validate_prefill_truncate(llama_context * ctx, const Reques
     const bool ok = BlockManager::truncate_seq_tail(ctx, req.seq_id, p0);
     const llama_pos pos_min_after = BlockManager::seq_pos_min(ctx, req.seq_id);
     const llama_pos pos_max_after = BlockManager::seq_pos_max(ctx, req.seq_id);
-    PGD_WRN(req, "[truncate-debug-after] seq=%d ok=%d seq_pos_min=%d seq_pos_max=%d\n",
+    PGD_WRN(req, "[truncate-debug-after] seq_id=%d ok=%d seq_pos_min=%d seq_pos_max=%d\n",
             req.seq_id,
             ok ? 1 : 0,
             (int) pos_min_after,
@@ -865,7 +865,7 @@ DecodeBatchResult PagedScheduler::populate_decode_batch(
                 seen_seq_ids.insert(seq);
             }
 
-            SRV_WRN("[paged-batch-final] k=%d seq=%d pos=%d logits=%d\n",
+            SRV_WRN("[paged-batch-final] k=%d seq_id=%d pos=%d logits=%d\n",
                     k, seq, batch.pos[k], batch.logits[k] ? 1 : 0);
         }
 

@@ -1988,7 +1988,7 @@ private:
             !req->prompt.tokens.empty();
 
         SRV_WRN(
-            "[paged-release-cache-check] seq=%d req=%p task=%p can_cache=%d "
+            "[paged-release-cache-check] seq_id=%d req=%p task=%p can_cache=%d "
             "drop=%d cache_prompt=%d task_type=%d has_mtmd=%d prompt_tokens=%zu "
             "prefix_cache=%d cache_ram_mib=%d\n",
             seq_id,
@@ -2123,7 +2123,7 @@ private:
                 const size_t prompt_total = r.task ? (size_t) r.task->n_tokens() : 0;
                 const size_t cached = std::min(r.cached_prefix_tokens, prompt_total);
                 const size_t suffix_total = prompt_total > cached ? prompt_total - cached : 0;
-                SRV_INF("[paged-prefill] done request_id=%d seq=%d cached=%zu prefilled_suffix=%zu total_prompt=%zu\n",
+                SRV_INF("[paged-prefill] done request_id=%d seq_id=%d cached=%zu prefilled_suffix=%zu total_prompt=%zu\n",
                         r.request_id, r.seq_id, cached, suffix_total, prompt_total);
             },
             /*on_request_progress=*/[](paged_request_state & r) {
@@ -2137,7 +2137,7 @@ private:
                 const size_t chunk = suffix_done >= r.last_prefill_progress_suffix_done
                     ? (suffix_done - r.last_prefill_progress_suffix_done) : 0;
                 r.last_prefill_progress_suffix_done = suffix_done;
-                SRV_INF("[paged-prefill] progress request_id=%d seq=%d cached=%zu suffix_done=%zu/%zu abs=%zu/%zu chunk=%zu\n",
+                SRV_INF("[paged-prefill] progress request_id=%d seq_id=%d cached=%zu suffix_done=%zu/%zu abs=%zu/%zu chunk=%zu\n",
                         r.request_id, r.seq_id, cached, suffix_done, suffix_total, abs_pos, prompt_total, chunk);
             },
             /*request_callbacks=*/server_scheduler::PrefillRequestCallbacks{
@@ -2633,7 +2633,7 @@ private:
         }
 
         n_empty_consecutive = 0;
-        SRV_INF("[paged] launched request seq_id=%d, task=%d, is_child=%d\n",
+        SRV_INF("[paged] launched request seq_id=%d, request_id=%d, is_child=%d\n",
                 req.seq_id, req.request_id, req.task->is_child() ? 1 : 0);
         return true;
     }
@@ -3244,7 +3244,7 @@ private:
         const int32_t prompt_tokens_total = req.task ? req.task->n_tokens() : 0;
         const int32_t cached_prefix_tokens = (int32_t) std::min<size_t>(req.cached_prefix_tokens, (size_t) std::max(0, prompt_tokens_total));
         const int32_t prefill_tokens_actual = std::max(0, prompt_tokens_total - cached_prefix_tokens);
-        SRV_WRN("[paged-latency] seq=%d task=%d prompt_tokens=%d cached_prefix_tokens=%d prefill_tokens=%d output_tokens=%d queue_wait_ms=%lld ttft_ms=%lld prefill_ms=%lld decode_ms=%lld total_ms=%lld\n",
+        SRV_WRN("[paged-latency] seq_id=%d request_id=%d prompt_tokens=%d cached_prefix_tokens=%d prefill_tokens=%d output_tokens=%d queue_wait_ms=%lld ttft_ms=%lld prefill_ms=%lld decode_ms=%lld total_ms=%lld\n",
                 req.seq_id,
                 req.request_id,
                 prompt_tokens_total,
@@ -3573,7 +3573,6 @@ private:
     // Paged-scheduler launch path for a COMPLETION/INFILL/EMBEDDING/RERANK task.
     // Handles admission/defer and launch directly on paged_request_state.
     void launch_completion_paged(server_task && task) {
-        const int id_slot = task.id_slot;
         const int id_task = task.id;
 
         if (!paged_admission_available(task)) {
@@ -3581,14 +3580,8 @@ private:
             return;
         }
 
-        if (id_slot != -1) {
-            // In paged mode id_slot is repurposed as a lineage key, not a
-            // slot index. Same-lineage reuse is handled by try_lineage_reuse().
-            SRV_DBG("[paged-lineage] using id_slot=%d as lineage key request_id=%d\n",
-                    id_slot, id_task);
-        }
         if (!task.lineage_key.empty()) {
-            SRV_DBG("[paged-lineage] derive request_id=%d key=%s\n",
+            SRV_DBG("[paged-lineage] request_id=%d key=%s\n",
                     id_task, task.lineage_key.c_str());
         }
 
@@ -5418,7 +5411,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             } else if (!conversation_id.empty()) {
                 task.lineage_key = "conversation:" + conversation_id;
             } else {
-                task.lineage_key = server_scheduler::derive_lineage_key(task);
+                task.lineage_key = lineage_key_from_api_slot(server_api_slot_id{ task.id_slot });
             }
 
             // OAI-compat

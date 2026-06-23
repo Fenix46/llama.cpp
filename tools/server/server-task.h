@@ -3,6 +3,7 @@
 #include "common.h"
 #include "llama.h"
 
+#include <cstdint>
 #include <string>
 #include <unordered_set>
 #include <list>
@@ -12,6 +13,14 @@
 #include "server-common.h"
 
 using json = nlohmann::ordered_json;
+
+struct server_api_slot_id {
+    int32_t value = -1;
+};
+
+inline std::string lineage_key_from_api_slot(server_api_slot_id id) {
+    return id.value >= 0 ? "id_slot:" + std::to_string(id.value) : std::string();
+}
 
 enum server_task_type {
     SERVER_TASK_TYPE_COMPLETION,
@@ -134,11 +143,14 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_CANCEL
     int id_target = -1;
+
+    // API compatibility slot id. Legacy scheduling treats it as a slot selector.
+    // Paged scheduling must not interpret it directly; the API layer converts it
+    // to lineage_key when legacy id_slot continuity is requested.
     int id_slot   = -1;
 
-    // Stable logical lineage key for paged-mode same-seq reuse.
-    // Populated from id_slot (or future session_id) by the HTTP layer before dispatch.
-    // Empty string = no lineage (fresh seq will be assigned).
+    // Stable logical lineage key for paged-mode reuse. Empty string = no lineage
+    // continuity requested; a fresh runtime seq_id lease will be assigned.
     std::string lineage_key;
 
     // used by parallel sampling (multiple completions from same prompt)
@@ -235,10 +247,11 @@ struct server_task {
 
         copy.id        = id_child;
         copy.id_parent = id_parent;
-        copy.params    = params;
-        copy.type      = type;
-        copy.tokens    = tokens.clone();
-        copy.id_slot   = -1; // child tasks cannot specify slot
+        copy.params      = params;
+        copy.type        = type;
+        copy.tokens      = tokens.clone();
+        copy.id_slot     = -1; // child tasks cannot specify slot
+        copy.lineage_key = lineage_key;
 
         // use different sampling seed for each child
         // note: https://github.com/ggml-org/llama.cpp/pull/18700#discussion_r2675115723
