@@ -17,6 +17,7 @@
 #include "scheduler/paged_prefix_reuse.h"
 #include "scheduler/paged_request_launcher.h"
 #include "scheduler/paged_cache_sweeper.h"
+#include "scheduler/paged_schedule_builder.h"
 #include "scheduler/reservation_model.h"
 #include "scheduler/request_lifecycle.h"
 #include "scheduler/sampling_executor.h"
@@ -2047,6 +2048,36 @@ private:
         });
     }
 
+    server_scheduler::PagedScheduleBuilder make_paged_schedule_builder() {
+        return server_scheduler::PagedScheduleBuilder({
+            /*core=*/&paged_core,
+            /*policy_config=*/&sched_policy_cfg_,
+            /*ctx=*/ctx,
+            /*paged_requests=*/&paged_requests,
+            /*paged_total_blocks=*/paged_total_blocks_,
+            /*paged_blocks_per_seq=*/paged_blocks_per_seq_,
+            /*paged_max_full_ctx_concurrency=*/paged_max_full_ctx_concurrency_,
+            /*n_ctx_slot=*/n_ctx_slot_,
+            /*paged_admission=*/params_base.paged_admission,
+            /*admission_decision=*/[this](const server_task & task) {
+                return paged_admission_decision(task);
+            },
+            /*on_preempt_kv=*/[this](int32_t preempted_seq_id) {
+                paged_request_state * victim = get_paged_request_by_seq_id(preempted_seq_id);
+                if (victim) {
+                    if (paged_lifecycle) {
+                        paged_lifecycle->abort_request(*victim, "kv-preemption");
+                    } else {
+                        mark_request_uncacheable(*victim, "kv-preemption");
+                    }
+                    reset_paged_request_for_reprefill(*victim, "kv-preemption");
+                    server_scheduler::BlockManager::release_runtime_sequence(*victim);
+                    PGD_WRN(*victim, "preempted by scheduler due to KV pressure, seq_id=%d\n", preempted_seq_id);
+                }
+            },
+        });
+    }
+
     server_scheduler::PagedPrefixReuse make_paged_prefix_reuse() {
         return server_scheduler::PagedPrefixReuse({
             /*params_base=*/&params_base,
@@ -3646,115 +3677,17 @@ private:
                 queue_tasks.post(std::move(task));
             }
 
-            int32_t max_running = paged_max_full_ctx_concurrency_ > 0 ? paged_max_full_ctx_concurrency_ : (int32_t) paged_requests.size();
-            if (ctx) {
-                const int32_t seq_max = (int32_t) llama_n_seq_max(ctx);
-                if (params_base.paged_admission == "actual-len") {
-                    max_running = seq_max;
-                } else {
-                    max_running = std::min(max_running, seq_max);
-                }
-            }
             // 3. build batch
             common_batch_clear(batch);
 
-            const int32_t n_batch  = llama_n_batch(ctx);
-            const int32_t n_ubatch = llama_n_ubatch(ctx);
-            const auto blk_stats = server_scheduler::BlockManager::stats(paged_requests);
-            const float kv_pressure_ratio = server_scheduler::BlockManager::pressure_ratio(blk_stats, paged_total_blocks_);
-            const int32_t block_size_for_fit = paged_blocks_per_seq_ > 0 ? std::max(1, n_ctx_slot_ / paged_blocks_per_seq_) : 1;
-
-            // Count decode-ready requests.
-            int32_t n_decode_active = 0;
-            for (const auto & req : paged_requests) {
-                if (req.phase == PAGED_REQUEST_DECODING) {
-                    n_decode_active++;
-                }
-            }
-
-            // Policy knobs come from sched_policy_cfg_ (parsed once at init).
-            const auto & spc = sched_policy_cfg_;
-            const int32_t max_num_scheduled_tokens = spc.max_num_batched_tokens;
-            const int32_t prefill_threshold = n_decode_active > 0
-                ? spc.prefill_chunk_active_decode
-                : spc.prefill_chunk_idle;
-
-            const auto schedule_decision = paged_core.schedule_tokens(server_scheduler::SchedulerCore::RuntimeSnapshot{
-                /*reqs=*/&paged_requests,
-                /*max_running=*/std::max(1, max_running),
-                /*n_batch=*/n_batch,
-                /*n_ubatch=*/n_ubatch,
-                /*decode_tokens_in_batch=*/0,
-                /*n_prefill_candidates=*/(int32_t) paged_requests.size(),
-                /*kv_total_blocks=*/paged_total_blocks_,
-                /*kv_reserved_blocks=*/blk_stats.reserved_blocks,
-                /*kv_active_requests=*/blk_stats.active_requests,
-                /*kv_pressure_ratio=*/kv_pressure_ratio,
-                /*max_num_scheduled_tokens=*/max_num_scheduled_tokens,
-                /*long_prefill_token_threshold=*/prefill_threshold,
-                /*enable_chunked_prefill=*/true,
-                /*reserve_full_isl=*/params_base.paged_admission == "full-ctx",
-                /*can_admit=*/[this](const server_scheduler::RequestState & req) {
-                    if (!req.task) {
-                        return server_scheduler::SchedulerCore::AdmissionEval{
-                            false,
-                            server_scheduler::SchedulerCore::normalize_reason("no-task"),
-                        };
-                    }
-                    const auto admission = paged_admission_decision(*req.task);
-                    return server_scheduler::SchedulerCore::AdmissionEval{
-                        admission.accepted,
-                        server_scheduler::SchedulerCore::normalize_reason(admission.reason),
-                    };
-                },
-                /*can_fit_tokens=*/[this, block_size_for_fit](const server_scheduler::RequestState & req, int32_t delta_tokens) {
-                    // Re-compute reserved_blocks live so preemption within the same
-                    // scheduling tick is reflected in subsequent fit checks.
-                    const auto live_stats = server_scheduler::BlockManager::stats(this->paged_requests);
-                    const auto fit = server_scheduler::BlockManager::can_fit_tokens_delta(
-                        req,
-                        delta_tokens,
-                        server_scheduler::BlockManager::FitContext{
-                            /*max_model_len=*/n_ctx_slot_,
-                            /*block_size=*/block_size_for_fit,
-                            /*total_blocks=*/paged_total_blocks_,
-                            /*reserved_blocks=*/live_stats.reserved_blocks,
-                        });
-                    return fit.can_fit;
-                },
-                /*on_preempt_kv=*/[this](int32_t preempted_seq_id) {
-                    // Free KV blocks for the preempted sequence and reset its prompt
-                    // state so it will restart prefill from scratch (recompute strategy,
-                    // matching vLLM default preemption mode).
-                    paged_request_state * victim = get_paged_request_by_seq_id(preempted_seq_id);
-                    if (victim) {
-                        if (paged_lifecycle) {
-                            paged_lifecycle->abort_request(*victim, "kv-preemption");
-                        } else {
-                            mark_request_uncacheable(*victim, "kv-preemption");
-                        }
-                        reset_paged_request_for_reprefill(*victim, "kv-preemption");
-                        server_scheduler::BlockManager::release_runtime_sequence(*victim);
-                        PGD_WRN(*victim, "preempted by scheduler due to KV pressure, seq_id=%d\n", preempted_seq_id);
-                    }
-                },
-            });
+            const auto schedule_build = make_paged_schedule_builder().build();
+            const auto & schedule_decision = schedule_build.schedule_decision;
             const auto & active_seq_ids = schedule_decision.active_seq_ids;
-            SRV_DBG("[paged-scheduler] total_scheduled_tokens=%d remaining_budget=%d running=%zu waiting=%zu\n",
-                    schedule_decision.total_scheduled_tokens,
-                    schedule_decision.remaining_budget,
-                    schedule_decision.running_seq_ids.size(),
-                    schedule_decision.waiting_seq_ids.size());
-            if (schedule_decision.deferred > 0) {
-                for (const auto & it : schedule_decision.deferred_reasons) {
-                    SRV_DBG("[paged-scheduler] deferred=%d reason=%s\n", it.second, it.first.c_str());
-                }
-            }
-            if (schedule_decision.preempted > 0) {
-                for (const auto & it : schedule_decision.preempted_reasons) {
-                    SRV_DBG("[paged-scheduler] preempted=%d reason=%s\n", it.second, it.first.c_str());
-                }
-            }
+            const int32_t n_batch = schedule_build.n_batch;
+            const int32_t n_ubatch = schedule_build.n_ubatch;
+            const int32_t n_decode_active = schedule_build.n_decode_active;
+            const int32_t max_num_scheduled_tokens = schedule_build.max_num_scheduled_tokens;
+            const int32_t prefill_threshold = schedule_build.prefill_threshold;
 
             paged_request_state * req_batched = nullptr;
             auto accept_special_token_paged = [&](const paged_request_state & req, llama_token token) {
