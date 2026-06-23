@@ -2083,6 +2083,70 @@ private:
         return server_scheduler::PagedPrefillDecodePolicy{};
     }
 
+    server_scheduler::PrefillPassCallbacks make_paged_prefill_callbacks() {
+        return server_scheduler::PrefillPassCallbacks{
+            /*on_request_begin=*/[this](paged_request_state & r) {
+                if (paged_lifecycle) {
+                    paged_lifecycle->mark_prefilling(r);
+                }
+                PGD_INF(r, "new prompt, n_ctx=%d, n_keep=%d, task.n_tokens=%d\n",
+                        r.n_ctx, r.task->params.n_keep, r.task->n_tokens());
+            },
+            /*on_request_prompt_done=*/[this](paged_request_state & r) {
+                PGD_INF(r, "prompt done, n_tokens=%d, batch.n_tokens=%d\n",
+                        r.prompt.n_tokens(), this->batch.n_tokens);
+                const size_t prompt_total = r.task ? (size_t) r.task->n_tokens() : 0;
+                const size_t cached = std::min(r.cached_prefix_tokens, prompt_total);
+                const size_t suffix_total = prompt_total > cached ? prompt_total - cached : 0;
+                SRV_INF("[paged-prefill] done request_id=%d seq=%d cached=%zu prefilled_suffix=%zu total_prompt=%zu\n",
+                        r.request_id, r.seq_id, cached, suffix_total, prompt_total);
+            },
+            /*on_request_progress=*/[](paged_request_state & r) {
+                PGD_INF(r, "prefill progress, n_tokens=%d/%d\n",
+                        r.prompt.n_tokens(), r.task->n_tokens());
+                const size_t prompt_total = r.task ? (size_t) r.task->n_tokens() : 0;
+                const size_t cached = std::min(r.cached_prefix_tokens, prompt_total);
+                const size_t suffix_total = prompt_total > cached ? prompt_total - cached : 0;
+                const size_t abs_pos = std::min((size_t) r.prompt.n_tokens(), prompt_total);
+                const size_t suffix_done = abs_pos > cached ? abs_pos - cached : 0;
+                const size_t chunk = suffix_done >= r.last_prefill_progress_suffix_done
+                    ? (suffix_done - r.last_prefill_progress_suffix_done) : 0;
+                r.last_prefill_progress_suffix_done = suffix_done;
+                SRV_INF("[paged-prefill] progress request_id=%d seq=%d cached=%zu suffix_done=%zu/%zu abs=%zu/%zu chunk=%zu\n",
+                        r.request_id, r.seq_id, cached, suffix_done, suffix_total, abs_pos, prompt_total, chunk);
+            },
+            /*request_callbacks=*/server_scheduler::PrefillRequestCallbacks{
+                /*on_release_final=*/[this](paged_request_state & r) {
+                    PGD_WRN(r, "%s", "empty prompt - releasing");
+                    r.print_timings();
+                    send_final_response(r);
+                    r.release();
+                },
+                /*on_release_error=*/[this](paged_request_state & r, const std::string & msg, error_type t) {
+                    send_error(r, msg, t);
+                    r.release();
+                },
+                /*on_hard_reset=*/[this](paged_request_state & r, const char * reason) {
+                    if (reason && std::string_view(reason) == "truncate-failed") {
+                        ++paged_truncate_failed_;
+                        if (paged_lifecycle) {
+                            paged_lifecycle->abort_request(r, "truncate-failed");
+                        } else {
+                            mark_request_uncacheable(r, "truncate-failed");
+                        }
+                    }
+                    reset_paged_request_for_reprefill(r, reason);
+                },
+                /*on_create_checkpoint=*/[this](paged_request_state & r, int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+                    create_checkpoint(r, n_tokens_cur, pos_min, pos_max);
+                },
+                /*on_partial_progress=*/[this](paged_request_state & r) {
+                    send_partial_response(r, {}, true);
+                },
+            },
+        };
+    }
+
     server_scheduler::PagedPrefixReuse make_paged_prefix_reuse() {
         return server_scheduler::PagedPrefixReuse({
             /*params_base=*/&params_base,
@@ -3767,67 +3831,7 @@ private:
                     /*checkpoint_every_nt=*/params_base.checkpoint_every_nt,
                     /*checkpoints_enabled=*/false,
                 },
-                server_scheduler::PrefillPassCallbacks{
-                    /*on_request_begin=*/[this](paged_request_state & r) {
-                        if (paged_lifecycle) {
-                            paged_lifecycle->mark_prefilling(r);
-                        }
-                        PGD_INF(r, "new prompt, n_ctx=%d, n_keep=%d, task.n_tokens=%d\n",
-                                r.n_ctx, r.task->params.n_keep, r.task->n_tokens());
-                    },
-                    /*on_request_prompt_done=*/[this](paged_request_state & r) {
-                        PGD_INF(r, "prompt done, n_tokens=%d, batch.n_tokens=%d\n",
-                                r.prompt.n_tokens(), this->batch.n_tokens);
-                        const size_t prompt_total = r.task ? (size_t) r.task->n_tokens() : 0;
-                        const size_t cached = std::min(r.cached_prefix_tokens, prompt_total);
-                        const size_t suffix_total = prompt_total > cached ? prompt_total - cached : 0;
-                        SRV_INF("[paged-prefill] done request_id=%d seq=%d cached=%zu prefilled_suffix=%zu total_prompt=%zu\n",
-                                r.request_id, r.seq_id, cached, suffix_total, prompt_total);
-                    },
-                    /*on_request_progress=*/[](paged_request_state & r) {
-                        PGD_INF(r, "prefill progress, n_tokens=%d/%d\n",
-                                r.prompt.n_tokens(), r.task->n_tokens());
-                        const size_t prompt_total = r.task ? (size_t) r.task->n_tokens() : 0;
-                        const size_t cached = std::min(r.cached_prefix_tokens, prompt_total);
-                        const size_t suffix_total = prompt_total > cached ? prompt_total - cached : 0;
-                        const size_t abs_pos = std::min((size_t) r.prompt.n_tokens(), prompt_total);
-                        const size_t suffix_done = abs_pos > cached ? abs_pos - cached : 0;
-                        const size_t chunk = suffix_done >= r.last_prefill_progress_suffix_done
-                            ? (suffix_done - r.last_prefill_progress_suffix_done) : 0;
-                        r.last_prefill_progress_suffix_done = suffix_done;
-                        SRV_INF("[paged-prefill] progress request_id=%d seq=%d cached=%zu suffix_done=%zu/%zu abs=%zu/%zu chunk=%zu\n",
-                                r.request_id, r.seq_id, cached, suffix_done, suffix_total, abs_pos, prompt_total, chunk);
-                    },
-                    /*request_callbacks=*/server_scheduler::PrefillRequestCallbacks{
-                        /*on_release_final=*/[this](paged_request_state & r) {
-                            PGD_WRN(r, "%s", "empty prompt - releasing");
-                            r.print_timings();
-                            send_final_response(r);
-                            r.release();
-                        },
-                        /*on_release_error=*/[this](paged_request_state & r, const std::string & msg, error_type t) {
-                            send_error(r, msg, t);
-                            r.release();
-                        },
-                            /*on_hard_reset=*/[this](paged_request_state & r, const char * reason) {
-                                if (reason && std::string_view(reason) == "truncate-failed") {
-                                    ++paged_truncate_failed_;
-                                    if (paged_lifecycle) {
-                                        paged_lifecycle->abort_request(r, "truncate-failed");
-                                    } else {
-                                        mark_request_uncacheable(r, "truncate-failed");
-                                    }
-                                }
-                                reset_paged_request_for_reprefill(r, reason);
-                            },
-                        /*on_create_checkpoint=*/[this](paged_request_state & r, int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
-                            create_checkpoint(r, n_tokens_cur, pos_min, pos_max);
-                        },
-                        /*on_partial_progress=*/[this](paged_request_state & r) {
-                            send_partial_response(r, {}, true);
-                        },
-                    },
-                });
+                make_paged_prefill_callbacks());
 
             if (!req_batched && prefill_pass.first_prefill_request_index >= 0) {
                 req_batched = &paged_requests[(size_t) prefill_pass.first_prefill_request_index];
@@ -4064,67 +4068,7 @@ private:
                         /*checkpoint_every_nt=*/params_base.checkpoint_every_nt,
                         /*checkpoints_enabled=*/false,
                     },
-                    server_scheduler::PrefillPassCallbacks{
-                        /*on_request_begin=*/[this](paged_request_state & r) {
-                            if (paged_lifecycle) {
-                                paged_lifecycle->mark_prefilling(r);
-                            }
-                            PGD_INF(r, "new prompt, n_ctx=%d, n_keep=%d, task.n_tokens=%d\n",
-                                    r.n_ctx, r.task->params.n_keep, r.task->n_tokens());
-                        },
-                        /*on_request_prompt_done=*/[this](paged_request_state & r) {
-                            PGD_INF(r, "prompt done, n_tokens=%d, batch.n_tokens=%d\n",
-                                    r.prompt.n_tokens(), this->batch.n_tokens);
-                            const size_t prompt_total = r.task ? (size_t) r.task->n_tokens() : 0;
-                            const size_t cached = std::min(r.cached_prefix_tokens, prompt_total);
-                            const size_t suffix_total = prompt_total > cached ? prompt_total - cached : 0;
-                            SRV_INF("[paged-prefill] done request_id=%d seq=%d cached=%zu prefilled_suffix=%zu total_prompt=%zu\n",
-                                    r.request_id, r.seq_id, cached, suffix_total, prompt_total);
-                        },
-                        /*on_request_progress=*/[](paged_request_state & r) {
-                            PGD_INF(r, "prefill progress, n_tokens=%d/%d\n",
-                                    r.prompt.n_tokens(), r.task->n_tokens());
-                            const size_t prompt_total = r.task ? (size_t) r.task->n_tokens() : 0;
-                            const size_t cached = std::min(r.cached_prefix_tokens, prompt_total);
-                            const size_t suffix_total = prompt_total > cached ? prompt_total - cached : 0;
-                            const size_t abs_pos = std::min((size_t) r.prompt.n_tokens(), prompt_total);
-                            const size_t suffix_done = abs_pos > cached ? abs_pos - cached : 0;
-                            const size_t chunk = suffix_done >= r.last_prefill_progress_suffix_done
-                                ? (suffix_done - r.last_prefill_progress_suffix_done) : 0;
-                            r.last_prefill_progress_suffix_done = suffix_done;
-                            SRV_INF("[paged-prefill] progress request_id=%d seq=%d cached=%zu suffix_done=%zu/%zu abs=%zu/%zu chunk=%zu\n",
-                                    r.request_id, r.seq_id, cached, suffix_done, suffix_total, abs_pos, prompt_total, chunk);
-                        },
-                        /*request_callbacks=*/server_scheduler::PrefillRequestCallbacks{
-                            /*on_release_final=*/[this](paged_request_state & r) {
-                                PGD_WRN(r, "%s", "empty prompt - releasing");
-                                r.print_timings();
-                                send_final_response(r);
-                                r.release();
-                            },
-                            /*on_release_error=*/[this](paged_request_state & r, const std::string & msg, error_type t) {
-                                send_error(r, msg, t);
-                                r.release();
-                            },
-                            /*on_hard_reset=*/[this](paged_request_state & r, const char * reason) {
-                                if (reason && std::string_view(reason) == "truncate-failed") {
-                                    ++paged_truncate_failed_;
-                                    if (paged_lifecycle) {
-                                        paged_lifecycle->abort_request(r, "truncate-failed");
-                                    } else {
-                                        mark_request_uncacheable(r, "truncate-failed");
-                                    }
-                                }
-                                reset_paged_request_for_reprefill(r, reason);
-                            },
-                            /*on_create_checkpoint=*/[this](paged_request_state & r, int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
-                                create_checkpoint(r, n_tokens_cur, pos_min, pos_max);
-                            },
-                            /*on_partial_progress=*/[this](paged_request_state & r) {
-                                send_partial_response(r, {}, true);
-                            },
-                        },
-                    });
+                    make_paged_prefill_callbacks());
 
                 if (batch.n_tokens > 0) {
                     const int32_t executed_decode_tokens = 0;

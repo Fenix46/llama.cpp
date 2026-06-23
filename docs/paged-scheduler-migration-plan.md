@@ -429,7 +429,7 @@ Rimuovere il grosso branch paged da `update_slots()`.
 - [x] Spostare sweep TTL/LRU paged in `server_scheduler::PagedCacheSweeper` (`tools/server/scheduler/paged_cache_sweeper.{h,cpp}`).
 - [x] Spostare costruzione schedule decision in `server_scheduler::PagedScheduleBuilder` (`tools/server/scheduler/paged_schedule_builder.{h,cpp}`).
 - [x] Spostare policy prefill/decode in `server_scheduler::PagedPrefillDecodePolicy` (`tools/server/scheduler/paged_prefill_decode_policy.{h,cpp}`).
-- [ ] Spostare callbacks di prefill.
+- [x] Spostare callbacks di prefill in `server_context_impl::make_paged_prefill_callbacks()` e rimuovere duplicazione fase A/B.
 - [ ] Spostare callbacks di decode/sampling.
 - [ ] Spostare gestione `kv_sched` metrics per paged.
 - [ ] Spostare gestione empty-turn/stall.
