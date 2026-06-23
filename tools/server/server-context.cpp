@@ -18,6 +18,7 @@
 #include "scheduler/paged_request_launcher.h"
 #include "scheduler/paged_cache_sweeper.h"
 #include "scheduler/paged_schedule_builder.h"
+#include "scheduler/paged_prefill_decode_policy.h"
 #include "scheduler/reservation_model.h"
 #include "scheduler/request_lifecycle.h"
 #include "scheduler/sampling_executor.h"
@@ -2078,6 +2079,10 @@ private:
         });
     }
 
+    server_scheduler::PagedPrefillDecodePolicy make_paged_prefill_decode_policy() const {
+        return server_scheduler::PagedPrefillDecodePolicy{};
+    }
+
     server_scheduler::PagedPrefixReuse make_paged_prefix_reuse() {
         return server_scheduler::PagedPrefixReuse({
             /*params_base=*/&params_base,
@@ -3722,108 +3727,31 @@ private:
                 req_batched = &paged_requests[(size_t) tick_decision.first_decode_request_index];
             }
 
-            const int32_t decode_tokens_in_batch = tick_decision.decode_tokens_in_batch;
-            SRV_DBG("[paged] decode_tokens=%d\n", decode_tokens_in_batch);
-            std::vector<size_t> prefill_candidates = tick_decision.prefill_candidates;
-            const auto budget = tick_decision.budget;
-            auto prefill_cursor = paged_sched.make_prefill_cursor(budget);
-            int32_t sched_decode_toks_tick = 0;
-            int32_t sched_prefill_toks_tick = 0;
-            int32_t planned_decode_rows_tick = 0;
-            int32_t planned_prefill_rows_tick = 0;
-            for (const auto & plan : schedule_decision.request_plans) {
-                sched_decode_toks_tick += plan.scheduled_decode_tokens;
-                sched_prefill_toks_tick += plan.scheduled_prefill_tokens;
-                if (plan.scheduled_decode_tokens > 0) {
-                    planned_decode_rows_tick++;
-                }
-                if (plan.scheduled_prefill_tokens > 0) {
-                    planned_prefill_rows_tick++;
-                }
-            }
-            const bool split_mixed_batch = sched_policy_cfg_.latency_mode &&
-                                           sched_decode_toks_tick > 0 && sched_prefill_toks_tick > 0;
-            int32_t active_reqs_tick = 0;
-            int32_t decode_ready_reqs_tick = 0;
-            int32_t prefill_ready_reqs_tick = 0;
-            for (const auto & req : paged_requests) {
-                if (!req.is_processing()) {
-                    continue;
-                }
-                ++active_reqs_tick;
-                if (req.phase == PAGED_REQUEST_DECODING) {
-                    ++decode_ready_reqs_tick;
-                }
-                if (req.phase == PAGED_REQUEST_STARTED || req.phase == PAGED_REQUEST_PREFILLING) {
-                    ++prefill_ready_reqs_tick;
-                }
-            }
-            if (decode_ready_reqs_tick == 0) {
-                paged_decode_burst_steps = 0;
-            }
-            if (decode_ready_reqs_tick > 0 && sched_decode_toks_tick == 0) {
-                SRV_ERR("[paged-sched-bug] decode_ready=%d but decode_sched=0 active=%d prefill_ready=%d prefill_sched=%d batch=%d\n",
-                        decode_ready_reqs_tick,
-                        active_reqs_tick,
-                        prefill_ready_reqs_tick,
-                        sched_prefill_toks_tick,
-                        batch.n_tokens);
-                const bool latency_mode = decode_ready_reqs_tick > 0;
-                if (latency_mode) {
-                    GGML_ASSERT(!(decode_ready_reqs_tick > 0 && sched_decode_toks_tick == 0));
-                }
-            }
-            if (decode_ready_reqs_tick == 0 &&
-                prefill_ready_reqs_tick > 0 &&
-                sched_decode_toks_tick == 0 &&
-                sched_prefill_toks_tick == 0 &&
-                !prefill_candidates.empty()) {
-                // Safety fallback: if prefill-ready requests exist but token planning
-                // produced no executable rows, force one small prefill chunk to avoid
-                // empty-turn stalls.
-                sched_prefill_toks_tick = std::max(1, std::min(prefill_threshold, max_num_scheduled_tokens));
-                planned_prefill_rows_tick = 1;
-            }
-            // Enforce token-plan budget at execution time: prevents oversized
-            // prefill bursts from monopolizing the batch when decode is active.
-            if (sched_prefill_toks_tick >= 0) {
-                prefill_cursor.prefill_total_budget = std::min(prefill_cursor.prefill_total_budget, sched_prefill_toks_tick);
-                prefill_cursor.prefill_per_request_budget = std::min(prefill_cursor.prefill_per_request_budget, prefill_threshold);
-            }
-
-            // Apply prefill ordering and budget capping via policy config.
-            {
-                server_scheduler::PrefillPolicyInput pp_in;
-                pp_in.reqs              = &paged_requests;
-                pp_in.candidates        = &prefill_candidates;
-                pp_in.n_decode_active   = n_decode_active;
-                pp_in.sched_decode_toks = sched_decode_toks_tick;
-                pp_in.sched_prefill_toks = sched_prefill_toks_tick;
-                pp_in.decode_burst_steps = paged_decode_burst_steps;
-                pp_in.decode_steps_since_long_prefill = paged_decode_steps_since_long_prefill;
-                pp_in.prefill_total_budget   = prefill_cursor.prefill_total_budget;
-                pp_in.prefill_per_req_budget = prefill_cursor.prefill_per_request_budget;
-                pp_in.rr_cursor = paged_prefill_rr_cursor;
-
-                const auto pp = server_scheduler::apply_prefill_policy(sched_policy_cfg_, pp_in, paged_prefill_rr_cursor);
-
-                prefill_candidates = pp.ordered_candidates;
-                prefill_cursor.prefill_total_budget   = pp.prefill_total_budget;
-                prefill_cursor.prefill_per_request_budget = pp.prefill_per_req_budget;
-
-                if (pp.decode_burst_only) {
-                    prefill_candidates.clear();
-                    sched_prefill_toks_tick = 0;
-                    planned_prefill_rows_tick = 0;
-                    SRV_DBG("[paged-scheduler] decode-burst tokens=%d (suppressing long prefill)\n",
-                            sched_decode_toks_tick);
-                }
-                if (split_mixed_batch) {
-                    // Phase A (latency mode): decode-only first.
-                    prefill_cursor.prefill_total_budget = 0;
-                    prefill_cursor.prefill_per_request_budget = 0;
-                }
-            }
+            const auto policy_result = make_paged_prefill_decode_policy().prepare({
+                /*reqs=*/&paged_requests,
+                /*policy_config=*/&sched_policy_cfg_,
+                /*schedule_decision=*/&schedule_decision,
+                /*tick_decision=*/&tick_decision,
+                /*prefill_rr_cursor=*/&paged_prefill_rr_cursor,
+                /*decode_burst_steps=*/&paged_decode_burst_steps,
+                /*decode_steps_since_long_prefill=*/&paged_decode_steps_since_long_prefill,
+                /*n_decode_active=*/n_decode_active,
+                /*max_num_scheduled_tokens=*/max_num_scheduled_tokens,
+                /*prefill_threshold=*/prefill_threshold,
+                /*batch_tokens=*/batch.n_tokens,
+            });
+            const int32_t decode_tokens_in_batch = policy_result.decode_tokens_in_batch;
+            std::vector<size_t> prefill_candidates = policy_result.prefill_candidates;
+            const auto budget = policy_result.budget;
+            auto prefill_cursor = policy_result.prefill_cursor;
+            int32_t sched_decode_toks_tick = policy_result.sched_decode_toks_tick;
+            int32_t sched_prefill_toks_tick = policy_result.sched_prefill_toks_tick;
+            int32_t planned_decode_rows_tick = policy_result.planned_decode_rows_tick;
+            int32_t planned_prefill_rows_tick = policy_result.planned_prefill_rows_tick;
+            const int32_t active_reqs_tick = policy_result.active_reqs_tick;
+            const int32_t decode_ready_reqs_tick = policy_result.decode_ready_reqs_tick;
+            const int32_t prefill_ready_reqs_tick = policy_result.prefill_ready_reqs_tick;
+            const bool split_mixed_batch = policy_result.split_mixed_batch;
 
             const auto prefill_pass = server_scheduler::PagedScheduler::process_prefill_candidates(
                 paged_requests,
