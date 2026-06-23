@@ -1454,7 +1454,7 @@ private:
                 server_scheduler::CallbackSchedulerBackend::Callbacks{
                     /*launch_completion=*/[this](server_task && t) { launch_completion_paged(std::move(t)); },
                     /*cancel=*/[this](int id_target) { cancel_paged(id_target); },
-                    /*tick=*/[this]() { update_slots(); },
+                    /*tick=*/[this]() { update_paged_tick(); },
                 });
         } else {
             backend_ = std::make_unique<server_scheduler::CallbackSchedulerBackend>(
@@ -3993,12 +3993,10 @@ private:
         }
     }
 
-    void update_slots() {
-        // ----------------------------------------------------------------
-        // Paged-scheduler execution path — runs entirely on paged_requests,
-        // no server_slot involved. Early-returns after handling everything.
-        // ----------------------------------------------------------------
-        if (params_base.scheduler == "paged") {
+    // Paged-scheduler tick — runs entirely on paged_requests, no server_slot
+    // involved. Invoked directly by the paged backend's tick callback.
+    void update_paged_tick() {
+        {
             // 0. periodic TTL/LRU sweep of cached KV blocks
             make_paged_cache_sweeper().maybe_sweep();
 
@@ -4246,13 +4244,13 @@ private:
             }
 
             SRV_DBG("%s", "[paged] run completed\n");
-            return; // <-- early return, skip slot-based path below
+            return;
         }
+    }
 
-        // ----------------------------------------------------------------
-        // Legacy slot-based execution path (non-paged schedulers)
-        // ----------------------------------------------------------------
-
+    // Legacy slot-based execution path (non-paged schedulers). Invoked by the
+    // legacy backend's tick callback.
+    void update_slots() {
         // check if all slots are idle
         {
             bool all_idle = true;
