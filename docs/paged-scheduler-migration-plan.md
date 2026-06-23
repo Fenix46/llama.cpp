@@ -437,15 +437,17 @@ Rimuovere il grosso branch paged da `update_slots()`.
 - [x] Spostare callbacks di decode/sampling in `server_context_impl::make_paged_on_segment_sample()`, `make_paged_decode_callbacks()` e `make_paged_decode_metrics_callback()`; decode pass immediata e pass split mixed-batch condividono ora un solo builder (no duplicazione fatal/retry/sample).
 - [x] Spostare gestione `kv_sched` metrics per paged in `make_paged_decode_metrics_callback()` (callback `on_segment_decoded` della decode pass immediata).
 - [x] Spostare gestione empty-turn/stall in `server_context_impl::handle_paged_empty_turn()` (ritorna Continue/Yield, l'early return resta in `update_slots()`). Classificazione fase non-split + burst counter in `update_paged_nonsplit_phase_metrics()`.
-- [ ] Lasciare `server_context_impl::update_slots()` come dispatch a `backend->tick()`.
+- [x] Branch paged estratto in `update_paged_tick()`, raggiunto direttamente dal callback `tick` del backend paged. `update_slots()` ora è il path legacy-only. La dispatch paged-vs-legacy del tick passa per la boundary backend (`backend_->tick()`), non più per un branch runtime dentro `update_slots()`.
 
 ### Criteri di completamento
 
-- [ ] `update_slots()` non contiene più logica paged interna.
-- [ ] Paged completions base funzionano.
-- [ ] Streaming paged funziona.
-- [ ] Cancel durante decode funziona.
-- [ ] Metrics decode/prefill ancora aggiornate.
+- [x] `update_slots()` non contiene più logica paged interna (paged → `update_paged_tick()`).
+- [x] Paged completions base funzionano. (verificato runtime gemma-4-E2B)
+- [x] Streaming paged funziona. (verificato runtime, 10 chunk SSE)
+- [x] Cancel durante decode funziona. (verificato: disconnect mid-flight, server sopravvive, abort_request loggato)
+- [x] Metrics decode/prefill ancora aggiornate. (`kv_sched->on_decoded` invariato in `make_paged_decode_metrics_callback()`)
+
+Nota: `update_paged_tick()` è ancora un metodo di `server_context_impl`, non di un `PagedSchedulerBackend` separato che possiede lo stato. La boundary è raggiunta (il backend lo chiama), ma l'ownership dello stato runtime resta in `server_context_impl` (vedi Fase 7/8/10).
 
 ---
 
