@@ -72,6 +72,19 @@ PagedScheduleBuildResult PagedScheduleBuilder::build() const {
                     SchedulerCore::normalize_reason("no-task"),
                 };
             }
+            // A request that is already processing has already passed admission
+            // at launch time and holds its seq-id lease / reserved blocks. The
+            // admission cap counts active requests, so re-evaluating an active
+            // request double-counts it against the cap (running+1 > cap) and
+            // would wrongly defer it forever — it never gets scheduled for
+            // prefill, never decodes, and the scheduler stalls at full capacity.
+            // Already-admitted requests only need scheduling, not re-admission.
+            if (req.is_processing()) {
+                return SchedulerCore::AdmissionEval{
+                    true,
+                    SchedulerCore::normalize_reason("already-admitted"),
+                };
+            }
             const auto admission = config_.admission_decision
                 ? config_.admission_decision(*req.task)
                 : AdmissionDecision{false, false, 0, 0, "no-admission-callback"};
