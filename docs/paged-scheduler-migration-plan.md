@@ -377,24 +377,17 @@ Togliere da `server_context_impl` la responsabilità diretta di creare e ammette
 
 ### Task
 
-- [ ] Spostare `get_or_create_paged_request()` nel backend paged o in un componente dedicato.
-- [ ] Spostare `try_lineage_reuse()` fuori da `server_context_impl`.
-- [ ] Spostare `paged_admission_decision()` e `paged_admission_available()` nel backend paged/admission layer.
-- [ ] Rendere esplicite le dipendenze richieste:
-  - `ctx`
-  - `params_base`
-  - `paged_requests`
-  - `paged_seq_leases`
-  - `BlockManager`
-  - `LineageManager`
-  - `PrefixReuseManager`
+- [x] `get_or_create_paged_request()` delega a `PagedRequestAllocator::get_or_create()` (`server-context.cpp:1704`, thin wrapper).
+- [~] `try_lineage_reuse()`: **codice morto**. Definito in `server-context.cpp:1617` ma mai chiamato (unica altra menzione è un commento a riga ~3582). La feature lineage-sticky seq reuse (commit `8249c05f9`) è di fatto **disattivata**: il `LineageManager` viene popolato al release (`on_release_cached`) e swept, ma il lato read/reuse (`check_hit`/`lease_specific`/`on_activate`, usati solo dentro `try_lineage_reuse`) non viene mai invocato. Il prefix-cache normale copre comunque il riuso KV. **Decisione: lasciato com'è, da rivalutare separatamente** (non rimosso né ricollegato).
+- [x] `paged_admission_decision()` / `paged_admission_available()` delegano a `PagedRequestAllocator::admission_decision()/admission_available()` (`server-context.cpp:3475`).
+- [x] Dipendenze esplicite: incapsulate in `PagedRequestAllocatorConfig` (ctx, params_base, paged_requests, paged_seq_leases, lineage_mgr, blocchi, prefix_cache_invalidate callback).
 - [ ] Aggiungere test/manual repro per capacity reached e KV exhausted.
 
 ### Criteri di completamento
 
-- [ ] `process_single_task()` non contiene più dettagli di lease/admission paged.
-- [ ] Defer per paged capacity funziona come prima.
-- [ ] Reuse/cached seq non cambia comportamento.
+- [x] `process_single_task()` non contiene più dettagli di lease/admission paged (delega via `launch_completion_paged` → allocator).
+- [~] Defer per paged capacity: **BUG PRE-ESISTENTE TROVATO**. Repro: `--scheduler paged --max-num-seqs 4 --gpu-memory-utilization 0.5`, 6 richieste concorrenti → 4 partono e finiscono in <1s, le 2 deferred **non vengono mai ri-ammesse** (timeout). Causa: `pop_deferred_task()` è chiamato SOLO da `server_slot::callback_on_release` (`server-context.cpp:907`), ma in paged mode non esistono `server_slot` (`initial_slot_count()` → 0), quindi quel callback non scatta mai. Il `callback_on_release` paged (`paged_request_launcher.cpp:101`) NON chiama `pop_deferred_task`. Non introdotto dal refactor Fase 1 (preservato verbatim). **Da fixare separatamente** (decisione utente: documentare e proseguire).
+- [~] Reuse/cached seq non cambia comportamento. **Eccezione nota**: lineage-sticky reuse era già disattivata prima di questa fase (vedi sopra). Il riuso via prefix-cache è invariato.
 
 ---
 
@@ -406,18 +399,19 @@ Rendere `launch_paged_request()` responsabilità del backend paged.
 
 ### Task
 
-- [ ] Spostare logica LoRA/aLoRA paged in helper condiviso o backend paged.
-- [ ] Spostare validazione token paged.
-- [ ] Spostare setup sampler paged.
-- [ ] Spostare setup callback release paged.
-- [ ] Spostare `execute_prefix_reuse_plan()` o incapsularlo nel backend paged.
-- [ ] Separare error reporting server da logica backend con callback dedicate.
+Tutto delegato a `PagedRequestLauncher` (`tools/server/scheduler/paged_request_launcher.{h,cpp}`); `launch_paged_request()` (`server-context.cpp:2623`) è un thin wrapper.
+
+- [x] LoRA/aLoRA: via callback `construct_lora_list` nel `PagedRequestLauncherConfig`.
+- [x] Validazione token + setup sampler: dentro `PagedRequestLauncher::launch()`.
+- [x] Callback release: via `register_prefix_cache_on_release` / `lifecycle_release_request` / `core_on_request_finished`.
+- [x] `execute_prefix_reuse_plan()`: via callback nel config.
+- [x] Error reporting separato: callback `send_error` dedicata, la logica backend non costruisce risposte HTTP.
 
 ### Criteri di completamento
 
-- [ ] Launch paged non dipende direttamente da `server_slot`.
-- [ ] Launch legacy e launch paged sono chiaramente separati.
-- [ ] Errori sampler/token validation sono propagati correttamente.
+- [x] Launch paged non dipende direttamente da `server_slot` (verificato: 0 ref a `server_slot`/`slots`/`get_slot_by_id` nel launcher e in `launch_completion_paged`).
+- [x] Launch legacy e launch paged sono chiaramente separati (`launch_completion_paged` vs `launch_completion_legacy`, dispatch via backend).
+- [x] Errori sampler/token validation propagati via callback `send_error`.
 
 ---
 
