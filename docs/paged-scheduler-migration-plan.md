@@ -617,24 +617,44 @@ Eliminare duplicazione di comportamento senza forzare un modello unico prematuro
 
 ### Task
 
-- [ ] Confrontare campi comuni:
-  - output state
-  - generated tokens/probs
-  - stop state
-  - timings
-  - sampling state
-  - LoRA state
-  - prompt counters
-- [ ] Estrarre helper condivisi solo dove riducono duplicazione reale.
-- [ ] Evitare dipendenze dal backend legacy nel paged backend.
-- [ ] Consolidare `process_token()` dove possibile.
-- [ ] Consolidare response final/partial dove possibile tramite callback backend-agnostiche.
+- [x] Confrontare campi comuni `server_slot` vs `paged_request_state`:
+  - output state: `server_slot` ha i campi inline (`generated_text`, `n_sent_text`,
+    `has_next_token`, `has_new_line`, `truncated`, `stop`, `stopping_word`,
+    `last_nl_pos`); `paged_request_state` li incapsula già in
+    `paged_request_output_state output`.
+  - generated tokens/probs, stop state, prompt counters, timings, sampling/LoRA:
+    presenti in entrambi con nomi quasi identici.
+  - Le due `process_token()` erano **logicamente identiche**, divergevano solo per
+    `slot.X` (inline) vs `req.output.X` e per i tag di log (`SLT_DBG`/`PGD_DBG`).
+- [x] Estrarre helper condivisi solo dove riducono duplicazione reale: estratta la
+      pipeline di token-stopping in `paged_request_state::process_sampled_token()`
+      (`paged-request.h`), che opera su `output` e prende `vocab`, `ctx_shift`,
+      `global_params` e una callback `on_stream_partial` per lo streaming.
+- [x] Evitare dipendenze dal backend legacy nel paged backend: l'helper vive sulla
+      struct paged, non tocca `server_slot`.
+- [x] Consolidare `process_token()`: il `process_token(paged_request_state&)` di
+      `server_context_impl` è ora un thin wrapper di ~11 righe (da ~117) che delega
+      all'helper. Il `process_token(server_slot&)` legacy resta **invariato**
+      (scelta a basso rischio: nessuna regressione legacy).
+- [~] Consolidare response final/partial: rinviato. `send_partial_response` /
+      `send_final_response` divergono di più (costruzione JSON, campi slot vs req);
+      l'unificazione via callback backend-agnostiche è un passo separato a maggior
+      rischio, non incluso qui.
+
+### Stato
+
+Duplicazione del token-stopping eliminata sul lato paged senza toccare il legacy.
+Verificato runtime (LFM2.5-1.2B, paged): n_predict limit (`stop_type=limit`, esatto),
+stop word (`stop_type=word`, troncamento corretto), streaming (11 chunk SSE) ed EOS
+naturale (`stop_type=eos`) tutti identici al comportamento pre-refactor.
 
 ### Criteri di completamento
 
-- [ ] Meno codice duplicato in launch/token processing/response.
-- [ ] Nessuna regressione legacy.
-- [ ] Nessuna dipendenza paged da `server_slot` introdotta per comodità.
+- [x] Meno codice duplicato in token processing (~106 righe in meno, logica in un
+      solo posto sul path paged).
+- [x] Nessuna regressione legacy (`server_slot::process_token` intatto; verificato build).
+- [x] Nessuna dipendenza paged da `server_slot` introdotta (helper sulla struct paged).
+- [~] Response final/partial non ancora consolidate (vedi sopra).
 
 ---
 

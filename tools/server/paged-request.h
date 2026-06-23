@@ -195,6 +195,136 @@ struct paged_request_state {
         output.generated_token_probs.push_back(token);
     }
 
+    // Core token-stopping pipeline shared by the paged decode path: appends the
+    // sampled token, strips stop words, applies UTF-8/context/budget/indent/time/EOS
+    // limits, and updates output.* state. Side effects that need server context are
+    // passed in: `vocab` for EOG detection, `ctx_shift` for the context-limit guard,
+    // and `on_stream_partial` to emit a streaming chunk when params.stream is set.
+    // Returns true if generation should continue.
+    bool process_sampled_token(
+            completion_token_output & result,
+            const llama_vocab * vocab,
+            bool ctx_shift,
+            const common_params & global_params,
+            const std::function<void(const completion_token_output &)> & on_stream_partial) {
+        GGML_ASSERT(task);
+
+        const std::string token_str = result.text_to_send;
+        sampled = result.tok;
+
+        output.generated_text += token_str;
+        if (task->params.return_tokens) {
+            output.generated_tokens.push_back(result.tok);
+        }
+        output.has_next_token = true;
+
+        const bool incomplete = validate_utf8(output.generated_text) < output.generated_text.size();
+
+        if (!incomplete) {
+            size_t pos = std::min(output.n_sent_text, output.generated_text.size());
+
+            const std::string str_test = output.generated_text.substr(pos);
+            bool send_text = true;
+
+            size_t stop_pos = find_stopping_strings(str_test, token_str.size(), true);
+            if (stop_pos != std::string::npos) {
+                output.generated_text.erase(
+                    output.generated_text.begin() + pos + stop_pos,
+                    output.generated_text.end());
+                pos = std::min(output.n_sent_text, output.generated_text.size());
+            } else if (output.has_next_token && !llama_vocab_is_eog(vocab, result.tok)) {
+                stop_pos = find_stopping_strings(str_test, token_str.size(), false);
+                send_text = stop_pos == std::string::npos;
+            }
+
+            if (send_text) {
+                result.text_to_send = output.generated_text.substr(pos, std::string::npos);
+                output.n_sent_text += result.text_to_send.size();
+            } else {
+                result.text_to_send = "";
+            }
+
+            add_token(result);
+            if (task->params.stream && on_stream_partial) {
+                on_stream_partial(result);
+            }
+        } else {
+            output.has_next_token = true;
+        }
+
+        if (!ctx_shift && prompt.n_tokens() + 1 >= n_ctx) {
+            output.truncated      = true;
+            output.stop           = STOP_TYPE_LIMIT;
+            output.has_next_token = false;
+
+            PGD_DBG(*this, "stopped due to context limit, n_tokens=%d, n_ctx=%d\n",
+                    prompt.n_tokens(), n_ctx);
+        }
+
+        if (n_decoded > 0 && output.has_next_token && !has_budget(global_params)) {
+            output.stop           = STOP_TYPE_LIMIT;
+            output.has_next_token = false;
+
+            PGD_DBG(*this, "stopped by limit, n_decoded=%d, n_predict=%d\n",
+                    n_decoded, task->params.n_predict);
+        }
+
+        if (output.has_new_line) {
+            if (task->params.n_indent > 0) {
+                if (output.last_nl_pos > 0) {
+                    size_t pos = output.last_nl_pos;
+
+                    int n_indent = 0;
+                    while (pos < output.generated_text.size() &&
+                           (output.generated_text[pos] == ' ' || output.generated_text[pos] == '\t')) {
+                        n_indent++;
+                        pos++;
+                    }
+
+                    if (pos < output.generated_text.size() && n_indent < task->params.n_indent) {
+                        output.stop           = STOP_TYPE_LIMIT;
+                        output.has_next_token = false;
+                        output.generated_text.erase(pos, std::string::npos);
+
+                        PGD_DBG(*this, "stopped by indentation limit, n_decoded=%d, n_indent=%d\n",
+                                n_decoded, n_indent);
+                    }
+                }
+
+                {
+                    const size_t pos = output.generated_text.find('\n', output.last_nl_pos);
+                    if (pos != std::string::npos) {
+                        output.last_nl_pos = pos + 1;
+                    }
+                }
+            }
+        }
+
+        if (result.text_to_send.find('\n') != std::string::npos) {
+            output.has_new_line = true;
+
+            if (task->params.t_max_predict_ms > 0 &&
+                (ggml_time_us() - t_start_generation > 1000.0f * task->params.t_max_predict_ms)) {
+                output.stop           = STOP_TYPE_LIMIT;
+                output.has_next_token = false;
+
+                PGD_DBG(*this, "stopped by time limit, n_decoded=%d\n", n_decoded);
+            }
+        }
+
+        if (llama_vocab_is_eog(vocab, result.tok)) {
+            output.stop           = STOP_TYPE_EOS;
+            output.has_next_token = false;
+
+            PGD_DBG(*this, "%s", "stopped by EOS\n");
+        }
+
+        PGD_DBG(*this, "n_decoded=%d, n_remaining=%d, next token: %5d '%s'\n",
+                n_decoded, n_remaining, result.tok, token_str.c_str());
+
+        return output.has_next_token;
+    }
+
     size_t find_stopping_strings(const std::string & text, const size_t last_token_size, bool is_full_stop) {
         GGML_ASSERT(task);
 

@@ -2778,122 +2778,16 @@ private:
     }
 
     bool process_token(completion_token_output & result, paged_request_state & req) {
-        const std::string token_str = result.text_to_send;
-        req.sampled = result.tok;
-
-        req.output.generated_text += token_str;
-        if (req.task->params.return_tokens) {
-            req.output.generated_tokens.push_back(result.tok);
-        }
-        req.output.has_next_token = true;
-
-        bool incomplete = validate_utf8(req.output.generated_text) < req.output.generated_text.size();
-
-        if (!incomplete) {
-            size_t pos = std::min(req.output.n_sent_text, req.output.generated_text.size());
-
-            const std::string str_test = req.output.generated_text.substr(pos);
-            bool send_text = true;
-
-            size_t stop_pos = req.find_stopping_strings(str_test, token_str.size(), true);
-            if (stop_pos != std::string::npos) {
-                req.output.generated_text.erase(
-                    req.output.generated_text.begin() + pos + stop_pos,
-                    req.output.generated_text.end());
-                pos = std::min(req.output.n_sent_text, req.output.generated_text.size());
-            } else if (req.output.has_next_token && !llama_vocab_is_eog(vocab, result.tok)) {
-                stop_pos = req.find_stopping_strings(str_test, token_str.size(), false);
-                send_text = stop_pos == std::string::npos;
-            }
-
-            if (send_text) {
-                result.text_to_send = req.output.generated_text.substr(pos, std::string::npos);
-                req.output.n_sent_text += result.text_to_send.size();
-            } else {
-                result.text_to_send = "";
-            }
-
-            req.add_token(result);
-            if (req.task->params.stream) {
-                send_partial_response(req, result, false);
-            }
-        }
-
-        if (incomplete) {
-            req.output.has_next_token = true;
-        }
-
-        if (!params_base.ctx_shift && req.prompt.n_tokens() + 1 >= req.n_ctx) {
-            req.output.truncated      = true;
-            req.output.stop           = STOP_TYPE_LIMIT;
-            req.output.has_next_token = false;
-
-            PGD_DBG(req, "stopped due to context limit, n_tokens=%d, n_ctx=%d\n",
-                    req.prompt.n_tokens(), req.n_ctx);
-        }
-
-        if (req.n_decoded > 0 && req.output.has_next_token && !req.has_budget(params_base)) {
-            req.output.stop           = STOP_TYPE_LIMIT;
-            req.output.has_next_token = false;
-
-            PGD_DBG(req, "stopped by limit, n_decoded=%d, n_predict=%d\n",
-                    req.n_decoded, req.task->params.n_predict);
-        }
-
-        if (req.output.has_new_line) {
-            if (req.task->params.n_indent > 0) {
-                if (req.output.last_nl_pos > 0) {
-                    size_t pos = req.output.last_nl_pos;
-
-                    int n_indent = 0;
-                    while (pos < req.output.generated_text.size() &&
-                           (req.output.generated_text[pos] == ' ' || req.output.generated_text[pos] == '\t')) {
-                        n_indent++;
-                        pos++;
-                    }
-
-                    if (pos < req.output.generated_text.size() && n_indent < req.task->params.n_indent) {
-                        req.output.stop           = STOP_TYPE_LIMIT;
-                        req.output.has_next_token = false;
-                        req.output.generated_text.erase(pos, std::string::npos);
-
-                        PGD_DBG(req, "stopped by indentation limit, n_decoded=%d, n_indent=%d\n",
-                                req.n_decoded, n_indent);
-                    }
-                }
-
-                {
-                    const size_t pos = req.output.generated_text.find('\n', req.output.last_nl_pos);
-                    if (pos != std::string::npos) {
-                        req.output.last_nl_pos = pos + 1;
-                    }
-                }
-            }
-        }
-
-        if (result.text_to_send.find('\n') != std::string::npos) {
-            req.output.has_new_line = true;
-
-            if (req.task->params.t_max_predict_ms > 0 &&
-                (ggml_time_us() - req.t_start_generation > 1000.0f * req.task->params.t_max_predict_ms)) {
-                req.output.stop           = STOP_TYPE_LIMIT;
-                req.output.has_next_token = false;
-
-                PGD_DBG(req, "stopped by time limit, n_decoded=%d\n", req.n_decoded);
-            }
-        }
-
-        if (llama_vocab_is_eog(vocab, result.tok)) {
-            req.output.stop           = STOP_TYPE_EOS;
-            req.output.has_next_token = false;
-
-            PGD_DBG(req, "%s", "stopped by EOS\n");
-        }
-
-        PGD_DBG(req, "n_decoded=%d, n_remaining=%d, next token: %5d '%s'\n",
-                req.n_decoded, req.n_remaining, result.tok, token_str.c_str());
-
-        return req.output.has_next_token;
+        // Token-stopping pipeline lives on paged_request_state; the only server-side
+        // side effect is the streaming partial response, injected as a callback.
+        return req.process_sampled_token(
+            result,
+            vocab,
+            params_base.ctx_shift,
+            params_base,
+            [this, &req](const completion_token_output & tkn) {
+                send_partial_response(req, tkn, false);
+            });
     }
 
     void populate_token_probs(const server_slot & slot, completion_token_output & result, bool post_sampling, bool special, int idx) const {
