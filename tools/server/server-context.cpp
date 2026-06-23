@@ -2594,6 +2594,10 @@ private:
             /*register_prefix_cache_on_release=*/[this](int32_t seq_id) {
                 register_paged_prefix_cache_on_release(seq_id);
             },
+            /*pop_deferred_task=*/[this]() {
+                // paged release is not slot-keyed; -1 pops the oldest deferred task
+                queue_tasks.pop_deferred_task(-1);
+            },
             /*find_request_by_seq_id=*/[this](int32_t seq_id) -> server_scheduler::RequestState * {
                 return get_paged_request_by_seq_id(seq_id);
             },

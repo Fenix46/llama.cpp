@@ -34,6 +34,11 @@ struct PagedRequestLauncherConfig {
     std::function<void(RequestState &, const char *)> reset_runtime_state_for_new_request;
     std::function<void(const server_task &, const std::string &, error_type)> send_error;
     std::function<void(int32_t)> register_prefix_cache_on_release;
+    // Drain one deferred task from the queue when a paged request is released,
+    // freeing capacity for tasks that were deferred under admission pressure.
+    // Mirrors the legacy server_slot::callback_on_release behavior, which never
+    // fires in paged mode (no server_slot exists).
+    std::function<void()> pop_deferred_task;
     std::function<RequestState *(int32_t)> find_request_by_seq_id;
     std::function<void(RequestState &)> lifecycle_release_request;
     std::function<void(int32_t)> core_on_request_finished;

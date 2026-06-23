@@ -103,6 +103,7 @@ bool PagedRequestLauncher::launch(RequestState & req, server_task && task) const
             find_request_by_seq_id,
             lifecycle_release_request,
             core_on_request_finished,
+            pop_deferred_task = config_.pop_deferred_task,
             lifecycle_enabled](int32_t seq_id) {
         RequestState * rel = find_request_by_seq_id ? find_request_by_seq_id(seq_id) : nullptr;
         if (lifecycle_enabled && rel) {
@@ -113,6 +114,11 @@ bool PagedRequestLauncher::launch(RequestState & req, server_task && task) const
         }
         if ((!lifecycle_enabled || !rel) && core_on_request_finished) {
             core_on_request_finished(seq_id);
+        }
+        // Capacity freed: pull a deferred task back into the main queue so
+        // requests deferred under admission pressure get retried.
+        if (pop_deferred_task) {
+            pop_deferred_task();
         }
     };
 
