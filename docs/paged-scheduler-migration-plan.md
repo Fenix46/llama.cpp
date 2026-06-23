@@ -430,7 +430,7 @@ Rimuovere il grosso branch paged da `update_slots()`.
 - [x] Spostare costruzione schedule decision in `server_scheduler::PagedScheduleBuilder` (`tools/server/scheduler/paged_schedule_builder.{h,cpp}`).
 - [x] Spostare policy prefill/decode in `server_scheduler::PagedPrefillDecodePolicy` (`tools/server/scheduler/paged_prefill_decode_policy.{h,cpp}`).
 - [x] Spostare callbacks di prefill in `server_context_impl::make_paged_prefill_callbacks()` e rimuovere duplicazione fase A/B.
-- [ ] Spostare callbacks di decode/sampling.
+- [x] Spostare callbacks di decode/sampling in `server_context_impl::make_paged_on_segment_sample()`, `make_paged_decode_callbacks()` e `make_paged_decode_metrics_callback()`; decode pass immediata e pass split mixed-batch condividono ora un solo builder (no duplicazione fatal/retry/sample).
 - [ ] Spostare gestione `kv_sched` metrics per paged.
 - [ ] Spostare gestione empty-turn/stall.
 - [ ] Lasciare `server_context_impl::update_slots()` come dispatch a `backend->tick()`.
