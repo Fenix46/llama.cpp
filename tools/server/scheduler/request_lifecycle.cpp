@@ -233,13 +233,35 @@ bool RequestLifecycle::register_prefix_cache_on_release(
                 (registered && reg_result.registered_entries > 0 && reg_result.retained_blocks > 0) ? 1 : 0,
                 reg_result.registered_entries,
                 reg_result.retained_blocks);
-        if (ops_.lineage_register_cached) {
+        if (registered && ops_.lineage_register_cached) {
             ops_.lineage_register_cached(*req, seq_id, ops_.now_us ? ops_.now_us() : 0);
         }
-        if (ops_.seq_mark_cached) {
-            ops_.seq_mark_cached(seq_id);
+        const bool has_block_cache_entry =
+                registered &&
+                reg_result.has_block_entries &&
+                reg_result.registered_entries > 0 &&
+                reg_result.retained_blocks > 0;
+        if (has_block_cache_entry) {
+            prepare_empty_sequence_for_prefix_copy(*req, "release-cached-seq");
+            reset_runtime_state_for_new_request(*req, "release-cached-seq");
+            if (ops_.seq_release_uncached) {
+                ops_.seq_release_uncached(seq_id);
+            }
+            req->seq_id = -1;
+            req->prompt.checkpoints.clear();
+        } else if (registered) {
+            if (ops_.seq_mark_cached) {
+                ops_.seq_mark_cached(seq_id);
+            }
+        } else {
+            prepare_empty_sequence_for_prefix_copy(*req, "release-cache-register-failed");
+            reset_runtime_state_for_new_request(*req, "release-cache-register-failed");
+            if (ops_.seq_release_uncached) {
+                ops_.seq_release_uncached(seq_id);
+            }
+            req->seq_id = -1;
         }
-        return true;
+        return registered;
     }
 
     if (req != nullptr) {

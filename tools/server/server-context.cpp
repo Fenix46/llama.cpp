@@ -1941,6 +1941,10 @@ private:
                 req, seq_id, prefix_cache_ != nullptr, params_base.cache_ram_mib);
             return;
         }
+        register_paged_prefix_cache_on_release_legacy(seq_id, req);
+    }
+
+    void register_paged_prefix_cache_on_release_legacy(int32_t seq_id, paged_request_state * req) {
         const bool cacheable_task =
             req != nullptr &&
             req->task &&

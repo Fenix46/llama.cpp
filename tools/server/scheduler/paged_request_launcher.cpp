@@ -104,13 +104,14 @@ bool PagedRequestLauncher::launch(RequestState & req, server_task && task) const
             lifecycle_release_request,
             core_on_request_finished,
             lifecycle_enabled](int32_t seq_id) {
-        if (register_prefix_cache_on_release) {
-            register_prefix_cache_on_release(seq_id);
-        }
         RequestState * rel = find_request_by_seq_id ? find_request_by_seq_id(seq_id) : nullptr;
         if (lifecycle_enabled && rel) {
             lifecycle_release_request(*rel);
-        } else if (core_on_request_finished) {
+        }
+        if (register_prefix_cache_on_release) {
+            register_prefix_cache_on_release(seq_id);
+        }
+        if ((!lifecycle_enabled || !rel) && core_on_request_finished) {
             core_on_request_finished(seq_id);
         }
     };

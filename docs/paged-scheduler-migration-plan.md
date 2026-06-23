@@ -285,7 +285,7 @@ Stato parziale: prefix reuse estratto in `server_scheduler::PagedPrefixReuse` in
 - [x] Release callback, prefix reuse call e lifecycle create/admit spostati in `PagedRequestLauncher::launch()`.
 - [x] `execute_prefix_reuse_plan()`.
 - [x] `build_prefix_reuse_metadata()`.
-- [ ] `register_paged_prefix_cache_on_release()` solo se prima si chiarisce ownership con `RequestLifecycle`.
+- [x] `register_paged_prefix_cache_on_release()`: ownership chiarita in `RequestLifecycle::register_prefix_cache_on_release()`; `server_context_impl` mantiene solo wrapper/fallback legacy.
 
 Reason: launch introduce dipendenze su LoRA, sampler, prefix cache e error reporting; va fatto dopo il nucleo allocation.
 
@@ -524,7 +524,7 @@ Ridurre callback sparse e rendere `RequestLifecycle` il punto centrale delle tra
   - release uncached
 - [ ] Spostare aggiornamenti `paged_core` nel lifecycle dove possibile.
 - [ ] Spostare aggiornamenti `paged_seq_leases` nel lifecycle dove possibile.
-- [ ] Spostare registrazione/invalidation prefix cache nel lifecycle dove possibile.
+- [x] Spostare registrazione/release prefix cache nel lifecycle dove possibile; invalidation resta via callback dal lifecycle al server layer.
 - [ ] Spostare integrazione lineage nel lifecycle dove possibile.
 - [ ] Ridurre callback `callback_on_release` a un singolo entrypoint lifecycle.
 
