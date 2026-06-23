@@ -349,19 +349,23 @@ Creare una boundary senza cambiare comportamento.
 
 ### Task
 
-- [ ] Definire interfaccia interna `ServerSchedulerBackend` o nome equivalente.
-- [ ] Definire tipo handle interno separato da `id_slot`.
-- [ ] Creare `SlotSchedulerBackend` come thin wrapper del path legacy.
-- [ ] Creare `PagedSchedulerBackend` come thin wrapper del path paged.
-- [ ] Spostare la selezione `scheduler == "paged"` verso init/configurazione backend.
-- [ ] Lasciare temporaneamente implementazioni delegate a `server_context_impl` se necessario.
+- [x] Definire interfaccia interna `ServerSchedulerBackend` (`tools/server/scheduler/scheduler_backend.h`): `launch_completion()`, `cancel()`, `tick()`. Metrics/save/restore/erase volutamente fuori (semantica paged ancora da normalizzare — Fase 6).
+- [ ] Definire tipo handle interno separato da `id_slot`. (rinviato a Fase 5)
+- [x] Creare wrapper legacy: `CallbackSchedulerBackend` con callback verso `launch_completion_legacy()` / `cancel_legacy()` / `update_slots()`.
+- [x] Creare wrapper paged: stesso `CallbackSchedulerBackend` con callback verso `launch_completion_paged()` / `cancel_paged()` / `update_slots()`.
+- [x] Spostare la selezione `scheduler == "paged"` per launch/cancel/tick in `init()` (creazione `backend_`). NB: restano ~28 branch `scheduler == "paged"` in sizing/init/metrics, fuori dal hot loop — cleanup in Fase 10.
+- [x] Implementazioni delegate a `server_context_impl` via callback (i due rami completion/cancel sono stati estratti verbatim in metodi dedicati).
+
+### Stato
+
+Boundary introdotta (commit `dfaf210e2`). `server_context_impl` ora dispatcha launch/cancel/tick attraverso `backend_` invece di branchare inline nel loop. Il `tick()` chiama ancora `update_slots()`, che mantiene lo split paged/legacy interno fino a Fase 4/10. Nessun cambio di comportamento. Resta da fare: backend che possiede davvero lo stato runtime (oggi delega tutto a `server_context_impl`).
 
 ### Criteri di completamento
 
-- [ ] Il server compila.
-- [ ] Legacy scheduler mantiene completions base.
-- [ ] Paged scheduler mantiene completions base.
-- [ ] `server_context_impl` sceglie un backend, anche se la logica è ancora parzialmente delegata.
+- [x] Il server compila.
+- [ ] Legacy scheduler mantiene completions base. (build OK; runtime smoke test non eseguito — modello non disponibile)
+- [ ] Paged scheduler mantiene completions base. (build OK; runtime smoke test non eseguito — modello non disponibile)
+- [x] `server_context_impl` sceglie un backend, anche se la logica è ancora parzialmente delegata.
 
 ---
 
