@@ -431,8 +431,8 @@ Rimuovere il grosso branch paged da `update_slots()`.
 - [x] Spostare policy prefill/decode in `server_scheduler::PagedPrefillDecodePolicy` (`tools/server/scheduler/paged_prefill_decode_policy.{h,cpp}`).
 - [x] Spostare callbacks di prefill in `server_context_impl::make_paged_prefill_callbacks()` e rimuovere duplicazione fase A/B.
 - [x] Spostare callbacks di decode/sampling in `server_context_impl::make_paged_on_segment_sample()`, `make_paged_decode_callbacks()` e `make_paged_decode_metrics_callback()`; decode pass immediata e pass split mixed-batch condividono ora un solo builder (no duplicazione fatal/retry/sample).
-- [ ] Spostare gestione `kv_sched` metrics per paged.
-- [ ] Spostare gestione empty-turn/stall.
+- [x] Spostare gestione `kv_sched` metrics per paged in `make_paged_decode_metrics_callback()` (callback `on_segment_decoded` della decode pass immediata).
+- [x] Spostare gestione empty-turn/stall in `server_context_impl::handle_paged_empty_turn()` (ritorna Continue/Yield, l'early return resta in `update_slots()`). Classificazione fase non-split + burst counter in `update_paged_nonsplit_phase_metrics()`.
 - [ ] Lasciare `server_context_impl::update_slots()` come dispatch a `backend->tick()`.
 
 ### Criteri di completamento
