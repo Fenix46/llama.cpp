@@ -2317,6 +2317,74 @@ private:
         };
     }
 
+    // Result of evaluating a zero-token paged decode turn.
+    enum class PagedEmptyTurnAction {
+        Continue, // batch has tokens, proceed with decode
+        Yield,    // zero tokens but pending work exists; caller should return and retry next tick
+    };
+
+    // In paged latency scheduling a zero-token turn can happen when budgets/plans
+    // yield no executable work for this immediate pass. Yield (and reset the empty
+    // counter) when prefill/decode-ready work is still pending; only abort if the
+    // scheduler stalls with truly nothing to do for several consecutive ticks.
+    PagedEmptyTurnAction handle_paged_empty_turn(int32_t decode_ready_reqs_tick,
+                                                 int32_t prefill_ready_reqs_tick) {
+        if (batch.n_tokens != 0) {
+            n_empty_consecutive = 0;
+            return PagedEmptyTurnAction::Continue;
+        }
+
+        SRV_WRN("%s", "[paged] no tokens to decode\n");
+        if (decode_ready_reqs_tick > 0 || prefill_ready_reqs_tick > 0) {
+            n_empty_consecutive = 0;
+            SRV_DBG("[paged] yielding empty turn (decode_ready=%d, prefill_ready=%d)\n",
+                    decode_ready_reqs_tick, prefill_ready_reqs_tick);
+            return PagedEmptyTurnAction::Yield;
+        }
+        if (++n_empty_consecutive > 3) {
+            GGML_ABORT("fatal error - please provide logs and repro in %s\n",
+                       "https://github.com/ggml-org/llama.cpp/pull/20277");
+        }
+        return PagedEmptyTurnAction::Continue;
+    }
+
+    // Classifies a non-split (single-pass) paged turn and updates burst counters
+    // plus throughput chunk metrics. Pure observability bookkeeping with no decode
+    // side effects; the split mixed-batch path maintains these counters inline.
+    void update_paged_nonsplit_phase_metrics(int32_t decode_tokens_in_batch,
+                                             int32_t sched_prefill_toks_tick,
+                                             int32_t sched_decode_toks_tick,
+                                             int32_t decode_ready_reqs_tick) {
+        if (decode_tokens_in_batch > 0 && sched_prefill_toks_tick == 0) {
+            paged_decode_burst_steps++;
+            paged_decode_steps_since_long_prefill++;
+            if (std::getenv("LLAMA_PAGED_SCHED_TRACE")) {
+                SRV_WRN("[paged-sched-phase] phase=decode_only reason=decode_burst step=%d/%d\n",
+                        paged_decode_burst_steps, std::max(1, sched_policy_cfg_.decode_burst_tokens));
+            }
+        } else if (decode_tokens_in_batch == 0) {
+            // Prefill-only turn: update burst counters based on prefill class.
+            if (sched_prefill_toks_tick > 0) {
+                paged_metrics_.throughput.record_chunk(sched_prefill_toks_tick);
+            }
+            const bool has_long = (sched_prefill_toks_tick > 0 && sched_decode_toks_tick == 0 &&
+                                   decode_ready_reqs_tick == 0);
+            if (has_long) {
+                paged_decode_burst_steps = 0;
+                paged_decode_steps_since_long_prefill = 0;
+            }
+            if (std::getenv("LLAMA_PAGED_SCHED_TRACE")) {
+                SRV_WRN("[paged-sched-phase] phase=prefill_only class=%s\n",
+                        has_long ? "long" : "short");
+            }
+        } else {
+            // Mixed decode+prefill single pass (no split).
+            if (sched_prefill_toks_tick > 0) {
+                paged_metrics_.throughput.record_chunk(sched_prefill_toks_tick);
+            }
+        }
+    }
+
     server_scheduler::PagedPrefixReuse make_paged_prefix_reuse() {
         return server_scheduler::PagedPrefixReuse({
             /*params_base=*/&params_base,
@@ -4026,24 +4094,9 @@ private:
                 llama_set_embeddings(ctx, req_batched->task->need_embd());
             }
 
-            if (batch.n_tokens == 0) {
-                SRV_WRN("%s", "[paged] no tokens to decode\n");
-                // In paged latency scheduling a zero-token turn can happen when
-                // budgets/plans yield no executable work for this immediate pass.
-                // Do not crash if there is still pending prefill/decode-ready
-                // work; just yield and continue next scheduler iteration.
-                if (decode_ready_reqs_tick > 0 || prefill_ready_reqs_tick > 0) {
-                    n_empty_consecutive = 0;
-                    SRV_DBG("[paged] yielding empty turn (decode_ready=%d, prefill_ready=%d)\n",
-                            decode_ready_reqs_tick, prefill_ready_reqs_tick);
-                    return;
-                }
-                if (++n_empty_consecutive > 3) {
-                    GGML_ABORT("fatal error - please provide logs and repro in %s\n",
-                               "https://github.com/ggml-org/llama.cpp/pull/20277");
-                }
-            } else {
-                n_empty_consecutive = 0;
+            if (handle_paged_empty_turn(decode_ready_reqs_tick, prefill_ready_reqs_tick) ==
+                PagedEmptyTurnAction::Yield) {
+                return;
             }
 
             auto on_segment_sample_paged = make_paged_on_segment_sample();
@@ -4137,34 +4190,8 @@ private:
                     decode_outcome.retried = decode_outcome.retried || prefill_decode_outcome.retried;
                 }
             } else if (batch.n_tokens > 0) {
-                if (decode_tokens_in_batch > 0 && sched_prefill_toks_tick == 0) {
-                    paged_decode_burst_steps++;
-                    paged_decode_steps_since_long_prefill++;
-                    if (std::getenv("LLAMA_PAGED_SCHED_TRACE")) {
-                        SRV_WRN("[paged-sched-phase] phase=decode_only reason=decode_burst step=%d/%d\n",
-                                paged_decode_burst_steps, std::max(1, sched_policy_cfg_.decode_burst_tokens));
-                    }
-                } else if (decode_tokens_in_batch == 0) {
-                    // Prefill-only turn: update burst counters based on prefill class.
-                    if (sched_prefill_toks_tick > 0) {
-                        paged_metrics_.throughput.record_chunk(sched_prefill_toks_tick);
-                    }
-                    const bool has_long = (sched_prefill_toks_tick > 0 && sched_decode_toks_tick == 0 &&
-                                           decode_ready_reqs_tick == 0);
-                    if (has_long) {
-                        paged_decode_burst_steps = 0;
-                        paged_decode_steps_since_long_prefill = 0;
-                    }
-                    if (std::getenv("LLAMA_PAGED_SCHED_TRACE")) {
-                        SRV_WRN("[paged-sched-phase] phase=prefill_only class=%s\n",
-                                has_long ? "long" : "short");
-                    }
-                } else {
-                    // Mixed decode+prefill single pass (no split).
-                    if (sched_prefill_toks_tick > 0) {
-                        paged_metrics_.throughput.record_chunk(sched_prefill_toks_tick);
-                    }
-                }
+                update_paged_nonsplit_phase_metrics(decode_tokens_in_batch, sched_prefill_toks_tick,
+                                                    sched_decode_toks_tick, decode_ready_reqs_tick);
             }
             tick_outcome.decode_result = decode_outcome;
             if (decode_outcome.speculative_accept_loops > 0) {
