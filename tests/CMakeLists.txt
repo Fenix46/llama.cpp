@@ -267,6 +267,10 @@ set_tests_properties(test-paged-kv-equiv PROPERTIES FIXTURES_REQUIRED test-downl
 llama_build_and_test(test-paged-kv-state.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-paged-kv-state PROPERTIES FIXTURES_REQUIRED test-download-model)
 
+# Multi-sequence decode (mixed batch) must isolate sequences from each other.
+llama_build_and_test(test-paged-kv-multiseq.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
+set_tests_properties(test-paged-kv-multiseq PROPERTIES FIXTURES_REQUIRED test-download-model)
+
 if (NOT GGML_BACKEND_DL)
     # these tests use the backends directly and cannot be built with dynamic loading
     llama_build_and_test(test-barrier.cpp)
