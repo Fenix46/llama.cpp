@@ -259,6 +259,10 @@ llama_build_and_test(test-paged-kv-alloc.cpp)
 llama_build_and_test(test-paged-kv-cow.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-paged-kv-cow PROPERTIES FIXTURES_REQUIRED test-download-model)
 
+# Equivalence: paged KV vs non-paged KV produce the same logits (fa on/off).
+llama_build_and_test(test-paged-kv-equiv.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
+set_tests_properties(test-paged-kv-equiv PROPERTIES FIXTURES_REQUIRED test-download-model)
+
 if (NOT GGML_BACKEND_DL)
     # these tests use the backends directly and cannot be built with dynamic loading
     llama_build_and_test(test-barrier.cpp)
