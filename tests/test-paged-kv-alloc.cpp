@@ -149,6 +149,39 @@ static void test_alloc_specific_and_acquire() {
     CHECK(a.ref_count(2) == 2);
 }
 
+static void test_used_and_shared_counts() {
+    // Observability counters used by llama_kv_cache_n_used_blocks /
+    // llama_kv_cache_n_shared_blocks (paged-attention-guidelines.md section 6).
+    llama_kv_block_allocator a;
+    a.init(64, 16); // 4 blocks
+
+    CHECK(a.n_used() == 0);
+    CHECK(a.n_shared() == 0);
+    CHECK(a.n_used() + a.n_free() == a.n_blocks()); // invariant
+
+    const uint32_t b0 = a.alloc();
+    const uint32_t b1 = a.alloc();
+    CHECK(a.n_used() == 2);
+    CHECK(a.n_shared() == 0); // both refcount 1
+    CHECK(a.n_used() + a.n_free() == a.n_blocks());
+
+    a.retain(b0); // b0 now shared (refcount 2)
+    CHECK(a.n_used() == 2);    // still 2 distinct blocks in use
+    CHECK(a.n_shared() == 1);  // one of them shared
+
+    a.retain(b1);
+    CHECK(a.n_shared() == 2);
+
+    a.free(b0); // refcount 2 -> 1, no longer shared, still used
+    CHECK(a.n_used() == 2);
+    CHECK(a.n_shared() == 1);
+
+    a.free(b0); // refcount 1 -> 0, returned to pool
+    CHECK(a.n_used() == 1);
+    CHECK(a.n_shared() == 1); // b1 still shared
+    CHECK(a.n_used() + a.n_free() == a.n_blocks());
+}
+
 static void test_reset() {
     llama_kv_block_allocator a;
     a.init(48, 16);
@@ -314,6 +347,7 @@ int main() {
     test_alloc_free_roundtrip();
     test_refcount_retain_release();
     test_alloc_specific_and_acquire();
+    test_used_and_shared_counts();
     test_reset();
 
     test_table_insert_lookup();

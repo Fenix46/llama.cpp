@@ -3407,6 +3407,39 @@ int32_t llama_kv_cache_n_blocks(llama_memory_t mem) {
     return (int32_t) kvc->get_n_blocks();
 }
 
+int32_t llama_kv_cache_n_used_blocks(llama_memory_t mem) {
+    auto * kvc = llama_kv_cache_from_memory(mem);
+    if (!kvc) {
+        return 0;
+    }
+    return (int32_t) kvc->get_n_used_blocks();
+}
+
+int32_t llama_kv_cache_n_shared_blocks(llama_memory_t mem) {
+    auto * kvc = llama_kv_cache_from_memory(mem);
+    if (!kvc) {
+        return 0;
+    }
+    return (int32_t) kvc->get_n_shared_blocks();
+}
+
+void llama_kv_cache_cow_stats(llama_memory_t mem,
+        uint64_t * n_blocks, uint64_t * n_bytes, uint64_t * n_fallbacks, uint64_t * t_copy_us) {
+    auto * kvc = llama_kv_cache_from_memory(mem);
+    if (!kvc) {
+        if (n_blocks)    { *n_blocks    = 0; }
+        if (n_bytes)     { *n_bytes     = 0; }
+        if (n_fallbacks) { *n_fallbacks = 0; }
+        if (t_copy_us)   { *t_copy_us   = 0; }
+        return;
+    }
+    const auto & s = kvc->get_paged_cow_stats();
+    if (n_blocks)    { *n_blocks    = s.n_blocks; }
+    if (n_bytes)     { *n_bytes     = s.n_bytes; }
+    if (n_fallbacks) { *n_fallbacks = s.n_copy_fallbacks; }
+    if (t_copy_us)   { *t_copy_us   = s.t_copy_us; }
+}
+
 bool llama_kv_cache_seq_get_block(llama_memory_t mem, llama_seq_id seq_id, uint32_t page, uint32_t * block_id_out) {
     auto * kvc = llama_kv_cache_from_memory(mem);
     if (!kvc || !block_id_out) {

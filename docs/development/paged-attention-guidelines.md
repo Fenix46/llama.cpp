@@ -118,20 +118,25 @@ Seguire `docs/paged-scheduler-migration-plan.md`. In più:
 
 ### 6. Osservabilità e debug
 
-Aggiungere metriche utili per capire frammentazione e comportamento paged:
+Metriche utili per capire frammentazione e comportamento paged. Stato corrente delle API pubbliche (`include/llama.h`):
 
-- blocchi totali/liberi/usati/riservati;
-- blocchi condivisi/refcount > 1;
-- COW count e bytes copiati (`paged_cow_stats`);
-- pagine mappate per seq;
-- fallimenti admission per capacità insufficiente;
-- fallback da paged fast path a ring-buffer.
+- blocchi totali: `llama_kv_cache_n_blocks` ✅
+- blocchi liberi: `llama_kv_cache_n_free_blocks` ✅
+- blocchi usati (allocati): `llama_kv_cache_n_used_blocks` ✅
+- blocchi condivisi (refcount > 1): `llama_kv_cache_n_shared_blocks` ✅
+- COW count/bytes/fallbacks/tempo: `llama_kv_cache_cow_stats` ✅ (espone `paged_cow_stats`)
+- pagine mappate per seq: derivabile da `llama_kv_cache_seq_get_block` + `get_block_table_max_mapped_page_plus1`; non c'è ancora un getter aggregato per seq.
+- blocchi riservati dal server scheduler: lato server (`paged_total_blocks_`, BlockManager); non è una metrica del core KV.
+- fallimenti admission per capacità insufficiente: lato server scheduler (da esporre).
+- fallback da paged fast path a ring-buffer: da strumentare (counter dedicato non ancora presente).
 
 Le metriche devono distinguere chiaramente:
 
-- capacità fisica della KV cache;
-- capacità riservata dal server scheduler;
-- capacità effettivamente mappata nella block table.
+- capacità fisica della KV cache → core KV (`n_blocks`/`n_free_blocks`/`n_used_blocks`);
+- capacità riservata dal server scheduler → lato server (`paged_total_blocks_`);
+- capacità effettivamente mappata nella block table → `max_mapped_page_plus1` / block table.
+
+I contatori core sono unit-testati a livello di allocator in `tests/test-paged-kv-alloc.cpp` (`n_used`/`n_shared` con invariante `n_used + n_free == n_blocks`).
 
 ## Regole operative per i modelli/agent futuri
 

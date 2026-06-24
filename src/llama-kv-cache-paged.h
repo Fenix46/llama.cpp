@@ -129,6 +129,22 @@ public:
     // Number of free (unallocated) blocks.
     uint32_t n_free() const { return (uint32_t) free_ids.size(); }
 
+    // Number of allocated (in-use) blocks.
+    uint32_t n_used() const { return (uint32_t) blocks.size() - (uint32_t) free_ids.size(); }
+
+    // Number of blocks shared by more than one logical owner (refcount > 1).
+    // These are the copy-on-write candidates: a write to such a block must copy
+    // first. Useful for diagnosing prefix-reuse / fork fan-out.
+    uint32_t n_shared() const {
+        uint32_t n = 0;
+        for (uint32_t rc : ref_counts) {
+            if (rc > 1) {
+                ++n;
+            }
+        }
+        return n;
+    }
+
     // Block size.
     uint32_t block_size() const { return bs; }
 

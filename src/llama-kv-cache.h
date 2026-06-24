@@ -192,6 +192,8 @@ public:
     bool release_block(uint32_t blk_id);
     uint32_t get_block_size_tokens() const;
     uint32_t get_n_blocks(uint32_t strm = 0) const;
+    uint32_t get_n_used_blocks(uint32_t strm = 0) const;
+    uint32_t get_n_shared_blocks(uint32_t strm = 0) const;
 
     //
     // graph_build API

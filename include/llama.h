@@ -766,6 +766,25 @@ extern "C" {
     // Number of free KV blocks in stream 0 (paged allocator). Returns 0 if not using paged allocator.
     LLAMA_API int32_t llama_kv_cache_n_free_blocks(llama_memory_t mem);
 
+    // Paged KV observability (stream 0). All return 0 if not using the paged
+    // allocator. n_used = allocated blocks; n_shared = blocks with refcount > 1
+    // (copy-on-write candidates from prefix reuse / sequence forks).
+    LLAMA_API int32_t llama_kv_cache_n_used_blocks(llama_memory_t mem);
+    LLAMA_API int32_t llama_kv_cache_n_shared_blocks(llama_memory_t mem);
+
+    // Copy-on-write statistics for the paged KV cache. Any out pointer may be
+    // NULL. Counters are cumulative since cache creation:
+    //   n_blocks  : blocks copied by COW
+    //   n_bytes   : bytes copied by COW
+    //   n_fallbacks : COW operations that fell back to a slow copy path
+    //   t_copy_us : total time spent copying (microseconds)
+    LLAMA_API void llama_kv_cache_cow_stats(
+            llama_memory_t mem,
+                uint64_t * n_blocks,
+                uint64_t * n_bytes,
+                uint64_t * n_fallbacks,
+                uint64_t * t_copy_us);
+
     // Rebuild the paged block table for seq_id after llama_state_seq_set_data_ext().
     // No-op if the memory does not use the paged allocator.
     LLAMA_API void llama_kv_cache_rebuild_block_table(llama_memory_t mem, llama_seq_id seq_id);

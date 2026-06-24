@@ -1905,6 +1905,20 @@ uint32_t llama_kv_cache::get_n_blocks(uint32_t strm) const {
     return v_block_alloc[strm].n_blocks();
 }
 
+uint32_t llama_kv_cache::get_n_used_blocks(uint32_t strm) const {
+    if (!paged || strm >= v_block_alloc.size()) {
+        return 0;
+    }
+    return v_block_alloc[strm].n_used();
+}
+
+uint32_t llama_kv_cache::get_n_shared_blocks(uint32_t strm) const {
+    if (!paged || strm >= v_block_alloc.size()) {
+        return 0;
+    }
+    return v_block_alloc[strm].n_shared();
+}
+
 const llama_kv_cache::paged_cow_stats & llama_kv_cache::get_paged_cow_stats() const {
     return cow_stats;
 }
