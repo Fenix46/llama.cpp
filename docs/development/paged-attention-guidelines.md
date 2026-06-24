@@ -81,14 +81,31 @@ Regola: se una modifica cambia shape o semantica di questi tensori, aggiornare s
 
 ### 4. Portare i backend Flash Attention a leggere davvero a pagine
 
-Il grafo passa già metadata paged a `ggml_flash_attn_ext`. I prossimi passi sono backend-specific:
+Il grafo passa già metadata paged a `ggml_flash_attn_ext` (`block_table` = src[5], `seq_ids_q` = src[6], `page_limits_q` = src[7]). Stato verificato per backend (vedi sotto). I prossimi passi sono backend-specific:
 
-- Verificare quali backend usano `block_table`, `seq_ids_q`, `page_limits_q` realmente e quali li ignorano.
-- Implementare/validare gather K/V per pagine nel backend target, iniziando da Metal se è quello già previsto dai commenti.
+- Implementare/validare gather K/V per pagine nei backend non ancora coperti.
 - Mantenere fallback corretto se il backend non supporta paged FA: errore chiaro o path legacy verificato, non risultati silenziosamente sbagliati.
 - Aggiungere test o golden checks su output equivalenti tra non-paged e paged con stesso prompt/batch.
 
 Criterio di completamento: `paged_kv + flash_attn` deve produrre output equivalenti al path non paged per casi piccoli e deve non leggere fuori dai blocchi mappati.
+
+#### Mappa del gating paged FA (verificata)
+
+Switch globale: env `LLAMA_PAGED_ATTN`. Default attivo; `LLAMA_PAGED_ATTN=0` forza il path legacy. Questo è anche lo strumento diagnostico per isolare il rumore numerico del kernel paged (vedi sotto e `tests/test-paged-kv-equiv.cpp`).
+
+**Metal** (`ggml/src/ggml-metal/ggml-metal-ops.cpp`, ~riga 2705):
+- Usa il kernel paged (`kernel_flash_attn_ext_paged` o `_paged_vec`) solo se TUTTE: `src[5]!=nullptr`, `LLAMA_PAGED_ATTN!=0`, `src[1]->type == F16`, K/V contigui in F16 (`nb10/nb20 == sizeof(F16)`), V head dim `ne20 <= 576` (= 18*32).
+- Variante `_paged_vec` solo per: maschera presente, no sinks/bias/softcap, `ne00==64 && ne20==64`.
+- Se i vincoli paged non sono soddisfatti: **fallback silenzioso al kernel legacy** sulla stessa slab piatta. È corretto perché in paged mode la slab fisica resta contigua F16, quindi il kernel legacy legge gli stessi byte — ma NON applica il mascheramento per-pagina del block table. Affidarsi al fatto che le celle non mappate restino mascherate dalla kq mask.
+- Quando paged attivo, asserisce che src[6] e src[7] siano presenti (hard error, non garbage).
+
+**CUDA** (`ggml/src/ggml-cuda/fattn.cu`, ~riga 334):
+- `paged_attn_active = block_table != nullptr && LLAMA_PAGED_ATTN!=0`.
+- Se `block_table != nullptr` ma `LLAMA_PAGED_ATTN=0` → `BEST_FATTN_KERNEL_NONE` (**errore esplicito**: forzare il legacy su layout paged darebbe garbage). Più rigoroso di Metal.
+- Se paged attivo ma manca src[6] o src[7] → `BEST_FATTN_KERNEL_NONE`.
+- Scelta kernel via env `LLAMA_PAGED_KERNEL` = `tile` | `mma` | `auto` (default auto). `auto`/`mma` usano MMA_F16 solo se shape supportata (`paged_mma_shape_supported`: Q head dim in {64,80,96,112,128,256,320,512,576} con vincoli V/GQA) e hardware Turing/Volta/AMD-MFMA; altrimenti fallback a TILE.
+
+**Nota numerica (verificata, gemma-4-E2B IQ3_XXS su Metal):** col kernel paged FA attivo i logit divergono da quelli non-paged di ~1e-2 (max abs). Con `LLAMA_PAGED_ATTN=0` la differenza scende a 0. È rumore di accumulo del kernel, non un bug del data path: con FA disabilitato paged e non-paged sono bit-identici. I test di equivalenza devono usare tolleranze separate (stretta per il data path, larga per il kernel paged FA).
 
 ### 5. Allineare server scheduler al modello a blocchi
 
