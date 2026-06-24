@@ -1520,7 +1520,7 @@ private:
                     free_blocks);
         }
 
-        // the update_slots() logic will always submit a maximum of n_batch or n_parallel tokens
+        // the update_slots_legacy() logic will always submit a maximum of n_batch or n_parallel tokens
         // note that n_batch can be > n_ctx (e.g. for non-causal attention models such as BERT where the KV cache is not used)
         {
             const int32_t n_batch = llama_n_batch(ctx);
@@ -1586,7 +1586,7 @@ private:
                 server_scheduler::CallbackSchedulerBackend::Callbacks{
                     /*launch_completion=*/[this](server_task && t) { launch_completion_legacy(std::move(t)); },
                     /*cancel=*/[this](int id_target) { cancel_legacy(id_target); },
-                    /*tick=*/[this]() { update_slots(); },
+                    /*tick=*/[this]() { update_slots_legacy(); },
                 });
         }
 
@@ -1675,14 +1675,15 @@ private:
     }
 
     server_slot * get_slot_by_id(int id_slot) {
+        // legacy slot lookup only: in paged mode `slots` is always empty
+        // (initial_slot_count() == 0), so this returns nullptr and the paged
+        // path never reaches here — it resolves requests by leased seq id.
         if (slots.empty() || id_slot < 0) {
             return nullptr;
         }
 
         // note: legacy slot APIs allow id_slot to be out of bounds (wrap around).
-        // Paged mode uses leased seq ids, so the requested id is already the
-        // actual llama sequence id and must not be modulo-mapped by handle count.
-        const int id_lookup = params_base.scheduler == "paged" ? id_slot : id_slot % slots.size();
+        const int id_lookup = id_slot % slots.size();
 
         for (server_slot & slot : slots) {
             if (slot.seq_id() == id_lookup) {
@@ -4151,7 +4152,7 @@ private:
 
     // Legacy slot-based execution path (non-paged schedulers). Invoked by the
     // legacy backend's tick callback.
-    void update_slots() {
+    void update_slots_legacy() {
         // check if all slots are idle
         {
             bool all_idle = true;
@@ -4270,13 +4271,9 @@ private:
         int32_t n_batch  = llama_n_batch(ctx);
         int32_t n_ubatch = llama_n_ubatch(ctx);
 
-        // update_slots() is the legacy slot-only path; the paged scheduler runs
-        // entirely in update_paged_tick(). Kept as a named constant so the
-        // paged-specific budget branches below are trivially dead-eliminated.
-        const bool is_paged_scheduler = false;
-        const int32_t decode_tokens_in_batch = batch.n_tokens;
-        const int32_t prefill_budget = is_paged_scheduler ? std::max(0, n_batch - decode_tokens_in_batch) : n_batch;
-        int32_t prefill_added = 0;
+        // update_slots_legacy() is the legacy slot-only path; the paged scheduler
+        // runs entirely in update_paged_tick(). No paged prefill-budget split here:
+        // the whole batch is available for prompt prefill.
 
         float  alora_scale       = -1.0f;
         size_t alora_disabled_id = 0;
@@ -4301,10 +4298,6 @@ private:
 
                 // this slot still has a prompt to be processed
                 if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) {
-                    if (is_paged_scheduler && prefill_added >= prefill_budget) {
-                        continue;
-                    }
-
                     const auto & input_tokens = slot.task->tokens;
 
                     // used to determine the number of tokens added to the batch for the current slot
@@ -4608,9 +4601,6 @@ private:
                         if (batch.n_tokens + slot.task->n_tokens() > n_batch) {
                             continue;
                         }
-                        if (is_paged_scheduler && prefill_added + slot.task->n_tokens() > prefill_budget) {
-                            continue;
-                        }
                     }
 
                     // truncate any tokens that are beyond n_past for this slot
@@ -4684,8 +4674,7 @@ private:
                     }
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.n_tokens < n_batch &&
-                           (!is_paged_scheduler || prefill_added < prefill_budget)) {
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.n_tokens < n_batch) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -4706,7 +4695,6 @@ private:
                             slot.prompt.tokens.pos_next(),
                             { slot.seq_id() },
                             slot.task->need_embd());
-                        prefill_added++;
                         slot.prompt.tokens.push_back(cur_tok);
 
                         slot.n_prompt_tokens_processed++;

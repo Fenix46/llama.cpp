@@ -701,7 +701,7 @@ Legenda stato: ✅ supportata e verificata · ⚠️ supportata con limiti docum
 
 ---
 
-## Fase 10 — Pulizia finale
+## Fase 10 — Pulizia finale ✅
 
 ### Scopo
 
@@ -709,19 +709,40 @@ Completare la separazione architetturale.
 
 ### Task
 
-- [ ] Rimuovere branch profondi `scheduler == "paged"` da `server_context_impl`.
-- [ ] Lasciare solo selezione backend in init/load.
-- [ ] Eliminare uso di `slots` dal path paged.
-- [ ] Rinominare funzioni generiche ancora slot-centriche, ad esempio `update_slots()` se ormai dispatcha backend.
-- [ ] Pulire commenti temporanei e fallback obsoleti.
-- [ ] Aggiornare docs e troubleshooting.
+- [x] Rimuovere branch profondi `scheduler == "paged"` dall'hot path runtime: il
+  decode/prefill loop legacy (`update_slots_legacy()`) non contiene più rami
+  paged morti (rimossi `is_paged_scheduler`/`prefill_budget`/`prefill_added` e le
+  tre condizioni di budget). Le occorrenze `scheduler == "paged"` rimaste sono
+  confinate a init/load (selezione backend) e agli adapter API/metrics.
+- [x] Lasciare solo selezione backend in init/load: il dispatch runtime è già via
+  `CallbackSchedulerBackend` (paged→`update_paged_tick`, legacy→`update_slots_legacy`).
+- [x] Eliminare uso di `slots` dal path paged: `get_slot_by_id()` è marcato
+  legacy-only e in paged ritorna sempre `nullptr` (`slots` vuoto, `initial_slot_count()==0`);
+  rimossa la branch paged morta nel calcolo `id_lookup`.
+- [x] Rinominare `update_slots()` → `update_slots_legacy()` (def, callsite tick e
+  commenti), coerente con `launch_completion_legacy`/`cancel_legacy`.
+- [x] Pulire commenti temporanei e fallback obsoleti nell'hot path legacy.
+- [x] Aggiornare docs (questa fase + matrice Fase 9).
 
 ### Criteri di completamento
 
-- [ ] `server_context_impl` non contiene due scheduler completi inline.
-- [ ] Backend legacy e backend paged sono separati.
-- [ ] Paged mode non usa `server_slot` per runtime request.
-- [ ] API compatibility è confinata in adapter/layer esterno.
+- [x] `server_context_impl` non contiene due scheduler completi inline: i due tick
+  runtime (`update_slots_legacy` / `update_paged_tick`) sono separati e selezionati
+  una sola volta in init via backend callback.
+- [x] Backend legacy e backend paged sono separati a livello di tick/launch/cancel.
+- [x] Paged mode non usa `server_slot` per runtime request: il path paged opera su
+  `paged_request_state` + seq id leasing; `slots` resta vuoto.
+- [x] API compatibility confinata in adapter: le SLOT_* dispatchano subito a
+  `handle_paged_slot_action()`; `/metrics` e `GET /slots` espongono lo stato paged
+  via `paged_seq_leases`/`paged_requests` senza simulare `server_slot`.
+
+### Nota di scope
+
+Una scomposizione fisica in due classi backend separate (file distinti) resta
+possibile come refactor futuro, ma è stata evitata per non introdurre una
+riscrittura massiva non verificabile (rischio #5). L'obiettivo della migrazione —
+confinare `server_slot` al backend legacy e impedire che il path paged lo consulti
+o lo simuli — è raggiunto.
 
 ## Verifica per ogni fase
 
@@ -802,3 +823,11 @@ Mitigazione:
 ## Nota finale
 
 La migrazione diventa pulita solo quando `server_context_impl` smette di essere il proprietario diretto di due modelli runtime. Il primo obiettivo non è cancellare `server_slot`, ma confinare il suo uso al backend legacy e impedire che il path paged lo consulti o lo simuli internamente.
+
+**Stato (Fasi 0–10 completate):** obiettivo raggiunto. I due runtime sono separati
+dietro `CallbackSchedulerBackend`; l'hot path paged opera su `paged_request_state` +
+seq leasing senza consultare né simulare `server_slot` (che resta vuoto in paged).
+`server_slot` e `update_slots_legacy()` sono confinati al backend legacy. Le
+occorrenze `scheduler == "paged"` residue sono limitate a init/load e agli adapter
+API/metrics. Una scomposizione fisica in classi backend separate resta un possibile
+refactor futuro, fuori dallo scope di questa migrazione incrementale.
