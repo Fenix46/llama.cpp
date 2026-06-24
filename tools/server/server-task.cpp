@@ -2074,8 +2074,11 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             return false;
         }
 
-        // Rebuild the paged block table for this slot — llama_state_seq_set_data_ext
-        // writes directly to KV cells, bypassing paged_record_cell().
+        // Rebuild the paged block table for this slot as a defensive, idempotent
+        // guarantee. The restore path (state_read_meta) already re-runs
+        // find_slot()/apply_ubatch() and thus paged_record_cell(), so the table
+        // is normally consistent after set_data_ext; this keeps it robust against
+        // future changes to the restore path. See tests/test-paged-kv-state.cpp.
         llama_kv_cache_rebuild_block_table(llama_get_memory(ctx), id_slot);
 
         it_best->data.clear();
