@@ -663,8 +663,14 @@ struct server_metrics {
 
 struct server_context_impl {
     friend struct server_context;
+    friend class server_scheduler::PagedSchedulerBackend;
 
 public:
+    // Read-only access to the active scheduler backend (paged or legacy). Used by
+    // the HTTP routes layer for capability queries (e.g. /slots support). May be
+    // null before init(); callers must guard.
+    const server_scheduler::ServerSchedulerBackend * scheduler_backend() const { return backend_.get(); }
+
     // only use these pointers outside of this class:
     //  - when not in sleeping state
     //  - and, with thread-safe APIs (e.g., tokenizer calls)
@@ -1575,12 +1581,7 @@ private:
         // launch/cancel/tick to the paged or legacy slot path. The hot loop now
         // dispatches through this boundary instead of branching inline.
         if (params_base.scheduler == "paged") {
-            backend_ = std::make_unique<server_scheduler::CallbackSchedulerBackend>(
-                server_scheduler::CallbackSchedulerBackend::Callbacks{
-                    /*launch_completion=*/[this](server_task && t) { launch_completion_paged(std::move(t)); },
-                    /*cancel=*/[this](int id_target) { cancel_paged(id_target); },
-                    /*tick=*/[this]() { update_paged_tick(); },
-                });
+            backend_ = std::make_unique<server_scheduler::PagedSchedulerBackend>(this);
         } else {
             backend_ = std::make_unique<server_scheduler::CallbackSchedulerBackend>(
                 server_scheduler::CallbackSchedulerBackend::Callbacks{
@@ -3649,19 +3650,7 @@ private:
                     int n_idle_slots       = 0;
                     int n_processing_slots = 0;
 
-                    if (params_base.scheduler == "paged") {
-                        n_processing_slots = paged_seq_leases.n_active();
-                        n_idle_slots       = (int) paged_requests.size() - n_processing_slots;
-                        if (n_idle_slots < 0) { n_idle_slots = 0; }
-                        for (const auto & req : paged_requests) {
-                            slots_data.push_back(json {
-                                {"id",            req.seq_id},
-                                {"is_processing", req.is_processing()},
-                                {"n_ctx",         req.n_ctx},
-                                {"id_task",       req.request_id},
-                            });
-                        }
-                    } else {
+                    if (!backend_->collect_slots_metrics(slots_data, n_idle_slots, n_processing_slots)) {
                         for (server_slot & slot : slots) {
                             json slot_data = slot.to_json(slots_debug == 0);
                             if (slot.is_processing()) {
@@ -3710,13 +3699,7 @@ private:
                             { "reused_tokens", st.reused_tokens },
                         };
                     }
-                    if (params_base.scheduler == "paged") {
-                        res->prefix_cache_data["seq_leases"] = json {
-                            { "active", paged_seq_leases.n_active() },
-                            { "cached", paged_seq_leases.n_cached() },
-                            { "free",   paged_seq_leases.n_free() },
-                        };
-                    }
+                    backend_->augment_prefix_cache_metrics(res->prefix_cache_data);
 
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
@@ -3728,8 +3711,7 @@ private:
                     if (!check_no_mtmd(task.id)) {
                         break;
                     }
-                    if (params_base.scheduler == "paged") {
-                        handle_paged_slot_action(task);
+                    if (backend_->handle_slot_action(task)) {
                         break;
                     }
 
@@ -3771,8 +3753,7 @@ private:
             case SERVER_TASK_TYPE_SLOT_RESTORE:
                 {
                     if (!check_no_mtmd(task.id)) break;
-                    if (params_base.scheduler == "paged") {
-                        handle_paged_slot_action(task);
+                    if (backend_->handle_slot_action(task)) {
                         break;
                     }
                     const int id_slot = task.slot_action.id_slot;
@@ -3824,8 +3805,7 @@ private:
                     if (!check_no_mtmd(task.id)) {
                         break;
                     }
-                    if (params_base.scheduler == "paged") {
-                        handle_paged_slot_action(task);
+                    if (backend_->handle_slot_action(task)) {
                         break;
                     }
                     const int id_slot = task.slot_action.id_slot;
@@ -5145,6 +5125,51 @@ private:
     }
 };
 
+// PagedSchedulerBackend method definitions. Defined here (not in the header) so
+// the full server_context_impl definition is visible; the backend is a friend.
+namespace server_scheduler {
+
+void PagedSchedulerBackend::launch_completion(server_task && task) {
+    ctx_->launch_completion_paged(std::move(task));
+}
+
+void PagedSchedulerBackend::cancel(int id_target) {
+    ctx_->cancel_paged(id_target);
+}
+
+void PagedSchedulerBackend::tick() {
+    ctx_->update_paged_tick();
+}
+
+bool PagedSchedulerBackend::handle_slot_action(server_task & task) {
+    return ctx_->handle_paged_slot_action(task);
+}
+
+bool PagedSchedulerBackend::collect_slots_metrics(json & slots_data, int & n_idle, int & n_processing) {
+    n_processing = ctx_->paged_seq_leases.n_active();
+    n_idle       = (int) ctx_->paged_requests.size() - n_processing;
+    if (n_idle < 0) { n_idle = 0; }
+    for (const auto & req : ctx_->paged_requests) {
+        slots_data.push_back(json {
+            {"id",            req.seq_id},
+            {"is_processing", req.is_processing()},
+            {"n_ctx",         req.n_ctx},
+            {"id_task",       req.request_id},
+        });
+    }
+    return true;
+}
+
+void PagedSchedulerBackend::augment_prefix_cache_metrics(json & prefix_cache_data) {
+    prefix_cache_data["seq_leases"] = json {
+        { "active", ctx_->paged_seq_leases.n_active() },
+        { "cached", ctx_->paged_seq_leases.n_cached() },
+        { "free",   ctx_->paged_seq_leases.n_free() },
+    };
+}
+
+} // namespace server_scheduler
+
 //
 // server_context (public API)
 //
@@ -5190,6 +5215,7 @@ server_context_meta server_context::get_meta() const {
         /* has_inp_audio          */ impl->chat_params.allow_audio,
         /* json_webui_settings    */ impl->json_webui_settings,
         /* slot_n_ctx             */ impl->get_slot_n_ctx(),
+        /* supports_slots_endpoint*/ impl->scheduler_backend() == nullptr || impl->scheduler_backend()->supports_slots_endpoint(),
         /* pooling_type           */ llama_pooling_type(impl->ctx),
 
         /* chat_params            */ impl->chat_params,
@@ -5641,7 +5667,8 @@ void server_routes::init_routes() {
 
     this->get_slots = [this](const server_http_req & req) {
         auto res = create_response();
-        if (params.scheduler == "paged") {
+        const auto * backend = ctx_server.scheduler_backend();
+        if (backend && !backend->supports_slots_endpoint()) {
             res->error(format_error_response("Slots endpoint is not supported in paged scheduler mode; requests are assigned KV-backed handles dynamically", ERROR_TYPE_NOT_SUPPORTED));
             return res;
         }
@@ -5750,7 +5777,7 @@ void server_routes::init_routes() {
                 {"audio",  meta->has_inp_audio},
             } },
             { "media_marker",                get_media_marker() },
-            { "endpoint_slots",              params.scheduler == "paged" ? false : params.endpoint_slots },
+            { "endpoint_slots",              meta->supports_slots_endpoint ? params.endpoint_slots : false },
             { "endpoint_props",              params.endpoint_props },
             { "endpoint_metrics",            params.endpoint_metrics },
             { "webui",                       params.webui },
