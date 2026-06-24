@@ -1,130 +1,127 @@
-# llama.cpp paged scheduler fork
+# llama-paged.cpp
 
-This private fork of `llama.cpp` focuses on a production-style paged KV scheduler for
-`llama-server`. It keeps upstream `llama.cpp` compatibility while experimenting with
-request-level paged scheduling, cross-request prefix reuse, long-context capacity
-planning, and Apple Silicon friendly server behavior.
+**A fork of [`llama.cpp`](https://github.com/ggml-org/llama.cpp) with a vLLM-style paged KV scheduler for `llama-server`.**
 
-The current branch is built around these server changes:
+`llama-paged.cpp` keeps full upstream `llama.cpp` compatibility (same models, same
+build system, same binaries) and adds a production-style **paged request scheduler**
+to the server: requests are scheduled at the request level on a global paged KV pool,
+instead of being pinned to a fixed number of pre-allocated slots.
 
-- Paged request handles are managed directly through `paged_request_state`, without
-  creating legacy slot handles in paged mode.
-- `--scheduler paged` uses a global KV pool and lazily creates request entries.
-- `--kv-prefix-cache` can reuse cached paged prefixes across idle requests.
-- SWA/hybrid checkpoint restore support is wired into paged prefill.
-- `--gpu-memory-utilization` / `--gpu-mem-util` controls how much device memory the
-  paged KV fit logic is allowed to consume.
+> This is a private/experimental fork. It is **not** an upstream replacement, and all
+> credit for the underlying engine belongs to the upstream
+> [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) project. The full
+> original README is preserved below under [Upstream llama.cpp](#upstream-llamacpp).
 
-This fork is intended for local/private experimentation first. It is not presented as
-an upstream replacement.
+## What the paged scheduler adds
 
-## Quick Paged Server Start
+- **`--scheduler paged`** — request-level scheduling on a single global KV pool;
+  no legacy slot handles are pre-created (`initial_slots = 0`). Requests are admitted
+  and run as `paged_request_state` entries identified by a leased sequence id.
+- **Memory-pressure aware fit** — `--gpu-memory-utilization` caps how much device
+  memory the paged KV pool may consume, so you can run long contexts without OOM.
+- **Capacity planning** — the server fits a global KV pool to the memory budget and
+  reports how many full-context requests fit concurrently.
+- **Experimental cross-request prefix reuse** — `--kv-prefix-cache` reuses cached KV
+  blocks across requests that share a common prompt prefix.
+- Standard server features work in paged mode: streaming, cancel, concurrency,
+  metrics, embedding, rerank, multimodal, parent/child tasks.
 
-Build:
+See [`docs/paged-scheduler-migration-plan.md`](docs/paged-scheduler-migration-plan.md)
+for the full design and feature-parity matrix.
+
+## Build
+
+The build is identical to upstream `llama.cpp`. On Apple Silicon (Metal):
 
 ```sh
-cmake --build build-arm64-apple-clang-release --target llama-server -j8
+cmake -B build -DGGML_METAL=ON -DLLAMA_CURL=OFF
+cmake --build build --target llama-server -j
 ```
 
-Run on Apple Silicon (Metal) with a local GGUF model:
+On Linux / NVIDIA (CUDA):
 
 ```sh
-./build-arm64-apple-clang-release/bin/llama-server \
-  -m /path/to/model.gguf \
-  --host 127.0.0.1 \
-  --port 8080 \
-  -ngl 99 \
-  --scheduler paged \
-  --flash-attn on \
-  -c 128000 \
-  --max-model-len 128000 \
-  -b 2048 \
-  -ub 512 \
-  --kv-block-size 64 \
-  --gpu-memory-utilization 0.90 \
-  --kv-prefix-cache \
-  --cache-ram 0 \
-  --webui
+cmake -B build -DGGML_CUDA=ON
+cmake --build build --target llama-server -j
 ```
 
-Run on CUDA (Linux / NVIDIA) with paged scheduler:
+## Quick start — paged server
+
+Minimal command to launch the server with the paged scheduler and a memory-pressure
+cap. **`--gpu-memory-utilization` is the key knob:** lower it if you hit out-of-memory,
+raise it (up to `1.0`) to pack more concurrent requests.
 
 ```sh
-LLAMA_PAGED_ATTN=1 LLAMA_PAGED_KERNEL=mma \
 ./build/bin/llama-server \
   -m /path/to/model.gguf \
-  --host 127.0.0.1 \
-  --port 8080 \
-  -ngl 99 \
   --scheduler paged \
-  --flash-attn on \
-  -c 262144 \
-  --max-model-len 262144 \
-  -b 8192 \
-  -ub 2048 \
-  --kv-block-size 64 \
+  --gpu-memory-utilization 0.5 \
+  --host 127.0.0.1 \
+  --port 8099 \
+  -c 4096 \
+  -ngl 99
+```
+
+Long-context, higher throughput (raise the memory budget and the per-request length):
+
+```sh
+./build/bin/llama-server \
+  -m /path/to/model.gguf \
+  --scheduler paged \
   --gpu-memory-utilization 0.90 \
+  --max-model-len 128000 \
+  --kv-block-size 64 \
   --kv-prefix-cache \
-  --cache-ram 0
+  --host 127.0.0.1 \
+  --port 8099 \
+  -c 128000 \
+  -ngl 99
 ```
 
-If the paged MMA path is not suitable for a given shape or GPU, force the paged tile kernel instead:
+### Paged scheduler flags
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--scheduler paged` | `slots` | Enable the paged request scheduler. |
+| `--gpu-memory-utilization` (`--gpu-mem-util`) | `0.90` | Target device-memory fraction the paged KV pool may use (`0 < x ≤ 1`). Lower it to relieve memory pressure. |
+| `--max-model-len N` | — | vLLM-style maximum context length per request. |
+| `--kv-block-size N` | `32` | Paged KV block size in tokens (power of two). |
+| `--paged-admission full-ctx\|actual-len` | `full-ctx` | Reserve blocks for the full context, or for prompt + max predicted tokens. |
+| `--paged-lookahead-tokens N` | `256` | Extra tokens reserved beyond the prompt when `n_predict` is unknown. |
+| `--max-num-seqs auto\|N` | `auto` | Max concurrent sequences (alias for `--max-parallel`). |
+| `--kv-prefix-cache` | off | Experimental cross-request KV prefix reuse. |
+
+## Smoke test the server
+
+With the server running on port `8099`:
 
 ```sh
-LLAMA_PAGED_ATTN=1 LLAMA_PAGED_KERNEL=tile ./build/bin/llama-server -m /path/to/model.gguf -ngl 99 --scheduler paged
+# 1. Health
+curl -s http://127.0.0.1:8099/health
+
+# 2. Non-streaming completion
+curl -s http://127.0.0.1:8099/completion \
+  -d '{"prompt":"The capital of France is","n_predict":12,"stream":false}'
+
+# 3. Streaming completion (SSE chunks)
+curl -sN http://127.0.0.1:8099/completion \
+  -d '{"prompt":"Count: 1 2 3","n_predict":8,"stream":true}'
+
+# 4. Server props (look for "initial_slots": 0 in paged mode)
+curl -s http://127.0.0.1:8099/props
 ```
 
-Check the server:
+Metrics are exposed only when the server is started with `--metrics`:
 
 ```sh
-curl http://127.0.0.1:8080/props
-curl http://127.0.0.1:8080/metrics | grep prefix_cache
+# add --metrics to the launch command, then:
+curl -s http://127.0.0.1:8099/metrics | grep -E 'tokens_predicted_total|n_decode_total'
 ```
 
-## Initial Benchmark
+> Note: `GET /slots` and `/metrics` without `--metrics` return HTTP `501` in paged
+> mode by design — paged mode has no legacy slots to introspect.
 
-Single-run local smoke benchmark, useful as a baseline rather than a formal
-performance claim.
-
-| Item | Value |
-| --- | --- |
-| Machine | MacBook Air, Apple M2 |
-| Backend | Metal |
-| Model | LFM2-2.6B-Q4_0.gguf |
-| Model size | 1.38 GiB |
-| Command shape | `--scheduler paged --max-model-len 128000 --gpu-memory-utilization 0.90 --kv-prefix-cache -ngl 99` |
-| Global KV pool | 389120 tokens |
-| Per-request context | 128000 tokens |
-| Full-context concurrency | 3 requests |
-| KV buffer | 6080 MiB |
-| Prompt eval | 36 tokens in 274.02 ms, 131.38 tok/s |
-| Decode | 952 tokens in 25577.22 ms, 37.22 tok/s |
-| Total | 988 tokens in 25851.24 ms |
-
-The important validation points from this run are:
-
-- `initial_slots=0`, confirming paged mode does not pre-create slot handles.
-- `n_ctx=389120` and `n_ctx_seq=128000`, confirming the global pool expanded while
-  each request kept the configured maximum model length.
-- `full_ctx_concurrency=3`, confirming capacity planning from the fitted KV pool.
-- A chat completion completed cleanly through the paged request path.
-
-## Initial Release Package
-
-The first local release package is intended to ship the macOS arm64 `llama-server`
-binary plus the matching local dynamic libraries from the current build:
-
-```text
-dist/llama-server-paged-v0.1.0-macos-arm64-e700f900a.tar.gz
-```
-
-Models are not bundled. The server expects a local `.gguf` model path at runtime.
-OpenSSL is linked from Homebrew in the current build, so machines without Homebrew
-OpenSSL may need:
-
-```sh
-brew install openssl@3
-```
+---
 
 ## Upstream llama.cpp
 
