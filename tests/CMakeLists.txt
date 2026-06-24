@@ -251,6 +251,10 @@ llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 llama_build_and_test(test-state-restore-fragmented.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-state-restore-fragmented PROPERTIES FIXTURES_REQUIRED test-download-model)
 
+# Unit tests for the paged KV core data structures (allocator + block table).
+# Header-only, no model or backend required.
+llama_build_and_test(test-paged-kv-alloc.cpp)
+
 # Test paged KV copy-on-write on a shared partial page, for both V-cache layouts.
 llama_build_and_test(test-paged-kv-cow.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-paged-kv-cow PROPERTIES FIXTURES_REQUIRED test-download-model)
