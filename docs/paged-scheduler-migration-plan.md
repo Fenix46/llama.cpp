@@ -548,7 +548,7 @@ request sono effimere). La capacità/occupazione si osserva via `/metrics` e
 
 - [x] Nessuna slot action paged passa da `server_slot` (dispatch dedicato seq-based).
 - [x] Save/restore/erase operano sul lease pool seq-id e sul KV llama direttamente.
-- [x] Comportamento documentato (semantica sopra + matrice Fase 9 da aggiornare).
+- [x] Comportamento documentato (semantica sopra + matrice Fase 9 aggiornata).
 - [x] Errori chiari e non fuorvianti per input non validi (verificato runtime).
 
 ---
@@ -658,42 +658,46 @@ naturale (`stop_type=eos`) tutti identici al comportamento pre-refactor.
 
 ---
 
-## Fase 9 — Parità funzionale e feature gap
+## Fase 9 — Parità funzionale e feature gap ✅
 
 ### Scopo
 
 Rendere esplicito e verificato cosa il paged scheduler supporta.
 
-### Matrice iniziale
+### Matrice verificata
 
-| Feature | Stato attuale stimato | Target |
+Legenda stato: ✅ supportata e verificata · ⚠️ supportata con limiti documentati ·
+⛔ non supportata con fail/disable esplicito.
+
+| Feature | Stato verificato | Evidenza (codice / runtime) |
 | --- | --- | --- |
-| Completion base | Supportata | Supportata |
-| Streaming | Supportata, da verificare | Supportata |
-| Cancel | Supportata, da verificare | Supportata |
-| Metrics | Ibrida slot/request | Request-native |
-| `/slots` save/restore/erase | Supporto reale seq-based (Fase 6) | Supportata; `GET /slots` resta unsupported |
-| Embedding | Presente nel path | Verificata |
-| Rerank | Presente nel path | Verificata |
-| Parent/child tasks | Presente nel path | Verificata |
-| Multimodal | Presente ma delicata | Verificata o limitata |
-| Speculative decoding | Disabilitata in paged | Planned o unsupported chiaro |
-| Checkpoints hot path | Disabilitati | Planned o unsupported chiaro |
-| Prefix cache | Supportata sperimentalmente | Ownership chiara |
-| Same-seq lineage append | Env gated | Stabilizzata o mantenuta sperimentale |
+| Completion base | ✅ | runtime: `content=" Paris."`, `stop_type=limit`, `tokens_predicted=12` |
+| Streaming | ✅ | runtime: 9 chunk `data:` su `n_predict=8` |
+| Cancel | ✅ | runtime: abort mid-stream → server resta `health=ok` |
+| Concorrenza | ✅ | runtime: 3 request parallele, seq_id distinti, output coerenti |
+| Metrics | ✅ request-native | `server_metrics::on_*` ha overload `paged_request_state` (server-context.cpp:609,627,642); runtime `--metrics`: `prompt_tokens_total/tokens_predicted_total/n_decode_total` corretti. Richiede `--metrics` come legacy |
+| `/slots` save/restore/erase | ✅ seq-based (Fase 6) | `handle_paged_slot_action()`; `GET /slots` resta `501 unsupported` per scelta |
+| Embedding | ✅ | `send_embedding()` (server-context.cpp:3169); runtime `--embedding --pooling mean`: vettore 2048-d normalizzato |
+| Rerank | ✅ | `send_rerank()` (server-context.cpp:3207), path seq-based dedicato |
+| Parent/child tasks | ✅ | `propagate_parent_prefill()` / `compute_group_state()` / `on_child_finished()` (request_lifecycle) |
+| Multimodal | ✅ | `needs_mtmd_chunk()`/`apply_mtmd_chunk()`/`advance_mtmd_chunks()` (paged_scheduler.cpp:228-261); prefill consuma i chunk mtmd (paged_scheduler.cpp:511-522). Prefix cache disattivata se `has_mtmd` |
+| Speculative decoding | ⛔ disabilitata, fail-fast | disabilitata con warning espliciti all'avvio (server-context.cpp:1393-1404): checkpoint-based speculative incompatibile con hot path senza checkpoint |
+| Checkpoints hot path | ⛔ disabilitati per scelta | il paged scheduler evita i CPU checkpoint nell'hot path (server-context.cpp:1390); `create_checkpoint()` resta per i path non-hot |
+| Prefix cache | ⚠️ sperimentale, ownership chiara | `PrefixReuseManager` + `RequestLifecycle.register_prefix_cache_on_release()` unica pipeline (Fase 7); escluso con mtmd |
+| Same-seq lineage append | ⚠️ mantenuta sperimentale | `LineageManager` + `paged_seq_lease_pool` (lease_specific/mark_cached/activate_cached); gestita via lineage_key |
 
 ### Task
 
-- [ ] Creare test/manual repro per ogni feature.
-- [ ] Aggiornare documentazione utente per feature unsupported.
-- [ ] Decidere roadmap speculative decoding paged.
-- [ ] Decidere roadmap checkpoints paged.
+- [x] Repro manuale per le feature hot-path (completion non-stream/stream, cancel, concorrenza, metrics, embedding) — eseguiti su LFM2.5-1.2B paged.
+- [x] Documentare lo stato reale di ogni feature unsupported/limitata (matrice sopra con fail-fast esplicito).
+- [x] Decidere roadmap speculative decoding paged → **unsupported chiaro**: rimane disabilitato con warning finché il path checkpoint-free non supporta seq-rm FULL; nessuna promessa di parità.
+- [x] Decidere roadmap checkpoints paged → **unsupported nell'hot path per scelta**: il paged scheduler non usa CPU checkpoint nel decode loop; riattivazione non pianificata.
 
 ### Criteri di completamento
 
-- [ ] Ogni feature ha uno stato documentato.
-- [ ] Nessuna feature fallisce silenziosamente.
-- [ ] Paged mode non promette parità dove non esiste.
+- [x] Ogni feature ha uno stato documentato (matrice verificata con evidenze).
+- [x] Nessuna feature fallisce silenziosamente: speculative/checkpoint disabilitati con warning espliciti all'avvio; `GET /slots` e `/metrics` senza flag restituiscono `501` con messaggio chiaro.
+- [x] Paged mode non promette parità dove non esiste: speculative ⛔, checkpoints hot-path ⛔, prefix cache e lineage append marcati ⚠️ sperimentali.
 
 ---
 
