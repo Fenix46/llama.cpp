@@ -1437,14 +1437,6 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
-    // [TAG_FA_F16_CUDA_GRAPHS] Set once per compute call in ggml_backend_cuda_graph_compute: true
-    // when the current cgraph is graph-enabled AND graph-compatible (i.e. it will be captured).
-    // On HIP the flash-attention launcher reads this to place its f16 KV-dequant temp buffers in the
-    // capture-safe memory pool instead of raw cudaMalloc/cudaFree, which are illegal while a CUDA
-    // graph is being captured. Left false for graph-incompatible graphs so those keep the raw
-    // release-after-use path (avoids the legacy pool retaining the temp; ref llama.cpp #22107).
-    bool fa_f16_use_pool = false;
-
     // Per-graph-eval shared-quantize cache for the mmvq path. Several matvecs in one decode
     // layer consume the same normed activation (Q/V/K read attn_norm; the router, fused
     // gate/up and shared-expert gate read attn_post_norm), and each used to re-quantize it to
@@ -1749,4 +1741,3 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
 }
-
