@@ -718,6 +718,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             break;
         case 576:
         case 640:
+#ifdef GGML_USE_HIP
+            // The matching tile kernels exceed HIP's local memory limit and are not compiled.
+            return BEST_FATTN_KERNEL_NONE;
+#endif
             if (V->ne[0] != 512) {
                 return BEST_FATTN_KERNEL_NONE;
             }
