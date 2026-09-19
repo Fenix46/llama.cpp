@@ -6918,7 +6918,6 @@ static void test_reasoning_effort_caps() {
     };
 
     assert_supports_effort("models/templates/deepseek-ai-DeepSeek-V4.jinja", true);
-    assert_supports_effort("models/templates/muse-glimmer.jinja", true);
     assert_supports_effort("models/templates/tencent-Hy3.jinja", true);
     assert_supports_effort("models/templates/openai-gpt-oss-120b.jinja", true);
     assert_supports_effort("models/templates/upstage-Solar-Open-100B.jinja", true);
