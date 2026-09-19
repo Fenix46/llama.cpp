@@ -662,14 +662,18 @@ static bool llama_model_has_cacheable_moe_weights(
         return false;
     }
 
+    size_t largest_expert_bytes = 0;
     for (const auto & entry : model.tensors_by_name) {
         const std::string & name = entry.first;
         const ggml_tensor * tensor = entry.second;
         if (!tensor || (name.find("_exps") == std::string::npos &&
                         name.find("_chexps") == std::string::npos) ||
             ggml_n_dims(tensor) != 3 || tensor->ne[0] <= 0 ||
-            tensor->ne[1] <= 0 || tensor->ne[2] <= 0 ||
-            tensor->nb[2] < min_expert_bytes) {
+            tensor->ne[1] <= 0 || tensor->ne[2] <= 0) {
+            continue;
+        }
+        largest_expert_bytes = std::max(largest_expert_bytes, tensor->nb[2]);
+        if (tensor->nb[2] < min_expert_bytes) {
             continue;
         }
 
@@ -694,7 +698,8 @@ static bool llama_model_has_cacheable_moe_weights(
             return true;
         }
     }
-    LLAMA_LOG_INFO("%s: MoE cache disabled (no cacheable expert tensors found)\n", __func__);
+    LLAMA_LOG_INFO("%s: MoE cache disabled (no cacheable expert tensors found; largest expert slab=%zu KiB, minimum=%zu KiB)\n",
+            __func__, largest_expert_bytes >> 10, min_expert_bytes >> 10);
     return false;
 }
 
