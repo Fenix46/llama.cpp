@@ -810,8 +810,7 @@ void ggml_cuda_op_mul_mat_vec_f(
 //
 // The two batch widths disagree about where the edge is: n=4 keeps winning past the point where
 // n=8 has turned. These bands take the widest span that still wins at every n measured (3, 4 and
-// 8), which costs some n=4 ground and avoids regressing n=8. RDNA4 is not measured and takes the
-// RDNA3 band. GGML_MMVF_NARROW_MIN and _MAX override both edges; setting _MAX to 0 restores the
+// 8), which costs some n=4 ground and avoids regressing n=8. GGML_MMVF_NARROW_MIN and _MAX override both edges; setting _MAX to 0 restores the
 // upstream behaviour of stopping at the column limit whatever the width.
 struct mmvf_narrow_band {
     int64_t min;
