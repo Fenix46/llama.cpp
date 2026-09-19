@@ -328,6 +328,27 @@ ggml_backend_cuda_context::moe_expert_slab * ggml_backend_cuda_context::moe_expe
         !alloc((void **) &e.miss_expert, (size_t) n_routed * sizeof(int32_t)) ||
         !alloc((void **) &e.miss_slot,   (size_t) n_routed * sizeof(int32_t)) ||
         !alloc((void **) &e.n_miss,      sizeof(int32_t))) {
+        (void) cudaGetLastError();
+        auto release = [&](void * ptr) {
+            if (ptr != nullptr) {
+                ggml_cuda_set_device(dev);
+                CUDA_CHECK(cudaFree(ptr));
+            }
+        };
+        release(e.slab);
+        release(e.slot_expert);
+        release(e.claim);
+        release(e.hit);
+        release(e.won);
+        release(e.miss_expert);
+        release(e.miss_slot);
+        release(e.n_miss);
+
+        moe_expert_slab skip;
+        skip.base      = src0->data;
+        skip.nb_expert = nb_expert;
+        skip.dev       = dev;
+        moe_slabs.push_back(skip);
         return nullptr;   // caller falls back to reading the experts where they live
     }
 
