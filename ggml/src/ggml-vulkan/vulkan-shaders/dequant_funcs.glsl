@@ -762,6 +762,60 @@ vec2 get_dm(uint ib, uint a_offset) {
 }
 #endif
 
+#if defined(DATA_A_TURBO2_0)
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    // 2-bit centroids, must match CENTROIDS_2BIT in ggml/src/ggml-turbo-quant.c
+    const float centroids[4] = float[4](-0.133462, -0.039994, 0.039994, 0.133462);
+
+    // iqs is the element index within the block (0..127), decode 2 consecutive elements
+    const uint j0 = iqs;
+    const uint j1 = iqs + 1;
+
+    const uint idx0 = (uint(data_a[a_offset + ib].qs[j0 / 4]) >> ((j0 % 4) * 2)) & 0x3;
+    const uint idx1 = (uint(data_a[a_offset + ib].qs[j1 / 4]) >> ((j1 % 4) * 2)) & 0x3;
+
+    return vec2(centroids[idx0], centroids[idx1]);
+}
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    vec2 v0 = dequantize(ib, iqs, a_offset);
+    vec2 v1 = dequantize(ib, iqs + 2, a_offset);
+    return vec4(v0.x, v0.y, v1.x, v1.y);
+}
+vec2 get_dm(uint ib, uint a_offset) {
+    return vec2(float(data_a[a_offset + ib].norm), 0);
+}
+#endif
+
+#if defined(DATA_A_TURBO4_0)
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    // 4-bit centroids, must match CENTROIDS_4BIT in ggml/src/ggml-turbo-quant.c
+    const float centroids[16] = float[16](
+        -0.241529, -0.182877, -0.143016, -0.111036,
+        -0.083292, -0.058050, -0.034299, -0.011349,
+         0.011349,  0.034299,  0.058050,  0.083292,
+         0.111036,  0.143016,  0.182877,  0.241529
+    );
+
+    // iqs is the element index within the block (0..127), decode 2 consecutive elements
+    // packed 2 per byte (nibble-packed)
+    const uint j0 = iqs;
+    const uint j1 = iqs + 1;
+
+    const uint idx0 = (uint(data_a[a_offset + ib].qs[j0 / 2]) >> ((j0 % 2) * 4)) & 0xF;
+    const uint idx1 = (uint(data_a[a_offset + ib].qs[j1 / 2]) >> ((j1 % 2) * 4)) & 0xF;
+
+    return vec2(centroids[idx0], centroids[idx1]);
+}
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    vec2 v0 = dequantize(ib, iqs, a_offset);
+    vec2 v1 = dequantize(ib, iqs + 2, a_offset);
+    return vec4(v0.x, v0.y, v1.x, v1.y);
+}
+vec2 get_dm(uint ib, uint a_offset) {
+    return vec2(float(data_a[a_offset + ib].norm), 0);
+}
+#endif
+
 #if defined(DATA_A_TQ3_1S)
 vec2 dequantize(uint ib, uint iqs, uint a_offset) {
     // TQ3_1S: 8-level Lloyd-Max centroids for N(0,1). ASYMMETRIC -- must match
