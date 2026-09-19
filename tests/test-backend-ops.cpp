@@ -11416,6 +11416,10 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
         output_printer->print_summary(test_summary_info(n_ok, tests_run, false));
         output_printer->print_failed_tests(failed_tests);
 
+        if (tests_run == 0) {
+            return false;
+        }
+
         return n_ok == tests_run;
     }
 
@@ -11434,6 +11438,10 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
             }
         }
         output_printer->print_summary(test_summary_info(n_ok, test_cases.size(), false));
+
+        if (test_cases.empty()) {
+            return false;
+        }
 
         return n_ok == test_cases.size();
     }
