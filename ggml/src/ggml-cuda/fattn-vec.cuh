@@ -828,6 +828,14 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
 
 template <ggml_type type_K, ggml_type type_V>
 void ggml_cuda_flash_attn_ext_vec_case_d512(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    // D=512 VEC decode is only dispatched on HIP (see ggml_cuda_get_best_fattn_kernel
+    // in fattn.cu, which gates d512_vec_safe behind GGML_USE_HIP); on plain CUDA this
+    // is unreachable. Some type_K/type_V combinations (q8_0 K with turbo V) need a
+    // V_cols_per_iter scaled by nthreads_V that only fits Turing's 64KB static-shared
+    // budget for D<=256, so instantiating the D=512 kernel body on CUDA caused ptxas
+    // "uses too much shared data" for no runtime benefit. Keep the symbol (avoids
+    // touching every per-type .cu instance file) but skip the kernel body there.
+#ifdef GGML_USE_HIP
     // decode-only (ncols=1): ncols=2 would exceed the 256-VGPR limit on RDNA4.
     const ggml_tensor * KQV = dst;
     float logit_softcap;
@@ -837,6 +845,11 @@ void ggml_cuda_flash_attn_ext_vec_case_d512(ggml_backend_cuda_context & ctx, ggm
     } else {
         ggml_cuda_flash_attn_ext_vec_case_impl<512, 1, type_K, type_V, true>(ctx, dst);
     }
+#else
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(dst);
+    GGML_ABORT("D=512 VEC flash attention decode is HIP-only");
+#endif // GGML_USE_HIP
 }
 
 #define DECL_FATTN_VEC_CASE(D, type_K, type_V)                              \
@@ -976,7 +989,8 @@ extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO4_0);
 extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO4_0);
 extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO4_0);
 
-// D=512 VEC instances (decode-only, K=q8_0; turbo-K excluded because it is VGPR-unsafe on RDNA4)
+// D=512 VEC instances (decode-only, K=q8_0; turbo-K excluded because it is VGPR-unsafe on RDNA4).
+// See ggml_cuda_flash_attn_ext_vec_case_d512 above: the kernel body only runs on HIP.
 extern DECL_FATTN_VEC_CASE_D512(GGML_TYPE_Q8_0, GGML_TYPE_F16);
 extern DECL_FATTN_VEC_CASE_D512(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
 extern DECL_FATTN_VEC_CASE_D512(GGML_TYPE_Q8_0, GGML_TYPE_BF16);
