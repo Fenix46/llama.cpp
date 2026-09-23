@@ -1347,7 +1347,13 @@ f16vec4 dequantFuncNVFP4_v(const in decodeBufNVFP4 bl, const in uint blockCoords
 }
 #endif
 
-#if defined(DATA_A_TURBO3_0)
+// Not gated behind DATA_A_TURBO3_0: unlike get_rows/cpy variants, the FA cm2
+// shader (flash_attn_cm2.comp) compiles a single pipeline that switches over
+// every K/V type at runtime via spec constants, so this decode helper (and
+// its _v counterpart below) must always be available there, the same way
+// dequantFuncQ8_0/dequantFuncQ4_0/etc. above are unguarded. DATA_A_TURBO3_0
+// itself stays gated in types.glsl, so this doesn't affect the A_TYPE/QUANT_K
+// aliasing used by the get_rows/cpy/set_rows paths.
 layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufTURBO3_0 {
    block_turbo3_0 block;
 };
@@ -1355,8 +1361,8 @@ layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufTUR
 float16_t dequantFuncTURBO3_0(const in decodeBufTURBO3_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
 {
     const float centroids[8] = float[8](
-        -0.190685, -0.117832, -0.065717, -0.021460,
-         0.021460,  0.065717,  0.117832,  0.190685
+        -0.190207, -0.118786, -0.066822, -0.021663,
+         0.021663,  0.066822,  0.118786,  0.190207
     );
     const float norm = float(bl.block.norm);
     const uint j = coordInBlock[1];
@@ -1372,7 +1378,31 @@ float16_t dequantFuncTURBO3_0(const in decodeBufTURBO3_0 bl, const in uint block
 
     return float16_t(centroids[idx] * norm);
 }
-#endif
+
+f16vec4 dequantFuncTURBO3_0_v(const in decodeBufTURBO3_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    // Vector counterpart of dequantFuncTURBO3_0 above: decodes 4 consecutive
+    // elements at once. coordInBlock[1] is expected to be vec4-aligned
+    // (j % 4 == 0), matching every caller's stride, so all 4 elements share
+    // one qs byte (4 per byte) and one signs byte (8 per byte).
+    const float centroids[8] = float[8](
+        -0.190207, -0.118786, -0.066822, -0.021663,
+         0.021663,  0.066822,  0.118786,  0.190207
+    );
+    const float norm = float(bl.block.norm);
+    const uint j = coordInBlock[1];
+
+    const uint qs_byte  = uint(bl.block.qs[j / 4]);
+    const uint sgn_byte = uint(bl.block.signs[j / 8]);
+    const uint base = j & 0x7u;
+
+    const uint i0 = ((qs_byte     ) & 0x3) | (((sgn_byte >> (base    )) & 0x1u) << 2);
+    const uint i1 = ((qs_byte >> 2) & 0x3) | (((sgn_byte >> (base + 1)) & 0x1u) << 2);
+    const uint i2 = ((qs_byte >> 4) & 0x3) | (((sgn_byte >> (base + 2)) & 0x1u) << 2);
+    const uint i3 = ((qs_byte >> 6) & 0x3) | (((sgn_byte >> (base + 3)) & 0x1u) << 2);
+
+    return f16vec4(norm * vec4(centroids[i0], centroids[i1], centroids[i2], centroids[i3]));
+}
 
 #if defined(DATA_A_Q1_0)
 #define dequantFuncA dequantFuncQ1_0
