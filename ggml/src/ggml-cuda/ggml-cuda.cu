@@ -4408,7 +4408,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             fusion_data.x_scale = scale;
 
             if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
-                cuda_ctx->fusion_stats.mul_mat_bias++;
+                // this site also fuses a scale with no bias; only count an actual ADD epilogue
+                if (bias != nullptr) {
+                    cuda_ctx->fusion_stats.mul_mat_bias++;
+                }
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, out_node, &fusion_data);
                 fused_mul_mat_vec = true;
                 fused_node_count  = n_ops;
