@@ -4339,7 +4339,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
         const ggml_op bias_op = op == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;
 
-        for (const bool with_bias : { false, true }) {
+        // try the bias form first: the scale-only op list is a prefix of it, so checking that one
+        // first always matched and left the bias ADD to run as its own kernel
+        for (const bool with_bias : { true, false }) {
             const int n_ops = op == GGML_OP_MUL_MAT ? (with_bias ? 3 : 2) : (with_bias ? 6 : 5);
             const int out_nodes[] = { i + n_ops - 1 };
             ggml_op ops[6];
