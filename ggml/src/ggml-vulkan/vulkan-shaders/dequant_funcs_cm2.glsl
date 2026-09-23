@@ -1404,6 +1404,90 @@ f16vec4 dequantFuncTURBO3_0_v(const in decodeBufTURBO3_0 bl, const in uint block
     return f16vec4(norm * vec4(centroids[i0], centroids[i1], centroids[i2], centroids[i3]));
 }
 
+// Not gated behind DATA_A_TURBO2_0, same reasoning as dequantFuncTURBO3_0 above.
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufTURBO2_0 {
+   block_turbo2_0 block;
+};
+
+float16_t dequantFuncTURBO2_0(const in decodeBufTURBO2_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const float centroids[4] = float[4](-0.133462, -0.039994, 0.039994, 0.133462);
+    const float norm = float(bl.block.norm);
+    const uint j = coordInBlock[1];
+
+    // 2-bit centroid index, 4 per byte
+    const uint idx = (uint(bl.block.qs[j / 4]) >> ((j % 4) * 2)) & 0x3;
+
+    return float16_t(centroids[idx] * norm);
+}
+
+f16vec4 dequantFuncTURBO2_0_v(const in decodeBufTURBO2_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    // Vector counterpart of dequantFuncTURBO2_0 above: decodes 4 consecutive
+    // elements at once. coordInBlock[1] is expected to be vec4-aligned
+    // (j % 4 == 0), matching every caller's stride, so all 4 elements share
+    // one qs byte (4 per byte).
+    const float centroids[4] = float[4](-0.133462, -0.039994, 0.039994, 0.133462);
+    const float norm = float(bl.block.norm);
+    const uint j = coordInBlock[1];
+
+    const uint qs_byte = uint(bl.block.qs[j / 4]);
+    const uint i0 = (qs_byte     ) & 0x3;
+    const uint i1 = (qs_byte >> 2) & 0x3;
+    const uint i2 = (qs_byte >> 4) & 0x3;
+    const uint i3 = (qs_byte >> 6) & 0x3;
+
+    return f16vec4(norm * vec4(centroids[i0], centroids[i1], centroids[i2], centroids[i3]));
+}
+
+// Not gated behind DATA_A_TURBO4_0, same reasoning as dequantFuncTURBO3_0 above.
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufTURBO4_0 {
+   block_turbo4_0 block;
+};
+
+float16_t dequantFuncTURBO4_0(const in decodeBufTURBO4_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const float centroids[16] = float[16](
+        -0.241529, -0.182877, -0.143016, -0.111036,
+        -0.083292, -0.058050, -0.034299, -0.011349,
+         0.011349,  0.034299,  0.058050,  0.083292,
+         0.111036,  0.143016,  0.182877,  0.241529
+    );
+    const float norm = float(bl.block.norm);
+    const uint j = coordInBlock[1];
+
+    // 4-bit centroid index, nibble-packed (2 per byte)
+    const uint idx = (uint(bl.block.qs[j / 2]) >> ((j % 2) * 4)) & 0xF;
+
+    return float16_t(centroids[idx] * norm);
+}
+
+f16vec4 dequantFuncTURBO4_0_v(const in decodeBufTURBO4_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    // Vector counterpart of dequantFuncTURBO4_0 above: decodes 4 consecutive
+    // elements at once. coordInBlock[1] is expected to be vec4-aligned
+    // (j % 4 == 0), matching every caller's stride, so the 4 elements span
+    // exactly 2 consecutive qs bytes (2 nibbles per byte).
+    const float centroids[16] = float[16](
+        -0.241529, -0.182877, -0.143016, -0.111036,
+        -0.083292, -0.058050, -0.034299, -0.011349,
+         0.011349,  0.034299,  0.058050,  0.083292,
+         0.111036,  0.143016,  0.182877,  0.241529
+    );
+    const float norm = float(bl.block.norm);
+    const uint j = coordInBlock[1];
+
+    const uint b0 = uint(bl.block.qs[j / 2    ]);
+    const uint b1 = uint(bl.block.qs[j / 2 + 1]);
+
+    const uint i0 = (b0     ) & 0xF;
+    const uint i1 = (b0 >> 4) & 0xF;
+    const uint i2 = (b1     ) & 0xF;
+    const uint i3 = (b1 >> 4) & 0xF;
+
+    return f16vec4(norm * vec4(centroids[i0], centroids[i1], centroids[i2], centroids[i3]));
+}
+
 #if defined(DATA_A_Q1_0)
 #define dequantFuncA dequantFuncQ1_0
 #define dequantFuncA_v dequantFuncQ1_0_v
